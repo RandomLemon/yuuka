@@ -312,9 +312,10 @@ yuuka/
 │   ├── yuuka/                 # CLI
 │   └── yuuka-server/          # OpenAI-compatible server
 ├── gguf/                      # Pure Go GGUF reader and validation
-├── tokenizer/                 # Qwen byte-level BPE and chat rendering
+├── tokenizer/                 # Qwen BPE, Llama SentencePiece, and chat rendering
 ├── tensor/                    # Dtypes, block layouts, CPU reference math
 ├── model/
+│   ├── dense/                 # Llama and Qwen3 CPU reference decoders
 │   └── qwen35/                # Config, weights, CPU reference decoder, state
 ├── engine/
 │   ├── engine.go              # Single-request generation loop
@@ -328,13 +329,16 @@ yuuka/
 ├── kernels/hip/
 │   ├── attention/
 │   ├── embedding/
+│   ├── gemm/
 │   ├── gemv/
 │   ├── ops/
 │   ├── ssm/
 │   ├── common.cuh
 │   └── yuuka_kernels.h
-├── tests/hip/                 # C ABI, GEMV, and operator tests
-├── bench/hip/                 # Hardware probe
+├── tests/
+│   ├── fixture/               # Deterministic tiny GGUF generators
+│   └── hip/                   # C ABI, GEMV, GEMM, and operator tests
+├── bench/hip/                 # Hardware probe and GEMV dispatch sweep
 ├── scripts/
 ├── docs/
 ├── CMakeLists.txt
@@ -342,11 +346,11 @@ yuuka/
 ```
 
 Planned but not present yet: `scheduler/`, `memory/`, a separate `backend/cpu/`
-package, `backend/npu/`, `model/llama/`, `model/qwen3/`, `kernels/hip/gemm/`,
-and `kernels/hip/sampling/`. The CPU reference itself is implemented in
-`engine` and `model/qwen35`. The `backend` interfaces and these packages
-describe the target structure; the current executor uses `engine.Runtime` and
-`backend/hip.Plan`.
+package, `backend/npu/`, separate `model/llama/` and `model/qwen3/` packages,
+and `kernels/hip/sampling/`. The CPU reference model code is implemented in
+`model/qwen35` and `model/dense`; `engine` owns the single-request generation
+loop. The `backend` interfaces and these packages describe the target
+structure; the current executor uses `engine.Runtime` and `backend/hip.Plan`.
 
 Use CMake for the HIP shared library and Go Modules for Go components. The two
 build systems meet at the C ABI. Do not embed the HIP/C++ build inside a Go

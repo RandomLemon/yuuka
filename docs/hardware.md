@@ -155,7 +155,10 @@ available to the toolchain and that a wave32 launch works on this device.
 5. WMMA is available; the prefill GEMM path can target it in a later phase.
 6. The CPU reference path remains the correctness oracle after HIP integration.
 
-## Remaining Phase 0 work
+## Post-gate follow-up measurements
+
+The Phase 0 exit criteria are met by the measurements above. The following
+follow-ups would strengthen the evidence but are not Phase 0 gates:
 
 - Longer thermal soak with fan and steady-state power recording.
 - A larger rocBLAS shape sweep and a WMMA tiled GEMM benchmark.

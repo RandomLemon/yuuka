@@ -353,9 +353,12 @@ The HIP workflow builds the native library, runs `ctest`, builds the `hip` Go
 tags, and runs the HIP-tagged tests. Set the `YUUKA_TEST_MODEL` repository
 secret to enable the real-model cases on that runner.
 
-Tests that need a model fall back to a generated tiny GGUF fixture when
-`YUUKA_TEST_MODEL` is unset. The fixture is produced by `tests/fixture` and is
-not committed as a model artifact. Real-model coverage remains opt-in.
+Tests that require the real model skip when `YUUKA_TEST_MODEL` is unset. A
+separate subset of tests runs without a model file by generating deterministic
+tiny GGUF fixtures from `tests/fixture`, including the tiny `qwen35` GPU/CPU
+comparison, dense-model tests, and server request tests. Fixtures are generated
+at test time and are not committed as model artifacts. Real-model coverage
+remains opt-in.
 
 Large model files are not committed to the repository. GPU tests must skip with
 a clear message when no supported device is present; they must not silently

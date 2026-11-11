@@ -38,7 +38,7 @@ layer traces agree, and a validated F32/F16 GEMM ABI baseline is checked in.
 HIP execution for the dense models is not implemented.
 
 Phase 2 exit criteria are met: quantized GEMV is correct across randomized
-shapes, GEMV accounts for about 90.6% of profiled decode time, and
+shapes, GEMV accounts for about 90.5% of profiled decode time, and
 per-quantization and per-batch baselines are recorded. WMMA/rocBLAS prefill,
 paged KV, continuous batching, and prefix caching are not implemented yet. The
 current measured baseline is in [benchmarks.md](benchmarks.md).
@@ -52,7 +52,7 @@ remain open, and the status above identifies their current boundary.
 | --- | --- | --- | --- |
 | **0. Bootstrap** | Prove the toolchain and characterize the device | Hardware report, repository scaffold, C ABI, GGUF fixtures, CPU reference skeleton | HIP/rocBLAS/WMMA smoke tests and allocation/bandwidth measurements recorded |
 | **1. Minimal loop** | Correct single-request generation | GGUF reader, tokenizer, Qwen3/Llama dense, CPU reference ops, HIP FP16 baseline, CLI | Fixed-prompt token IDs match or logits are within documented tolerance; generation stops correctly |
-| **2. Quantized decode** | Native low-bit decode | Q4_K/Q6_K/Q8_0 GEMV, fused unpack/scale, dispatch thresholds, profiling | Qwen3 Q4_K runs correctly; decode bottleneck is attributable to a kernel and memory behavior |
+| **2. Quantized decode** | Native low-bit decode | Q4_K/Q6_K/Q8_0 GEMV, fused unpack/scale, dispatch thresholds, profiling | Qwen3.5-4B Q4_K_M runs correctly; decode bottleneck is attributable to a kernel and memory behavior |
 | **3. High-performance prefill** | Fast prompt processing | WMMA quantized GEMM, Flash Attention, chunked prefill, key fusions, tuning tables | Performance curves at 128/512/2048/8192/32768 tokens and same-condition comparison with llama.cpp |
 | **4. Multi-request serving** | Concurrent, cache-aware service | Paged KV, continuous batching, prefix cache, HIP Graph, SSE/OpenAI API, metrics | Reproducible latency and throughput; cancellation and reclamation are leak-free |
 | **5. Expansion** | Broader models and research | MoE/grouped GEMM, KV quantization, speculative decoding, NPU experiments, more architectures | Each feature is opt-in, measured, and does not regress the GPU-only path |
@@ -158,7 +158,7 @@ expanding the model to a full FP16 weight matrix.
 
 ### Exit criteria
 
-- [x] Qwen3 Q4_K generates correct tokens on the target device.
+- [x] Qwen3.5-4B Q4_K_M generates correct tokens on the target device.
 - [x] Decode does not expand all quantized weights into FP16.
 - [x] The decode bottleneck is attributable to a specific kernel and memory
       behavior, with profiler evidence.
@@ -289,7 +289,7 @@ destabilizing the core GPU path.
 | --- | --- | --- |
 | **M0: Toolchain proven** | HIP, rocBLAS, and WMMA smoke tests; allocation report | Phase 0 checklist |
 | **M1: Correct generation** | Single-request Qwen3/Llama generation with CPU/GPU agreement | Token and logits comparison report |
-| **M2: Quantized decode** | Qwen3 Q4_K generation with native GEMV | Per-kernel correctness and decode baseline |
+| **M2: Quantized decode** | Qwen3.5-4B Q4_K_M generation with native GEMV | Per-kernel correctness and decode baseline |
 | **M3: Prefill performance** | Prompt-length performance curves | Benchmark report vs llama.cpp |
 | **M4: Concurrent service** | Paged KV, continuous batching, SSE API | Latency/throughput report and leak checks |
 | **M5: Expansion** | At least one new architecture/feature with measured benefit | Feature report and regression run |
@@ -373,17 +373,23 @@ not declare completion or depend on unverified results from an open gate.
 
 ## 14. Success criteria for the first release
 
-The first release is successful when:
+The first release is successful when all of the following hold. Checked items
+are already satisfied by the current single-request vertical slice; unchecked
+items remain release gates.
 
-- [ ] Qwen3.5-4B Q4_K_M GGUF loads and validates on the target gfx1151 system.
-- [ ] A single request generates tokens end-to-end on the GPU.
-- [ ] Tokenizer, chat template, and greedy token sequences match the reference
+- [x] Qwen3.5-4B Q4_K_M GGUF loads and validates on the target gfx1151 system.
+- [x] A single request generates tokens end-to-end on the GPU.
+- [x] Tokenizer, chat template, and greedy token sequences match the reference
       implementation.
-- [ ] Quantized decode runs natively, without expanding the model to FP16.
+- [x] Quantized decode runs natively, without expanding the model to FP16.
 - [ ] Prefill and decode performance are measured across the required prompt and
       output lengths.
-- [ ] The CPU reference path remains available for correctness and fallback.
+- [x] The CPU reference path remains available for correctness and fallback.
 - [ ] Results are reproducible from the documented environment and benchmark
       metadata.
-- [ ] The architecture, format, kernel, serving, and testing documents match the
-      implemented behavior.
+- [x] The architecture, format, kernel, serving, and testing documents match the
+      implemented single-request behavior; later-phase behavior remains
+      documented as target design.
+
+Phase 3–5 exit gates remain open; this list does not declare the first release
+complete.
