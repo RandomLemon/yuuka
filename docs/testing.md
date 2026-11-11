@@ -291,6 +291,7 @@ go test ./...
 go test -race ./...
 go build -tags hip ./...
 go test -tags hip ./backend/hip ./engine/gpu
+YUUKA_TEST_SPM_VOCAB=/path/to/ggml-vocab-llama-spm.gguf go test ./tokenizer
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
@@ -307,7 +308,9 @@ YUUKA_TEST_MODEL=/path/to/model.gguf go test ./...
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
-reference, and server request/stream behavior. Native GPU tests return CTest
+reference, layer-by-layer hidden-state comparison, and server request/stream
+behavior. SentencePiece golden IDs additionally accept
+`YUUKA_TEST_SPM_VOCAB=/path/to/ggml-vocab-llama-spm.gguf`. Native GPU tests return CTest
 skip code 77; Go GPU tests skip with a message when no HIP device is available
 or `YUUKA_TEST_MODEL` is unset.
 

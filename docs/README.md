@@ -120,7 +120,7 @@ Not yet implemented:
 - WMMA or rocBLAS prefill integration.
 - Paged KV, continuous batching, prefix cache, or HIP Graph.
 - HIP execution for dense Llama/Qwen3 models.
-- Multiple architectures and quantization presets beyond the tested models.
+- Quantization presets and architectures beyond the tested models.
 - NPU paths.
 
 Verification gaps: real-model tests are opt-in through `YUUKA_TEST_MODEL`; GPU

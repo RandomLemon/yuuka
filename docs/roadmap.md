@@ -40,8 +40,8 @@ attribution, batch dispatch thresholds, or per-shape sweep. WMMA/rocBLAS
 prefill, paged KV, batching, and prefix caching are not implemented yet. The
 current measured baseline is in [benchmarks.md](benchmarks.md).
 
-Phase 0 is the only phase whose exit gate is declared complete. Later phases
-remain open, and the status above identifies their current boundary.
+Phase 0 and Phase 1 exit gates are declared complete. Later phases remain open,
+and the status above identifies their current boundary.
 
 ## 2. Phase overview
 
@@ -116,16 +116,16 @@ request, with a GPU path and a CPU reference path.
 
 ### Exit criteria
 
-- [ ] A fixed prompt produces token IDs identical to the reference, or logits
+- [x] A fixed prompt produces token IDs identical to the reference, or logits
       within the documented tolerance.
-- [ ] The model generates continuously and stops on EOS or the configured stop
+- [x] The model generates continuously and stops on EOS or the configured stop
       condition.
-- [ ] The same prompt and greedy settings produce the same tokens on repeated
+- [x] The same prompt and greedy settings produce the same tokens on repeated
       runs.
-- [ ] The CPU reference and GPU path agree at tensor and logits levels.
-- [ ] The tokenizer matches the reference for English, Chinese, special tokens,
+- [x] The CPU reference and GPU path agree at tensor and logits levels.
+- [x] The tokenizer matches the reference for English, Chinese, special tokens,
       and chat templates.
-- [ ] The Q4_K file used for the target model loads and validates, even if its
+- [x] The Q4_K file used for the target model loads and validates, even if its
       native execution path is not yet enabled.
 
 ### Risks and dependencies
