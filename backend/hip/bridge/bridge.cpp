@@ -9,6 +9,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <vector>
 
 struct yuuka_device {
     hipDeviceProp_t prop;
@@ -26,6 +27,10 @@ struct yuuka_stream {
 
 struct yuuka_event {
     hipEvent_t event;
+};
+
+struct yuuka_plan {
+    std::vector<yuuka_op> ops;
 };
 
 namespace {
@@ -92,6 +97,160 @@ yuuka_status guard(Fn && fn) {
     } catch (...) {
         return fail(YUUKA_ERR_INTERNAL, "unexpected non-standard exception");
     }
+}
+
+template <typename T>
+T * op_ptr(yuuka_op const & op, int index) {
+    return reinterpret_cast<T *>(static_cast<uint8_t *>(op.buf[index]->ptr) + op.off[index]);
+}
+
+void launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
+    auto * out = op_ptr<float>(op, 2);
+    const auto * x = op_ptr<const float>(op, 1);
+    const void * w = op_ptr<const void>(op, 0);
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    switch (op.u[0]) {
+        case YUUKA_DTYPE_F32:
+            yuuka::launch_gemv_f32(out, x, static_cast<const float *>(w), n_in, n_out, stream);
+            break;
+        case YUUKA_DTYPE_F16:
+            yuuka::launch_gemv_f16(out, x, w, n_in, n_out, stream);
+            break;
+        case YUUKA_DTYPE_Q8_0:
+            yuuka::launch_gemv_q8_0(out, x, w, n_in, n_out, stream);
+            break;
+        case YUUKA_DTYPE_Q4_K:
+            yuuka::launch_gemv_q4_k(out, x, w, n_in, n_out, stream);
+            break;
+        case YUUKA_DTYPE_Q5_K:
+            yuuka::launch_gemv_q5_k(out, x, w, n_in, n_out, stream);
+            break;
+        case YUUKA_DTYPE_Q6_K:
+            yuuka::launch_gemv_q6_k(out, x, w, n_in, n_out, stream);
+            break;
+        default:
+            break;
+    }
+}
+
+yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
+                        hipStream_t stream) {
+    switch (op.code) {
+        case YUUKA_OP_GEMV:
+            launch_gemv_dispatch(op, stream);
+            break;
+        case YUUKA_OP_RMSNORM: {
+            auto * dst = op_ptr<float>(op, 2);
+            const auto * src = op_ptr<const float>(op, 0);
+            const auto * weight = op_ptr<const float>(op, 1);
+            yuuka::launch_rmsnorm_f32(dst, src, weight, int64_t(op.n[0]), op.f[0], stream);
+            break;
+        }
+        case YUUKA_OP_L2NORM: {
+            auto * dst = op_ptr<float>(op, 2);
+            const auto * src = op_ptr<const float>(op, 0);
+            const int64_t size = int64_t(op.n[1]);
+            for (uint64_t h = 0; h < op.n[0]; ++h) {
+                yuuka::launch_l2norm_f32(dst + h * size, src + h * size, size,
+                                         op.f[0], op.f[1], stream);
+            }
+            break;
+        }
+        case YUUKA_OP_GATED_RMSNORM: {
+            auto * dst = op_ptr<float>(op, 3);
+            const auto * src = op_ptr<const float>(op, 0);
+            const auto * weight = op_ptr<const float>(op, 1);
+            const auto * gate = op_ptr<const float>(op, 2);
+            const int64_t size = int64_t(op.n[0]);
+            for (uint64_t h = 0; h < op.n[1]; ++h) {
+                yuuka::launch_gated_rmsnorm_f32(dst + h * size, src + h * size,
+                                                weight, gate + h * size, size,
+                                                op.f[0], stream);
+            }
+            break;
+        }
+        case YUUKA_OP_ROPE:
+            yuuka::launch_rope_f32(op_ptr<float>(op, 0),
+                                   int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
+                                   int(position), op.f[0], stream);
+            break;
+        case YUUKA_OP_ATTENTION:
+            yuuka::launch_attention_f32(
+                op_ptr<float>(op, 3),
+                op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2),
+                op_ptr<float>(op, 4),
+                int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
+                int(position), int(op.u[0]), op.f[0], stream);
+            break;
+        case YUUKA_OP_CONV1D:
+            yuuka::launch_conv1d_f32(op_ptr<float>(op, 0),
+                                     op_ptr<const float>(op, 1),
+                                     op_ptr<const float>(op, 2),
+                                     op_ptr<float>(op, 3),
+                                     int(op.n[0]), int(op.n[1]), stream);
+            break;
+        case YUUKA_OP_GDN:
+            yuuka::launch_gdn_f32(
+                op_ptr<float>(op, 0),
+                op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2),
+                op_ptr<const float>(op, 3),
+                op_ptr<const float>(op, 4),
+                op_ptr<const float>(op, 5),
+                op_ptr<const float>(op, 6),
+                op_ptr<const float>(op, 7),
+                op_ptr<float>(op, 8),
+                int(op.n[0]), int(op.n[1]), int(op.n[2]), stream);
+            break;
+        case YUUKA_OP_SILU_MUL:
+            yuuka::launch_silu_mul_f32(op_ptr<float>(op, 2),
+                                       op_ptr<const float>(op, 0),
+                                       op_ptr<const float>(op, 1),
+                                       int64_t(op.n[0]), stream);
+            break;
+        case YUUKA_OP_ADD:
+            yuuka::launch_add_f32_buffers(op_ptr<float>(op, 0),
+                                          op_ptr<const float>(op, 1),
+                                          int64_t(op.n[0]), stream);
+            break;
+        case YUUKA_OP_COPY:
+            yuuka::launch_copy_f32(op_ptr<float>(op, 0),
+                                   op_ptr<const float>(op, 1),
+                                   int64_t(op.n[0]), stream);
+            break;
+        case YUUKA_OP_SCALE:
+            yuuka::launch_scale_f32(op_ptr<float>(op, 0),
+                                    int64_t(op.n[0]), op.f[0], stream);
+            break;
+        case YUUKA_OP_EMBEDDING:
+            yuuka::launch_embedding_f32(op_ptr<float>(op, 1),
+                                        op_ptr<const void>(op, 0), token, op.n[1], int64_t(op.n[0]),
+                                        op.u[0], stream);
+            break;
+        case YUUKA_OP_KV_WRITE: {
+            const uint64_t bytes = op.n[0] * sizeof(float);
+            const uint64_t cache_offset = uint64_t(position) * bytes;
+            hipError_t err = hipMemcpyAsync(
+                static_cast<uint8_t *>(op.buf[2]->ptr) + op.off[2] + cache_offset,
+                op_ptr<const void>(op, 0), bytes, hipMemcpyDeviceToDevice, stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "kv write k: %s", hip_error(err));
+            }
+            err = hipMemcpyAsync(
+                static_cast<uint8_t *>(op.buf[3]->ptr) + op.off[3] + cache_offset,
+                op_ptr<const void>(op, 1), bytes, hipMemcpyDeviceToDevice, stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "kv write v: %s", hip_error(err));
+            }
+            break;
+        }
+        default:
+            return fail(YUUKA_ERR_UNSUPPORTED, "unknown plan op %u", op.code);
+    }
+    return YUUKA_OK;
 }
 
 } // namespace
@@ -459,6 +618,68 @@ YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
             return fail(YUUKA_ERR_DEVICE, "gemv launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out) {
+    return guard([&]() -> yuuka_status {
+        if (dev == nullptr || out == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "device or plan handle is null");
+        }
+        *out = new yuuka_plan();
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API void yuuka_plan_destroy(yuuka_plan * plan) {
+    delete plan;
+}
+
+YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
+    return guard([&]() -> yuuka_status {
+        if (plan == nullptr || op == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
+        }
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_KV_WRITE) {
+            return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
+        }
+        plan->ops.push_back(*op);
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_plan_execute(yuuka_plan * plan, yuuka_stream * stream,
+                                          int32_t token, uint32_t position,
+                                          int run_tail, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (plan == nullptr || stream == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or stream is null");
+        }
+        for (const yuuka_op & op : plan->ops) {
+            if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
+                continue;
+            }
+            for (int i = 0; i < 10; ++i) {
+                if (op.buf[i] != nullptr && op.buf[i]->ptr == nullptr) {
+                    return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan op %u has a null buffer", op.code);
+                }
+            }
+            yuuka_status status = execute_op(op, token, position, stream->stream);
+            if (status != YUUKA_OK) {
+                return status;
+            }
+        }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "plan execute: %s", hip_error(err));
         }
         if (completion != nullptr) {
             err = hipEventRecord(completion->event, stream->stream);

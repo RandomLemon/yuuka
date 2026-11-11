@@ -21,8 +21,13 @@ if(YUUKA_ENABLE_HIP)
     set_source_files_properties(backend/hip/bridge/bridge.cpp PROPERTIES LANGUAGE HIP)
     add_library(yuuka_hip SHARED
         backend/hip/bridge/bridge.cpp
+        kernels/hip/attention/attention.hip
+        kernels/hip/embedding/embedding.hip
         kernels/hip/gemv/gemv_quant.hip
         kernels/hip/ops/elementwise.hip
+        kernels/hip/ops/norm.hip
+        kernels/hip/ops/rope.hip
+        kernels/hip/ssm/ssm.hip
     )
     target_include_directories(yuuka_hip PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/backend/hip/bridge
@@ -60,5 +65,10 @@ if(YUUKA_ENABLE_HIP)
         target_link_libraries(yuuka_hip_gemv_test PRIVATE yuuka_hip)
         add_test(NAME hip_gemv_correctness COMMAND yuuka_hip_gemv_test)
         set_tests_properties(hip_gemv_correctness PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(yuuka_hip_ops_test tests/hip/ops_test.cpp)
+        target_link_libraries(yuuka_hip_ops_test PRIVATE yuuka_hip)
+        add_test(NAME hip_ops_correctness COMMAND yuuka_hip_ops_test)
+        set_tests_properties(hip_ops_correctness PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()

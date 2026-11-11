@@ -87,6 +87,37 @@ YUUKA_API yuuka_status yuuka_add_f32(yuuka_stream * stream, yuuka_buffer * dst,
  * declared in yuuka_dtype. The operation is submitted on stream and signals
  * completion after the kernel. No host synchronization is performed.
  */
+typedef enum yuuka_op_code {
+    YUUKA_OP_GEMV = 1,
+    YUUKA_OP_RMSNORM = 2,
+    YUUKA_OP_L2NORM = 3,
+    YUUKA_OP_GATED_RMSNORM = 4,
+    YUUKA_OP_ROPE = 5,
+    YUUKA_OP_ATTENTION = 6,
+    YUUKA_OP_CONV1D = 7,
+    YUUKA_OP_GDN = 8,
+    YUUKA_OP_SILU_MUL = 9,
+    YUUKA_OP_ADD = 10,
+    YUUKA_OP_COPY = 11,
+    YUUKA_OP_SCALE = 12,
+    YUUKA_OP_EMBEDDING = 13,
+    YUUKA_OP_KV_WRITE = 14
+} yuuka_op_code;
+
+#define YUUKA_OP_FLAG_TAIL 0x1u
+
+typedef struct yuuka_op {
+    uint32_t code;
+    uint32_t flags;
+    yuuka_buffer * buf[10];
+    uint64_t off[10];
+    uint64_t n[6];
+    uint32_t u[4];
+    float f[4];
+} yuuka_op;
+
+typedef struct yuuka_plan yuuka_plan;
+
 typedef enum yuuka_dtype {
     YUUKA_DTYPE_F32 = 0,
     YUUKA_DTYPE_F16 = 1,
@@ -100,6 +131,14 @@ YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
                         const yuuka_buffer * x, const yuuka_buffer * w,
                         uint64_t n_in, uint64_t n_out, uint32_t dtype,
                         yuuka_event * completion);
+
+/* Plans batch generic device operations into one submission. */
+YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out);
+YUUKA_API void yuuka_plan_destroy(yuuka_plan * plan);
+YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op);
+YUUKA_API yuuka_status yuuka_plan_execute(yuuka_plan * plan, yuuka_stream * stream,
+                                          int32_t token, uint32_t position,
+                                          int run_tail, yuuka_event * completion);
 
 #ifdef __cplusplus
 }

@@ -41,6 +41,7 @@ type server struct {
 	engine      *engine.Engine
 	contextSize int
 	modelName   string
+	backend     string
 	started     time.Time
 	mu          sync.Mutex
 	metrics     metrics
@@ -52,6 +53,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	contextSize := flag.Int("ctx", 4096, "context capacity for the loaded model")
 	modelName := flag.String("model-name", "yuuka", "model identifier returned by the API")
+	backend := flag.String("backend", "cpu", "execution backend: cpu or hip")
 	flag.Parse()
 
 	if *modelPath == "" {
@@ -73,10 +75,20 @@ func main() {
 	if *contextSize > model.Config.ContextLength {
 		log.Fatalf("--ctx %d exceeds model context %d", *contextSize, model.Config.ContextLength)
 	}
-	runner, err := engine.New(model, tok, *contextSize, nil)
+	var runner *engine.Engine
+	if *backend == "cpu" {
+		runner, err = engine.New(model, tok, *contextSize, nil)
+	} else {
+		runtime, runtimeErr := buildRuntime(reader, model, *contextSize, *backend)
+		if runtimeErr != nil {
+			log.Fatal(runtimeErr)
+		}
+		runner, err = engine.NewWithRuntime(runtime, tok, nil)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer runner.Close()
 	srv := &server{
 		reader:      reader,
 		tokenizer:   tok,
@@ -84,6 +96,7 @@ func main() {
 		engine:      runner,
 		contextSize: *contextSize,
 		modelName:   *modelName,
+		backend:     *backend,
 		started:     time.Now(),
 	}
 	mux := http.NewServeMux()
@@ -120,7 +133,7 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"model":        s.modelName,
 		"architecture": s.model.Config.Architecture,
 		"context":      s.contextSize,
-		"backend":      "cpu",
+		"backend":      s.backend,
 		"uptime_s":     time.Since(s.started).Seconds(),
 	})
 }
@@ -154,7 +167,7 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 				"architecture": s.model.Config.Architecture,
 				"context":      s.contextSize,
 				"vocab_size":   s.model.Config.VocabSize,
-				"backend":      "cpu",
+				"backend":      s.backend,
 			},
 		}},
 	})
@@ -426,7 +439,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"prefill_ms": result.PrefillTime.Seconds() * 1000,
 			"ttft_ms":    result.TimeToFirst.Seconds() * 1000,
 			"decode_ms":  result.DecodeTime.Seconds() * 1000,
-			"backend":    "cpu",
+			"backend":    s.backend,
 		},
 	})
 }

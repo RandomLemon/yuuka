@@ -177,6 +177,7 @@ func runGenerate(args []string) error {
 	chat := fs.Bool("chat", false, "render the model chat template")
 	thinking := fs.Bool("thinking", false, "enable an open reasoning block in chat mode")
 	contextSize := fs.Int("ctx", 4096, "context capacity")
+	backend := fs.String("backend", "cpu", "execution backend: cpu or hip")
 	maxTokens := fs.Int("max-tokens", 128, "maximum generated tokens")
 	temperature := fs.Float64("temperature", 0, "sampling temperature (0 = greedy)")
 	topK := fs.Int("top-k", 40, "top-k sampling cutoff")
@@ -226,10 +227,11 @@ func runGenerate(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := engine.New(l.model, l.tokenizer, *contextSize, sampler)
+	runner, err := buildEngine(l, *contextSize, sampler, *backend)
 	if err != nil {
 		return err
 	}
+	defer runner.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	started := time.Now()
@@ -261,6 +263,7 @@ func runBench(args []string) error {
 	promptTokens := fs.Int("prompt-tokens", 128, "prompt length in tokens")
 	decodeTokens := fs.Int("decode-tokens", 32, "generated tokens per repetition")
 	contextSize := fs.Int("ctx", 0, "context capacity (default: prompt + decode + 64)")
+	backend := fs.String("backend", "cpu", "execution backend: cpu or hip")
 	warmup := fs.Int("warmup", 1, "warmup repetitions")
 	reps := fs.Int("reps", 3, "measured repetitions")
 	hash := fs.Bool("hash", false, "print the model SHA-256")
@@ -295,10 +298,11 @@ func runBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := engine.New(l.model, l.tokenizer, capacity, sampler)
+	runner, err := buildEngine(l, capacity, sampler, *backend)
 	if err != nil {
 		return err
 	}
+	defer runner.Close()
 	run := func() (*engine.GenerateResult, error) {
 		return runner.Generate(context.Background(), ids, engine.GenerateOptions{
 			MaxTokens: *decodeTokens,
@@ -338,6 +342,26 @@ func runBench(args []string) error {
 	fmt.Printf("prefill: %.3fs (%.2f tok/s)\n", prefill/n, prefillPS/n)
 	fmt.Printf("ttft: %.3fs  decode: %.3fs (%.2f tok/s)\n", ttft/n, decode/n, decodePS/n)
 	return nil
+}
+
+func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string) (*engine.Engine, error) {
+	switch backend {
+	case "cpu":
+		return engine.New(l.model, l.tokenizer, capacity, sampler)
+	case "hip":
+		runtime, err := newHIPRuntime(l, capacity)
+		if err != nil {
+			return nil, err
+		}
+		runner, err := engine.NewWithRuntime(runtime, l.tokenizer, sampler)
+		if err != nil {
+			_ = runtime.Close()
+			return nil, err
+		}
+		return runner, nil
+	default:
+		return nil, fmt.Errorf("unknown backend %q (want cpu or hip)", backend)
+	}
 }
 
 func (l *loadedModel) quantizationLabel() string {

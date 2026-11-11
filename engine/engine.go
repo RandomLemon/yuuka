@@ -43,28 +43,72 @@ type GenerateResult struct {
 	DecodeTokensPS float64
 }
 
-// Engine owns a model, a reusable request state, and a sampler.
+// Runtime is the execution surface used by the generation loop. The CPU
+// reference backend and the HIP backend both implement it.
+type Runtime interface {
+	Reset()
+	Forward(tokens []int32) ([]float32, error)
+	Step(token int32) ([]float32, error)
+	Capacity() int
+	VocabSize() int
+	Close() error
+}
+
+type cpuRuntime struct {
+	model *qwen35.Model
+	state *qwen35.State
+}
+
+func (r *cpuRuntime) Reset() { r.state.Reset() }
+func (r *cpuRuntime) Forward(tokens []int32) ([]float32, error) {
+	return r.model.Forward(tokens, r.state)
+}
+func (r *cpuRuntime) Step(token int32) ([]float32, error) {
+	return r.model.Step(token, r.state)
+}
+func (r *cpuRuntime) Capacity() int  { return r.state.Capacity }
+func (r *cpuRuntime) VocabSize() int { return r.model.Config.VocabSize }
+func (r *cpuRuntime) Close() error   { return nil }
+
+// Engine owns a runtime, tokenizer, and sampler.
 type Engine struct {
-	Model     *qwen35.Model
+	Runtime   Runtime
 	Tokenizer *tokenizer.Tokenizer
-	State     *qwen35.State
 	Sampler   *Sampler
 }
 
-// New creates an engine for a model and tokenizer. capacity must not exceed
-// the model context length.
+// New creates a CPU reference engine for a model and tokenizer. capacity must
+// not exceed the model context length.
 func New(model *qwen35.Model, tok *tokenizer.Tokenizer, capacity int, sampler *Sampler) (*Engine, error) {
 	state, err := qwen35.NewState(model.Config, capacity)
 	if err != nil {
 		return nil, err
 	}
+	runtime := &cpuRuntime{model: model, state: state}
+	return NewWithRuntime(runtime, tok, sampler)
+}
+
+// Close releases the runtime. It is idempotent.
+func (e *Engine) Close() error {
+	if e == nil || e.Runtime == nil {
+		return nil
+	}
+	return e.Runtime.Close()
+}
+
+// NewWithRuntime creates an engine over an explicit runtime.
+func NewWithRuntime(runtime Runtime, tok *tokenizer.Tokenizer, sampler *Sampler) (*Engine, error) {
+	if runtime == nil || tok == nil {
+		return nil, fmt.Errorf("runtime and tokenizer are required")
+	}
 	if sampler == nil {
-		sampler, err = NewSampler(SamplerConfig{}, model.Config.VocabSize)
+		var err error
+		sampler, err = NewSampler(SamplerConfig{}, runtime.VocabSize())
 		if err != nil {
 			return nil, err
 		}
 	}
-	return &Engine{Model: model, Tokenizer: tok, State: state, Sampler: sampler}, nil
+	return &Engine{Runtime: runtime, Tokenizer: tok, Sampler: sampler}, nil
 }
 
 // Generate runs one prompt through the model and returns the generated tokens.
@@ -75,11 +119,11 @@ func (e *Engine) Generate(ctx context.Context, prompt []int32, opts GenerateOpti
 	if opts.MaxTokens <= 0 {
 		return nil, fmt.Errorf("max tokens must be positive")
 	}
-	if len(prompt) > e.State.Capacity {
+	if len(prompt) > e.Runtime.Capacity() {
 		return nil, fmt.Errorf("prompt length %d exceeds context capacity %d",
-			len(prompt), e.State.Capacity)
+			len(prompt), e.Runtime.Capacity())
 	}
-	remaining := e.State.Capacity - len(prompt)
+	remaining := e.Runtime.Capacity() - len(prompt)
 	if opts.MaxTokens > remaining {
 		opts.MaxTokens = remaining
 	}
@@ -90,10 +134,10 @@ func (e *Engine) Generate(ctx context.Context, prompt []int32, opts GenerateOpti
 		return nil, err
 	}
 
-	e.State.Reset()
+	e.Runtime.Reset()
 	result := &GenerateResult{PromptTokens: len(prompt)}
 	started := time.Now()
-	logits, err := e.Model.Forward(prompt, e.State)
+	logits, err := e.Runtime.Forward(prompt)
 	if err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
@@ -151,7 +195,7 @@ func (e *Engine) Generate(ctx context.Context, prompt []int32, opts GenerateOpti
 		if i+1 == opts.MaxTokens {
 			break
 		}
-		logits, err = e.Model.Step(token, e.State)
+		logits, err = e.Runtime.Step(token)
 		if err != nil {
 			return nil, fmt.Errorf("decode: %w", err)
 		}
