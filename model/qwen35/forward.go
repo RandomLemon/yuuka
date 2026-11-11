@@ -10,6 +10,12 @@ import (
 // Forward processes tokens and returns the logits for the last token. The
 // returned slice is owned by st and is valid until the next forward call.
 func (m *Model) Forward(tokens []int32, st *State) ([]float32, error) {
+	return m.ForwardTrace(tokens, st, nil)
+}
+
+// ForwardTrace is Forward with an optional per-layer hidden-state callback. The
+// callback must copy x if it needs the values after the call returns.
+func (m *Model) ForwardTrace(tokens []int32, st *State, trace func(layer int, x []float32)) ([]float32, error) {
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("empty token sequence")
 	}
@@ -24,7 +30,7 @@ func (m *Model) Forward(tokens []int32, st *State) ([]float32, error) {
 		if token < 0 || int(token) >= m.Config.VocabSize {
 			return nil, fmt.Errorf("token id %d is out of range", token)
 		}
-		if err := m.forwardOne(token, st, i == len(tokens)-1); err != nil {
+		if err := m.forwardOne(token, st, i == len(tokens)-1, trace); err != nil {
 			return nil, err
 		}
 	}
@@ -51,7 +57,7 @@ func (m *Model) MatVecOutput(dst, hidden []float32) error {
 // call. The slice is owned by st and is valid until the next forward call.
 func (m *Model) LastHidden(st *State) []float32 { return st.scratch.norm }
 
-func (m *Model) forwardOne(token int32, st *State, wantLogits bool) error {
+func (m *Model) forwardOne(token int32, st *State, wantLogits bool, trace func(int, []float32)) error {
 	if st.Pos >= st.Capacity {
 		return fmt.Errorf("context capacity %d exhausted", st.Capacity)
 	}
@@ -76,6 +82,9 @@ func (m *Model) forwardOne(token int32, st *State, wantLogits bool) error {
 			if err := m.forwardRecurrent(i, layer, st); err != nil {
 				return err
 			}
+		}
+		if trace != nil {
+			trace(i, st.scratch.x)
 		}
 	}
 

@@ -6,3 +6,5 @@
 *.log
 *.gguf
 /bench/results/
+/yuuka
+/yuuka-server
