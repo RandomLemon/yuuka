@@ -104,6 +104,37 @@ T * op_ptr(yuuka_op const & op, int index) {
     return reinterpret_cast<T *>(static_cast<uint8_t *>(op.buf[index]->ptr) + op.off[index]);
 }
 
+void launch_gemv_batch_dispatch(yuuka_op const & op, hipStream_t stream) {
+    auto * out = op_ptr<float>(op, 2);
+    const auto * x = op_ptr<const float>(op, 1);
+    const void * w = op_ptr<const void>(op, 0);
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t batch = op.n[2];
+    switch (op.u[0]) {
+        case YUUKA_DTYPE_F32:
+            yuuka::launch_gemv_batch_f32(out, x, static_cast<const float *>(w), n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_F16:
+            yuuka::launch_gemv_batch_f16(out, x, w, n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_Q8_0:
+            yuuka::launch_gemv_batch_q8_0(out, x, w, n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_Q4_K:
+            yuuka::launch_gemv_batch_q4_k(out, x, w, n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_Q5_K:
+            yuuka::launch_gemv_batch_q5_k(out, x, w, n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_Q6_K:
+            yuuka::launch_gemv_batch_q6_k(out, x, w, n_in, n_out, batch, stream);
+            break;
+        default:
+            break;
+    }
+}
+
 void launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
     auto * out = op_ptr<float>(op, 2);
     const auto * x = op_ptr<const float>(op, 1);
@@ -162,6 +193,9 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             break;
         case YUUKA_OP_GEMM:
             launch_gemm_dispatch(op, stream);
+            break;
+        case YUUKA_OP_GEMV_BATCH:
+            launch_gemv_batch_dispatch(op, stream);
             break;
         case YUUKA_OP_RMSNORM: {
             auto * dst = op_ptr<float>(op, 2);
@@ -577,6 +611,58 @@ YUUKA_API yuuka_status yuuka_add_f32(yuuka_stream * stream, yuuka_buffer * dst,
     });
 }
 
+YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * out,
+                                        const yuuka_buffer * x, const yuuka_buffer * w,
+                                        uint64_t n_in, uint64_t n_out, uint64_t batch,
+                                        uint32_t dtype, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || out == nullptr || x == nullptr || w == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        if (!check_gemv_shapes(n_in, dtype)) {
+            return fail(YUUKA_ERR_UNSUPPORTED,
+                        "unsupported gemv dtype %u or input width %llu",
+                        dtype, static_cast<unsigned long long>(n_in));
+        }
+        if (n_out == 0 || batch == 0 || batch > 16) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "output width or batch is invalid");
+        }
+        const uint64_t weight_row_bytes = row_bytes(n_in, dtype);
+        if (w->bytes != weight_row_bytes * n_out) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "weight buffer has %llu bytes, expected %llu",
+                        static_cast<unsigned long long>(w->bytes),
+                        static_cast<unsigned long long>(weight_row_bytes * n_out));
+        }
+        if (x->bytes < n_in * batch * sizeof(float) ||
+            out->bytes < n_out * batch * sizeof(float)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv batch buffer is too small");
+        }
+        const float * x_ptr = static_cast<const float *>(x->ptr);
+        float * out_ptr = static_cast<float *>(out->ptr);
+        switch (dtype) {
+            case YUUKA_DTYPE_F32: yuuka::launch_gemv_batch_f32(out_ptr, x_ptr, static_cast<const float *>(w->ptr), n_in, n_out, batch, stream->stream); break;
+            case YUUKA_DTYPE_F16: yuuka::launch_gemv_batch_f16(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
+            case YUUKA_DTYPE_Q8_0: yuuka::launch_gemv_batch_q8_0(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
+            case YUUKA_DTYPE_Q4_K: yuuka::launch_gemv_batch_q4_k(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
+            case YUUKA_DTYPE_Q5_K: yuuka::launch_gemv_batch_q5_k(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
+            case YUUKA_DTYPE_Q6_K: yuuka::launch_gemv_batch_q6_k(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
+            default: return fail(YUUKA_ERR_UNSUPPORTED, "unsupported gemv dtype %u", dtype);
+        }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "gemv batch launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
 YUUKA_API yuuka_status yuuka_gemm(yuuka_stream * stream, yuuka_buffer * out,
                                   const yuuka_buffer * x, const yuuka_buffer * w,
                                   uint64_t n_in, uint64_t n_out, uint64_t batch,
@@ -720,10 +806,114 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMM) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMV_BATCH) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         plan->ops.push_back(*op);
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_plan_execute_profiled(
+    yuuka_plan * plan, yuuka_stream * stream, int32_t token, uint32_t position,
+    int run_tail, uint32_t * op_codes, uint64_t * op_times_ns,
+    uint64_t capacity, uint64_t * op_count, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (plan == nullptr || stream == nullptr || op_count == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan, stream, or op_count is null");
+        }
+        uint64_t executed = 0;
+        for (const yuuka_op & op : plan->ops) {
+            if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
+                continue;
+            }
+            executed++;
+        }
+        if (capacity < executed || (executed != 0 && (op_codes == nullptr || op_times_ns == nullptr))) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "profile output capacity %llu is too small for %llu ops",
+                        static_cast<unsigned long long>(capacity),
+                        static_cast<unsigned long long>(executed));
+        }
+        std::vector<hipEvent_t> starts;
+        std::vector<hipEvent_t> stops;
+        std::vector<const yuuka_op *> ops;
+        starts.reserve(executed);
+        stops.reserve(executed);
+        ops.reserve(executed);
+        auto cleanup = [&]() {
+            for (hipEvent_t ev : starts) {
+                hipError_t cleanup_err = hipEventDestroy(ev);
+                (void)cleanup_err;
+            }
+            for (hipEvent_t ev : stops) {
+                hipError_t cleanup_err = hipEventDestroy(ev);
+                (void)cleanup_err;
+            }
+        };
+        for (const yuuka_op & op : plan->ops) {
+            if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
+                continue;
+            }
+            for (int i = 0; i < 10; ++i) {
+                if (op.buf[i] != nullptr && op.buf[i]->ptr == nullptr) {
+                    cleanup();
+                    return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan op %u has a null buffer", op.code);
+                }
+            }
+            hipEvent_t start = nullptr;
+            hipEvent_t stop = nullptr;
+            hipError_t err = hipEventCreate(&start);
+            if (err != hipSuccess) {
+                cleanup();
+                return fail(YUUKA_ERR_DEVICE, "profile event create: %s", hip_error(err));
+            }
+            starts.push_back(start);
+            err = hipEventCreate(&stop);
+            if (err != hipSuccess) {
+                cleanup();
+                return fail(YUUKA_ERR_DEVICE, "profile event create: %s", hip_error(err));
+            }
+            stops.push_back(stop);
+            ops.push_back(&op);
+            err = hipEventRecord(start, stream->stream);
+            if (err != hipSuccess) {
+                cleanup();
+                return fail(YUUKA_ERR_DEVICE, "profile event record: %s", hip_error(err));
+            }
+            yuuka_status status = execute_op(op, token, position, stream->stream);
+            if (status != YUUKA_OK) {
+                cleanup();
+                return status;
+            }
+            err = hipEventRecord(stop, stream->stream);
+            if (err != hipSuccess) {
+                cleanup();
+                return fail(YUUKA_ERR_DEVICE, "profile event record: %s", hip_error(err));
+            }
+        }
+        hipError_t err = hipStreamSynchronize(stream->stream);
+        if (err != hipSuccess) {
+            cleanup();
+            return fail(YUUKA_ERR_DEVICE, "profile synchronize: %s", hip_error(err));
+        }
+        for (size_t i = 0; i < ops.size(); ++i) {
+            float milliseconds = 0.0f;
+            err = hipEventElapsedTime(&milliseconds, starts[i], stops[i]);
+            if (err != hipSuccess) {
+                cleanup();
+                return fail(YUUKA_ERR_DEVICE, "profile elapsed time: %s", hip_error(err));
+            }
+            op_codes[i] = ops[i]->code;
+            op_times_ns[i] = static_cast<uint64_t>(milliseconds * 1000000.0f);
+        }
+        *op_count = executed;
+        cleanup();
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
         return YUUKA_OK;
     });
 }

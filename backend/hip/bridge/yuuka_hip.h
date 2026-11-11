@@ -103,7 +103,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_EMBEDDING = 13,
     YUUKA_OP_KV_WRITE = 14,
     YUUKA_OP_RMSNORM_HEADS = 15,
-    YUUKA_OP_GEMM = 16
+    YUUKA_OP_GEMM = 16,
+    YUUKA_OP_GEMV_BATCH = 17
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -146,6 +147,18 @@ YUUKA_API yuuka_status yuuka_gemm(yuuka_stream * stream, yuuka_buffer * out,
                         uint64_t n_in, uint64_t n_out, uint64_t batch,
                         uint32_t dtype, yuuka_event * completion);
 
+/* Batched quantized/unquantized GEMV:
+ *
+ * out[batch, n_out] = W[n_out, n_in] * x[batch, n_in]
+ *
+ * Unlike gemm, this path supports every decode dtype and reuses each packed
+ * weight element across the batch. batch is limited to 16.
+ */
+YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * x, const yuuka_buffer * w,
+                        uint64_t n_in, uint64_t n_out, uint64_t batch,
+                        uint32_t dtype, yuuka_event * completion);
+
 /* Plans batch generic device operations into one submission. */
 YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out);
 YUUKA_API void yuuka_plan_destroy(yuuka_plan * plan);
@@ -153,6 +166,14 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op);
 YUUKA_API yuuka_status yuuka_plan_execute(yuuka_plan * plan, yuuka_stream * stream,
                                           int32_t token, uint32_t position,
                                           int run_tail, yuuka_event * completion);
+
+/* Diagnostic execution path. Records HIP events around every submitted
+ * operation, synchronizes once, and returns per-op codes and elapsed
+ * nanoseconds. It is intended for offline attribution, not the hot path. */
+YUUKA_API yuuka_status yuuka_plan_execute_profiled(
+    yuuka_plan * plan, yuuka_stream * stream, int32_t token, uint32_t position,
+    int run_tail, uint32_t * op_codes, uint64_t * op_times_ns,
+    uint64_t capacity, uint64_t * op_count, yuuka_event * completion);
 
 #ifdef __cplusplus
 }

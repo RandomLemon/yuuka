@@ -72,6 +72,9 @@ func New(reader *gguf.Reader, model *qwen35.Model, capacity int) (*Runtime, erro
 	if capacity <= 0 || capacity > model.Config.ContextLength {
 		return nil, fmt.Errorf("invalid context capacity %d", capacity)
 	}
+	if err := validateModelSupport(model); err != nil {
+		return nil, err
+	}
 	device, err := hip.Open(0)
 	if err != nil {
 		return nil, err
@@ -562,6 +565,27 @@ func (r *Runtime) Forward(tokens []int32) ([]float32, error) {
 
 func (r *Runtime) Step(token int32) ([]float32, error) {
 	return r.Forward([]int32{token})
+}
+
+// ProfileStep executes one token through the ordinary plan with per-operation
+// HIP events and returns the submitted operation timings. The runtime position
+// advances exactly as it does for Forward.
+func (r *Runtime) ProfileStep(token int32) ([]hip.OpTime, error) {
+	if token < 0 || int(token) >= r.config.VocabSize {
+		return nil, fmt.Errorf("token id %d is out of range", token)
+	}
+	if r.pos >= r.capacity {
+		return nil, fmt.Errorf("context capacity %d exhausted", r.capacity)
+	}
+	times, err := r.plan.ExecuteProfiled(r.stream, token, uint32(r.pos), true, r.event)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.event.Wait(); err != nil {
+		return nil, err
+	}
+	r.pos++
+	return times, nil
 }
 
 // ForwardTrace processes tokens and returns the last-token logits together

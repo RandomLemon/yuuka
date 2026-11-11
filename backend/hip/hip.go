@@ -354,6 +354,37 @@ func (p *Plan) AddGemvAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Bu
 	return p.add(op)
 }
 
+// AddGemvBatch appends out = W * X for a packed decode weight matrix and a
+// batch of up to 16 rows. x is [batch, nIn] and out is [batch, nOut].
+func (p *Plan) AddGemvBatch(w, x, out *Buffer, nIn, nOut, batch int64, dtype tensor.DType) error {
+	return p.AddGemvBatchAt(w, 0, x, 0, out, 0, nIn, nOut, batch, dtype)
+}
+
+// AddGemvBatchAt appends a batched GEMV with byte offsets applied to each buffer.
+func (p *Plan) AddGemvBatchAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, nIn, nOut, batch int64, dtype tensor.DType) error {
+	if batch <= 0 || batch > 16 {
+		return fmt.Errorf("hip: batched GEMV batch %d is outside 1..16", batch)
+	}
+	if nIn <= 0 || nOut <= 0 {
+		return errors.New("hip: batched GEMV dimensions must be positive")
+	}
+	if err := p.check(w, x, out); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMV_BATCH}
+	op.off[0] = C.uint64_t(wOff)
+	op.off[1] = C.uint64_t(xOff)
+	op.off[2] = C.uint64_t(outOff)
+	op.buf[0] = w.ptr
+	op.buf[1] = x.ptr
+	op.buf[2] = out.ptr
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(batch)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
 // AddGemm appends out = W * X for a packed weight matrix and a batch of
 // contiguous input rows. x is [batch, nIn] and out is [batch, nOut].
 func (p *Plan) AddGemm(w, x, out *Buffer, nIn, nOut, batch int64, dtype tensor.DType) error {
@@ -629,6 +660,54 @@ func (p *Plan) Execute(stream *Stream, token int32, position uint32, runTail boo
 		ev = event.ptr
 	}
 	return status(C.yuuka_plan_execute(p.ptr, stream.ptr, C.int32_t(token), C.uint32_t(position), tail, ev), "plan_execute")
+}
+
+// OpTime is one profiled operation in plan order.
+type OpTime struct {
+	Code  uint32
+	Nanos uint64
+}
+
+// ExecuteProfiled runs the plan with HIP events around every operation and
+// leaks no events. It synchronizes once before returning, so it is a
+// diagnostic path rather than a hot-path submission.
+func (p *Plan) ExecuteProfiled(stream *Stream, token int32, position uint32, runTail bool, event *Event) ([]OpTime, error) {
+	if p == nil || p.ptr == nil {
+		return nil, errors.New("hip: plan is closed")
+	}
+	if stream == nil || stream.closed {
+		return nil, errors.New("hip: stream is closed")
+	}
+	tail := C.int(0)
+	if runTail {
+		tail = 1
+	}
+	var ev *C.yuuka_event
+	if event != nil {
+		ev = event.ptr
+	}
+	codes := make([]C.uint32_t, p.ops)
+	times := make([]C.uint64_t, p.ops)
+	var codesPtr *C.uint32_t
+	var timesPtr *C.uint64_t
+	if len(codes) != 0 {
+		codesPtr = &codes[0]
+		timesPtr = &times[0]
+	}
+	count := C.uint64_t(0)
+	err := status(C.yuuka_plan_execute_profiled(
+		p.ptr, stream.ptr, C.int32_t(token), C.uint32_t(position), tail,
+		codesPtr, timesPtr, C.uint64_t(len(codes)), &count, ev), "plan_execute_profiled")
+	runtime.KeepAlive(codes)
+	runtime.KeepAlive(times)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]OpTime, int(count))
+	for i := range out {
+		out[i] = OpTime{Code: uint32(codes[i]), Nanos: uint64(times[i])}
+	}
+	return out, nil
 }
 
 // Close releases the plan. It is idempotent.

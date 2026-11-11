@@ -451,11 +451,25 @@ func (l *loadedModel) quantizationLabel() string {
 		return "unknown"
 	}
 	switch raw {
+	case 7:
+		return "Q8_0"
+	case 10:
+		return "Q2_K"
+	case 11:
+		return "Q3_K_S"
+	case 12:
+		return "Q3_K_M"
+	case 13:
+		return "Q3_K_L"
+	case 14:
+		return "Q4_K_S"
 	case 15:
 		return "Q4_K_M"
-	case 14:
-		return "Q5_K_M"
+	case 16:
+		return "Q5_K_S"
 	case 17:
+		return "Q5_K_M"
+	case 18:
 		return "Q6_K"
 	default:
 		return fmt.Sprintf("file_type=%d", raw)

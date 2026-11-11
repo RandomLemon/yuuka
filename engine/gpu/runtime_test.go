@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/yuuka-ai/yuuka/gguf"
@@ -222,4 +223,58 @@ func TestGPULayerTraceMatchesCPU(t *testing.T) {
 		}
 	}
 	t.Logf("worst layer %d max abs hidden diff %.6g", worstLayer, worstDiff)
+}
+
+func TestGPUProfileDecode(t *testing.T) {
+	reader, _, model, prompt := goldenPrompt(t)
+	rt, err := New(reader, model, 64)
+	if err != nil {
+		t.Skipf("HIP runtime unavailable: %v", err)
+	}
+	defer rt.Close()
+	logits, err := rt.Forward(prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := argmax(logits)
+	times, err := rt.ProfileStep(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(times) == 0 {
+		t.Fatal("profile returned no operations")
+	}
+	names := map[uint32]string{
+		1: "gemv", 2: "rmsnorm", 3: "l2norm", 4: "gated_rmsnorm",
+		5: "rope", 6: "attention", 7: "conv1d", 8: "gdn", 9: "silu_mul",
+		10: "add", 11: "copy", 12: "scale", 13: "embedding",
+		14: "kv_write", 15: "rmsnorm_heads", 16: "gemm",
+	}
+	totals := make(map[uint32]uint64)
+	var total uint64
+	for _, item := range times {
+		totals[item.Code] += item.Nanos
+		total += item.Nanos
+	}
+	type row struct {
+		code uint32
+		ns   uint64
+	}
+	rows := make([]row, 0, len(totals))
+	for code, ns := range totals {
+		rows = append(rows, row{code, ns})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ns > rows[j].ns })
+	t.Logf("profiled %d ops, total %.3f ms", len(times), float64(total)/1e6)
+	for i, item := range rows {
+		if i == 10 {
+			break
+		}
+		name := names[item.code]
+		if name == "" {
+			name = "unknown"
+		}
+		t.Logf("%-14s %8.3f ms  %5.1f%%", name, float64(item.ns)/1e6,
+			100*float64(item.ns)/float64(total))
+	}
 }

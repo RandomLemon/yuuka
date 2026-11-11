@@ -53,6 +53,9 @@ if(YUUKA_ENABLE_HIP)
         find_package(rocwmma REQUIRED)
         add_executable(yuuka_hardware_probe bench/hip/hardware_probe.hip)
         target_link_libraries(yuuka_hardware_probe PRIVATE hip::device roc::rocblas roc::rocwmma)
+
+        add_executable(yuuka_gemv_sweep bench/hip/gemv_sweep.cpp)
+        target_link_libraries(yuuka_gemv_sweep PRIVATE yuuka_hip)
     endif()
 
     if(YUUKA_BUILD_TESTS)
