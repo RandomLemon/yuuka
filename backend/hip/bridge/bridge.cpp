@@ -67,23 +67,136 @@ bool check_gemv_shapes(uint64_t n_in, uint32_t dtype) {
     }
 }
 
-uint64_t row_bytes(uint64_t n_in, uint32_t dtype) {
+bool checked_row_bytes(uint64_t n_in, uint32_t dtype, uint64_t * out) {
+    uint64_t blocks = 0;
     switch (dtype) {
         case YUUKA_DTYPE_F32:
-            return n_in * 4;
+            return !__builtin_mul_overflow(n_in, uint64_t(4), out);
         case YUUKA_DTYPE_F16:
-            return n_in * 2;
+            return !__builtin_mul_overflow(n_in, uint64_t(2), out);
         case YUUKA_DTYPE_Q8_0:
-            return (n_in / 32) * 34;
+            blocks = n_in / 32;
+            return !__builtin_mul_overflow(blocks, uint64_t(34), out);
         case YUUKA_DTYPE_Q4_K:
-            return (n_in / 256) * 144;
+            blocks = n_in / 256;
+            return !__builtin_mul_overflow(blocks, uint64_t(144), out);
         case YUUKA_DTYPE_Q5_K:
-            return (n_in / 256) * 176;
+            blocks = n_in / 256;
+            return !__builtin_mul_overflow(blocks, uint64_t(176), out);
         case YUUKA_DTYPE_Q6_K:
-            return (n_in / 256) * 210;
+            blocks = n_in / 256;
+            return !__builtin_mul_overflow(blocks, uint64_t(210), out);
         default:
-            return 0;
+            return false;
     }
+}
+
+bool checked_float_bytes(uint64_t elements, uint64_t * out) {
+    return !__builtin_mul_overflow(elements, uint64_t(sizeof(float)), out);
+}
+
+bool buffer_range_ok(const yuuka_buffer * buf, uint64_t offset, uint64_t bytes) {
+    return buf != nullptr && offset <= buf->bytes && bytes <= buf->bytes - offset;
+}
+
+// validate_gemv_plan_op checks a GEMV or GEMV_BATCH operation before it enters
+// the plan. Unsupported dtypes and block-misaligned widths are capability
+// failures; invalid dimensions and undersized buffers are argument failures.
+// The check mirrors the direct GEMV entry points so a plan cannot silently
+// submit an operation that the direct API would reject.
+yuuka_status validate_gemv_plan_op(const yuuka_op & op, bool batched) {
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv op buffer %d is null", i);
+        }
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t batch = batched ? op.n[2] : 1;
+    const uint32_t dtype = op.u[0];
+    if (!check_gemv_shapes(n_in, dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "unsupported gemv dtype %u or input width %llu",
+                    dtype, static_cast<unsigned long long>(n_in));
+    }
+    if (n_out == 0 || batch == 0 || (batched && batch > 16)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid gemv output width %llu or batch %llu",
+                    static_cast<unsigned long long>(n_out),
+                    static_cast<unsigned long long>(batch));
+    }
+    uint64_t weight_bytes = 0;
+    uint64_t weight_row_bytes = 0;
+    uint64_t input_elements = 0;
+    uint64_t output_elements = 0;
+    if (!checked_row_bytes(n_in, dtype, &weight_row_bytes) ||
+        __builtin_mul_overflow(weight_row_bytes, n_out, &weight_bytes) ||
+        __builtin_mul_overflow(n_in, batch, &input_elements) ||
+        __builtin_mul_overflow(n_out, batch, &output_elements)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv dimensions overflow");
+    }
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    if (__builtin_mul_overflow(input_elements, uint64_t(sizeof(float)), &input_bytes) ||
+        __builtin_mul_overflow(output_elements, uint64_t(sizeof(float)), &output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv weight buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[1], op.off[1], input_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv input buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[2], op.off[2], output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv output buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_gemm_plan_op applies the same contract to the F32/F16 GEMM plan op.
+yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm op buffer %d is null", i);
+        }
+    }
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t batch = op.n[2];
+    const uint32_t dtype = op.u[0];
+    if (dtype != YUUKA_DTYPE_F32 && dtype != YUUKA_DTYPE_F16) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "unsupported gemm dtype %u", dtype);
+    }
+    if (n_in == 0 || n_out == 0 || batch == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm dimensions must be positive");
+    }
+    uint64_t weight_bytes = 0;
+    uint64_t weight_row_bytes = 0;
+    uint64_t input_elements = 0;
+    uint64_t output_elements = 0;
+    if (!checked_row_bytes(n_in, dtype, &weight_row_bytes) ||
+        __builtin_mul_overflow(weight_row_bytes, n_out, &weight_bytes) ||
+        __builtin_mul_overflow(n_in, batch, &input_elements) ||
+        __builtin_mul_overflow(n_out, batch, &output_elements)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm dimensions overflow");
+    }
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    if (__builtin_mul_overflow(input_elements, uint64_t(sizeof(float)), &input_bytes) ||
+        __builtin_mul_overflow(output_elements, uint64_t(sizeof(float)), &output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm weight buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[1], op.off[1], input_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm input buffer is too small");
+    }
+    if (!buffer_range_ok(op.buf[2], op.off[2], output_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm output buffer is too small");
+    }
+    return YUUKA_OK;
 }
 
 template <typename Fn>
@@ -104,7 +217,7 @@ T * op_ptr(yuuka_op const & op, int index) {
     return reinterpret_cast<T *>(static_cast<uint8_t *>(op.buf[index]->ptr) + op.off[index]);
 }
 
-void launch_gemv_batch_dispatch(yuuka_op const & op, hipStream_t stream) {
+yuuka_status launch_gemv_batch_dispatch(yuuka_op const & op, hipStream_t stream) {
     auto * out = op_ptr<float>(op, 2);
     const auto * x = op_ptr<const float>(op, 1);
     const void * w = op_ptr<const void>(op, 0);
@@ -131,11 +244,12 @@ void launch_gemv_batch_dispatch(yuuka_op const & op, hipStream_t stream) {
             yuuka::launch_gemv_batch_q6_k(out, x, w, n_in, n_out, batch, stream);
             break;
         default:
-            break;
+            return fail(YUUKA_ERR_UNSUPPORTED, "unsupported gemv dtype %u", op.u[0]);
     }
+    return YUUKA_OK;
 }
 
-void launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
+yuuka_status launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
     auto * out = op_ptr<float>(op, 2);
     const auto * x = op_ptr<const float>(op, 1);
     const void * w = op_ptr<const void>(op, 0);
@@ -151,11 +265,12 @@ void launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
             yuuka::launch_gemm_f16(out, x, w, n_in, n_out, batch, stream);
             break;
         default:
-            break;
+            return fail(YUUKA_ERR_UNSUPPORTED, "unsupported gemm dtype %u", op.u[0]);
     }
+    return YUUKA_OK;
 }
 
-void launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
+yuuka_status launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
     auto * out = op_ptr<float>(op, 2);
     const auto * x = op_ptr<const float>(op, 1);
     const void * w = op_ptr<const void>(op, 0);
@@ -181,22 +296,35 @@ void launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
             yuuka::launch_gemv_q6_k(out, x, w, n_in, n_out, stream);
             break;
         default:
-            break;
+            return fail(YUUKA_ERR_UNSUPPORTED, "unsupported gemv dtype %u", op.u[0]);
     }
+    return YUUKA_OK;
 }
 
 yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                         hipStream_t stream) {
     switch (op.code) {
-        case YUUKA_OP_GEMV:
-            launch_gemv_dispatch(op, stream);
+        case YUUKA_OP_GEMV: {
+            yuuka_status status = launch_gemv_dispatch(op, stream);
+            if (status != YUUKA_OK) {
+                return status;
+            }
             break;
-        case YUUKA_OP_GEMM:
-            launch_gemm_dispatch(op, stream);
+        }
+        case YUUKA_OP_GEMM: {
+            yuuka_status status = launch_gemm_dispatch(op, stream);
+            if (status != YUUKA_OK) {
+                return status;
+            }
             break;
-        case YUUKA_OP_GEMV_BATCH:
-            launch_gemv_batch_dispatch(op, stream);
+        }
+        case YUUKA_OP_GEMV_BATCH: {
+            yuuka_status status = launch_gemv_batch_dispatch(op, stream);
+            if (status != YUUKA_OK) {
+                return status;
+            }
             break;
+        }
         case YUUKA_OP_RMSNORM: {
             auto * dst = op_ptr<float>(op, 2);
             const auto * src = op_ptr<const float>(op, 0);
@@ -627,15 +755,27 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
         if (n_out == 0 || batch == 0 || batch > 16) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "output width or batch is invalid");
         }
-        const uint64_t weight_row_bytes = row_bytes(n_in, dtype);
-        if (w->bytes != weight_row_bytes * n_out) {
+        uint64_t weight_row_bytes = 0;
+        uint64_t weight_bytes = 0;
+        uint64_t input_elements = 0;
+        uint64_t output_elements = 0;
+        uint64_t input_bytes = 0;
+        uint64_t output_bytes = 0;
+        if (!checked_row_bytes(n_in, dtype, &weight_row_bytes) ||
+            __builtin_mul_overflow(weight_row_bytes, n_out, &weight_bytes) ||
+            __builtin_mul_overflow(n_in, batch, &input_elements) ||
+            __builtin_mul_overflow(n_out, batch, &output_elements) ||
+            !checked_float_bytes(input_elements, &input_bytes) ||
+            !checked_float_bytes(output_elements, &output_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv batch dimensions overflow");
+        }
+        if (w->bytes != weight_bytes) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT,
                         "weight buffer has %llu bytes, expected %llu",
                         static_cast<unsigned long long>(w->bytes),
-                        static_cast<unsigned long long>(weight_row_bytes * n_out));
+                        static_cast<unsigned long long>(weight_bytes));
         }
-        if (x->bytes < n_in * batch * sizeof(float) ||
-            out->bytes < n_out * batch * sizeof(float)) {
+        if (x->bytes < input_bytes || out->bytes < output_bytes) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv batch buffer is too small");
         }
         const float * x_ptr = static_cast<const float *>(x->ptr);
@@ -679,15 +819,27 @@ YUUKA_API yuuka_status yuuka_gemm(yuuka_stream * stream, yuuka_buffer * out,
         if (n_out == 0 || batch == 0) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "output width or batch is zero");
         }
-        const uint64_t weight_row_bytes = row_bytes(n_in, dtype);
-        if (w->bytes != weight_row_bytes * n_out) {
+        uint64_t weight_row_bytes = 0;
+        uint64_t weight_bytes = 0;
+        uint64_t input_elements = 0;
+        uint64_t output_elements = 0;
+        uint64_t input_bytes = 0;
+        uint64_t output_bytes = 0;
+        if (!checked_row_bytes(n_in, dtype, &weight_row_bytes) ||
+            __builtin_mul_overflow(weight_row_bytes, n_out, &weight_bytes) ||
+            __builtin_mul_overflow(n_in, batch, &input_elements) ||
+            __builtin_mul_overflow(n_out, batch, &output_elements) ||
+            !checked_float_bytes(input_elements, &input_bytes) ||
+            !checked_float_bytes(output_elements, &output_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm dimensions overflow");
+        }
+        if (w->bytes != weight_bytes) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT,
                         "weight buffer has %llu bytes, expected %llu",
                         static_cast<unsigned long long>(w->bytes),
-                        static_cast<unsigned long long>(weight_row_bytes * n_out));
+                        static_cast<unsigned long long>(weight_bytes));
         }
-        if (x->bytes < n_in * batch * sizeof(float) ||
-            out->bytes < n_out * batch * sizeof(float)) {
+        if (x->bytes < input_bytes || out->bytes < output_bytes) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm buffer is too small");
         }
         const float * x_ptr = static_cast<const float *>(x->ptr);
@@ -729,14 +881,21 @@ YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
         if (n_out == 0) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "output width is zero");
         }
-        const uint64_t input_bytes = n_in * sizeof(float);
-        const uint64_t output_bytes = n_out * sizeof(float);
-        const uint64_t weight_row_bytes = row_bytes(n_in, dtype);
-        if (w->bytes != weight_row_bytes * n_out) {
+        uint64_t weight_row_bytes = 0;
+        uint64_t weight_bytes = 0;
+        uint64_t input_bytes = 0;
+        uint64_t output_bytes = 0;
+        if (!checked_row_bytes(n_in, dtype, &weight_row_bytes) ||
+            __builtin_mul_overflow(weight_row_bytes, n_out, &weight_bytes) ||
+            !checked_float_bytes(n_in, &input_bytes) ||
+            !checked_float_bytes(n_out, &output_bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemv dimensions overflow");
+        }
+        if (w->bytes != weight_bytes) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT,
                         "weight buffer has %llu bytes, expected %llu",
                         static_cast<unsigned long long>(w->bytes),
-                        static_cast<unsigned long long>(weight_row_bytes * n_out));
+                        static_cast<unsigned long long>(weight_bytes));
         }
         if (x->bytes < input_bytes || out->bytes < output_bytes) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT,
@@ -808,6 +967,23 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         }
         if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMV_BATCH) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
+        }
+        yuuka_status status = YUUKA_OK;
+        switch (op->code) {
+            case YUUKA_OP_GEMV:
+                status = validate_gemv_plan_op(*op, false);
+                break;
+            case YUUKA_OP_GEMV_BATCH:
+                status = validate_gemv_plan_op(*op, true);
+                break;
+            case YUUKA_OP_GEMM:
+                status = validate_gemm_plan_op(*op);
+                break;
+            default:
+                break;
+        }
+        if (status != YUUKA_OK) {
+            return status;
         }
         plan->ops.push_back(*op);
         return YUUKA_OK;

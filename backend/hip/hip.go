@@ -331,6 +331,19 @@ func (p *Plan) check(buffers ...*Buffer) error {
 	return nil
 }
 
+// checkGemvDType rejects dtypes without a device kernel and widths that do not
+// satisfy the quantization block layout. It mirrors the C ABI validation so the
+// Go planner fails before submission.
+func checkGemvDType(dtype tensor.DType, nIn int64) error {
+	if !dtype.Supported() {
+		return fmt.Errorf("hip: GEMV dtype %s is not supported", dtype)
+	}
+	if _, err := dtype.RowBytes(nIn); err != nil {
+		return fmt.Errorf("hip: GEMV shape: %w", err)
+	}
+	return nil
+}
+
 // AddGemv appends out = W * x for a packed weight matrix.
 func (p *Plan) AddGemv(w, x, out *Buffer, nIn, nOut int64, dtype tensor.DType) error {
 	return p.AddGemvAt(w, 0, x, 0, out, 0, nIn, nOut, dtype)
@@ -338,6 +351,12 @@ func (p *Plan) AddGemv(w, x, out *Buffer, nIn, nOut int64, dtype tensor.DType) e
 
 // AddGemvAt appends a GEMV with byte offsets applied to each buffer.
 func (p *Plan) AddGemvAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, nIn, nOut int64, dtype tensor.DType) error {
+	if nIn <= 0 || nOut <= 0 {
+		return errors.New("hip: GEMV dimensions must be positive")
+	}
+	if err := checkGemvDType(dtype, nIn); err != nil {
+		return err
+	}
 	if err := p.check(w, x, out); err != nil {
 		return err
 	}
@@ -367,6 +386,9 @@ func (p *Plan) AddGemvBatchAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, ou
 	}
 	if nIn <= 0 || nOut <= 0 {
 		return errors.New("hip: batched GEMV dimensions must be positive")
+	}
+	if err := checkGemvDType(dtype, nIn); err != nil {
+		return err
 	}
 	if err := p.check(w, x, out); err != nil {
 		return err

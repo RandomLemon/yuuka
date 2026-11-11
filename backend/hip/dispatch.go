@@ -2,7 +2,11 @@
 
 package hip
 
-import "github.com/yuuka-ai/yuuka/tensor"
+import (
+	"fmt"
+
+	"github.com/yuuka-ai/yuuka/tensor"
+)
 
 // GemvPath is the selected decode matrix-vector submission shape.
 type GemvPath int
@@ -34,9 +38,10 @@ func SelectGemvPath(dtype tensor.DType, batch int) GemvPath {
 }
 
 // AddGemvAuto appends the measured dispatch choice for a batch of input rows.
+// batch must be positive. Batches above 16 fall back to one GEMV per row.
 func (p *Plan) AddGemvAuto(w, x, out *Buffer, nIn, nOut, batch int64, dtype tensor.DType) error {
 	if batch <= 0 {
-		return p.AddGemvAt(w, 0, x, 0, out, 0, nIn, nOut, dtype)
+		return fmt.Errorf("hip: GEMV batch %d must be positive", batch)
 	}
 	if SelectGemvPath(dtype, int(batch)) == GemvBatched {
 		return p.AddGemvBatch(w, x, out, nIn, nOut, batch, dtype)

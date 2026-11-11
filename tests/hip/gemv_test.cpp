@@ -196,21 +196,14 @@ bool check(yuuka_status status, const char * what) {
     return false;
 }
 
-} // namespace
+struct Case {
+    const char * name;
+    yuuka_dtype dtype;
+    int row_bytes;
+    float (*ref)(const uint8_t *, const float *, int64_t);
+};
 
-bool run_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
-              yuuka_dtype dtype, const char * name, int64_t n_in, int64_t n_out,
-              std::mt19937 & rng) {
-    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
-    std::vector<float> x(static_cast<size_t>(n_in));
-    for (float & value : x) value = xdist(rng);
-
-    struct Case {
-        const char * name;
-        yuuka_dtype dtype;
-        int row_bytes;
-        float (*ref)(const uint8_t *, const float *, int64_t);
-    } tc;
+bool make_case(yuuka_dtype dtype, const char * name, int64_t n_in, Case & tc) {
     tc.name = name;
     tc.dtype = dtype;
     switch (dtype) {
@@ -222,50 +215,71 @@ bool run_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
         case YUUKA_DTYPE_Q6_K: tc.row_bytes = int(n_in / 256 * 210); tc.ref = dot_q6_k; break;
         default: return false;
     }
+    return true;
+}
+
+void fill_weights(uint8_t * base, yuuka_dtype dtype, int64_t n_in, std::mt19937 & rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    if (dtype == YUUKA_DTYPE_F32) {
+        for (int64_t i = 0; i < n_in; ++i) {
+            const float value = dist(rng) * 0.1f;
+            std::memcpy(base + i * 4, &value, sizeof(value));
+        }
+    } else if (dtype == YUUKA_DTYPE_F16) {
+        for (int64_t i = 0; i < n_in; ++i) put_half(base + i * 2, dist(rng) * 0.1f);
+    } else if (dtype == YUUKA_DTYPE_Q8_0) {
+        for (int64_t b = 0; b < n_in / 32; ++b) {
+            uint8_t * blk = base + b * 34;
+            put_half(blk, 0.03125f);
+            for (int i = 0; i < 32; ++i) blk[2 + i] = uint8_t(rng() % 256);
+        }
+    } else if (dtype == YUUKA_DTYPE_Q4_K) {
+        for (int64_t b = 0; b < n_in / 256; ++b) {
+            uint8_t * blk = base + b * 144;
+            put_half(blk, 0.02f);
+            put_half(blk + 2, 0.01f);
+            for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
+            for (int i = 0; i < 128; ++i) blk[16 + i] = uint8_t(rng() % 256);
+        }
+    } else if (dtype == YUUKA_DTYPE_Q5_K) {
+        for (int64_t b = 0; b < n_in / 256; ++b) {
+            uint8_t * blk = base + b * 176;
+            put_half(blk, 0.02f);
+            put_half(blk + 2, 0.01f);
+            for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
+            for (int i = 0; i < 32; ++i) blk[16 + i] = uint8_t(rng() % 256);
+            for (int i = 0; i < 128; ++i) blk[48 + i] = uint8_t(rng() % 256);
+        }
+    } else if (dtype == YUUKA_DTYPE_Q6_K) {
+        for (int64_t b = 0; b < n_in / 256; ++b) {
+            uint8_t * blk = base + b * 210;
+            for (int i = 0; i < 128; ++i) blk[i] = uint8_t(rng() % 256);
+            for (int i = 0; i < 64; ++i) blk[128 + i] = uint8_t(rng() % 256);
+            for (int i = 0; i < 16; ++i) blk[192 + i] = uint8_t(rng() % 256);
+            put_half(blk + 208, 0.01f);
+        }
+    }
+}
+
+} // namespace
+
+bool run_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+              yuuka_dtype dtype, const char * name, int64_t n_in, int64_t n_out,
+              std::mt19937 & rng) {
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<size_t>(n_in));
+    for (float & value : x) value = xdist(rng);
+
+    Case tc;
+    if (!make_case(dtype, name, n_in, tc)) {
+        return false;
+    }
 
     std::vector<uint8_t> weights(static_cast<size_t>(tc.row_bytes) * n_out);
     std::vector<float> expected(n_out);
     for (int64_t row = 0; row < n_out; ++row) {
         uint8_t * base = weights.data() + row * tc.row_bytes;
-        if (tc.dtype == YUUKA_DTYPE_F32) {
-            for (int64_t i = 0; i < n_in; ++i) {
-                const float value = xdist(rng) * 0.1f;
-                std::memcpy(base + i * 4, &value, sizeof(value));
-            }
-        } else if (tc.dtype == YUUKA_DTYPE_F16) {
-            for (int64_t i = 0; i < n_in; ++i) put_half(base + i * 2, xdist(rng) * 0.1f);
-        } else if (tc.dtype == YUUKA_DTYPE_Q8_0) {
-            for (int64_t b = 0; b < n_in / 32; ++b) {
-                uint8_t * blk = base + b * 34;
-                put_half(blk, 0.03125f);
-                for (int i = 0; i < 32; ++i) blk[2 + i] = uint8_t(rng() % 256);
-            }
-        } else if (tc.dtype == YUUKA_DTYPE_Q4_K) {
-            for (int64_t b = 0; b < n_in / 256; ++b) {
-                uint8_t * blk = base + b * 144;
-                put_half(blk, 0.02f);
-                put_half(blk + 2, 0.01f);
-                for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
-                for (int i = 0; i < 128; ++i) blk[16 + i] = uint8_t(rng() % 256);
-            }
-        } else if (tc.dtype == YUUKA_DTYPE_Q5_K) {
-            for (int64_t b = 0; b < n_in / 256; ++b) {
-                uint8_t * blk = base + b * 176;
-                put_half(blk, 0.02f);
-                put_half(blk + 2, 0.01f);
-                for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
-                for (int i = 0; i < 32; ++i) blk[16 + i] = uint8_t(rng() % 256);
-                for (int i = 0; i < 128; ++i) blk[48 + i] = uint8_t(rng() % 256);
-            }
-        } else if (tc.dtype == YUUKA_DTYPE_Q6_K) {
-            for (int64_t b = 0; b < n_in / 256; ++b) {
-                uint8_t * blk = base + b * 210;
-                for (int i = 0; i < 128; ++i) blk[i] = uint8_t(rng() % 256);
-                for (int i = 0; i < 64; ++i) blk[128 + i] = uint8_t(rng() % 256);
-                for (int i = 0; i < 16; ++i) blk[192 + i] = uint8_t(rng() % 256);
-                put_half(blk + 208, 0.01f);
-            }
-        }
+        fill_weights(base, tc.dtype, n_in, rng);
         expected[row] = tc.ref(base, x.data(), n_in);
     }
 
@@ -297,6 +311,65 @@ bool run_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
     std::printf("%s n_in=%lld n_out=%lld: %s\n", tc.name,
                 static_cast<long long>(n_in), static_cast<long long>(n_out),
                 ok ? "ok" : "FAILED");
+    yuuka_buffer_free(obuf);
+    yuuka_buffer_free(xbuf);
+    yuuka_buffer_free(wbuf);
+    return ok;
+}
+
+bool run_batch_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+                    yuuka_dtype dtype, const char * name, int64_t n_in, int64_t n_out,
+                    int64_t batch, std::mt19937 & rng) {
+    Case tc;
+    if (!make_case(dtype, name, n_in, tc)) {
+        return false;
+    }
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<size_t>(n_in) * batch);
+    for (float & value : x) value = xdist(rng);
+
+    std::vector<uint8_t> weights(static_cast<size_t>(tc.row_bytes) * n_out);
+    for (int64_t row = 0; row < n_out; ++row) {
+        fill_weights(weights.data() + row * tc.row_bytes, tc.dtype, n_in, rng);
+    }
+    std::vector<float> expected(static_cast<size_t>(n_out) * batch);
+    for (int64_t b = 0; b < batch; ++b) {
+        for (int64_t row = 0; row < n_out; ++row) {
+            expected[b * n_out + row] = tc.ref(
+                weights.data() + row * tc.row_bytes, x.data() + b * n_in, n_in);
+        }
+    }
+
+    yuuka_buffer * wbuf = nullptr;
+    yuuka_buffer * xbuf = nullptr;
+    yuuka_buffer * obuf = nullptr;
+    bool ok = check(yuuka_buffer_alloc(device, weights.size(), &wbuf), "alloc batch weights") &&
+              check(yuuka_buffer_alloc(device, x.size() * 4, &xbuf), "alloc batch x") &&
+              check(yuuka_buffer_alloc(device, expected.size() * 4, &obuf), "alloc batch out") &&
+              check(yuuka_memcpy_h2d(wbuf, weights.data(), weights.size()), "h2d batch weights") &&
+              check(yuuka_memcpy_h2d(xbuf, x.data(), x.size() * 4), "h2d batch x") &&
+              check(yuuka_gemv_batch(stream, obuf, xbuf, wbuf, n_in, n_out, batch, tc.dtype, event),
+                    "gemv batch") &&
+              check(yuuka_event_wait(event), "batch event wait");
+    std::vector<float> got(expected.size());
+    ok = ok && check(yuuka_memcpy_d2h(got.data(), obuf, got.size() * 4), "d2h batch");
+    if (ok) {
+        for (size_t i = 0; i < expected.size(); ++i) {
+            const float tolerance = 2e-3f * (1.0f + std::fabs(expected[i]));
+            if (std::fabs(got[i] - expected[i]) > tolerance) {
+                std::fprintf(stderr, "%s n_in=%lld n_out=%lld batch=%lld index %zu: "
+                             "got %.6f expected %.6f\n",
+                             tc.name, static_cast<long long>(n_in),
+                             static_cast<long long>(n_out), static_cast<long long>(batch),
+                             i, got[i], expected[i]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    std::printf("%s n_in=%lld n_out=%lld batch=%lld: %s\n", tc.name,
+                static_cast<long long>(n_in), static_cast<long long>(n_out),
+                static_cast<long long>(batch), ok ? "ok" : "FAILED");
     yuuka_buffer_free(obuf);
     yuuka_buffer_free(xbuf);
     yuuka_buffer_free(wbuf);
@@ -335,6 +408,24 @@ int main() {
         ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q6_K, "Q6_K", width, 17, rng);
     }
 
+    // The batched GEMV path reuses each packed weight element across rows and
+    // must match the reference for every dtype and every measured batch class.
+    const int64_t batches[] = {1, 2, 3, 4, 8, 16};
+    for (int64_t batch : batches) {
+        ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_F32, "F32", 37, 17, batch, rng);
+        ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_F16, "F16", 37, 17, batch, rng);
+        ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_Q8_0, "Q8_0", 96, 17, batch, rng);
+        ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_Q4_K, "Q4_K", 512, 17, batch, rng);
+        ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_Q5_K, "Q5_K", 256, 17, batch, rng);
+        ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_Q6_K, "Q6_K", 768, 17, batch, rng);
+    }
+
     yuuka_buffer * dummy = nullptr;
     if (ok && check(yuuka_buffer_alloc(device, 4, &dummy), "alloc dummy")) {
         const struct { yuuka_dtype dtype; uint64_t width; } invalid[] = {
@@ -349,6 +440,81 @@ int main() {
                 ok = false;
             }
         }
+        if (yuuka_gemv(stream, dummy, dummy, dummy, 32, UINT64_MAX / 8,
+                       YUUKA_DTYPE_Q8_0, nullptr) != YUUKA_ERR_INVALID_ARGUMENT) {
+            std::fprintf(stderr, "overflowing output width was not rejected\n");
+            ok = false;
+        }
+
+        // Plan construction must reject unsupported dtype/shape combinations
+        // instead of submitting a silent no-op.
+        yuuka_plan * plan = nullptr;
+        if (ok && check(yuuka_plan_create(device, &plan), "plan create")) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_GEMV;
+            op.buf[0] = dummy;
+            op.buf[1] = dummy;
+            op.buf[2] = dummy;
+            op.n[0] = 256;
+            op.n[1] = 1;
+            op.u[0] = 2; /* GGML Q4_0 has no device kernel. */
+            if (yuuka_plan_add(plan, &op) != YUUKA_ERR_UNSUPPORTED) {
+                std::fprintf(stderr, "unsupported plan dtype was not rejected\n");
+                ok = false;
+            }
+            op.u[0] = YUUKA_DTYPE_Q4_K;
+            op.n[0] = 100;
+            if (yuuka_plan_add(plan, &op) != YUUKA_ERR_UNSUPPORTED) {
+                std::fprintf(stderr, "misaligned plan width was not rejected\n");
+                ok = false;
+            }
+            op.code = YUUKA_OP_GEMV_BATCH;
+            op.u[0] = YUUKA_DTYPE_Q8_0;
+            op.n[0] = 32;
+            op.n[2] = 17;
+            if (yuuka_plan_add(plan, &op) != YUUKA_ERR_INVALID_ARGUMENT) {
+                std::fprintf(stderr, "batch 17 plan op was not rejected\n");
+                ok = false;
+            }
+            op.n[2] = 1;
+            op.buf[0] = nullptr;
+            if (yuuka_plan_add(plan, &op) != YUUKA_ERR_INVALID_ARGUMENT) {
+                std::fprintf(stderr, "null plan weight buffer was not rejected\n");
+                ok = false;
+            }
+            op.buf[0] = dummy;
+            if (yuuka_plan_add(plan, &op) != YUUKA_ERR_INVALID_ARGUMENT) {
+                std::fprintf(stderr, "undersized plan weight buffer was not rejected\n");
+                ok = false;
+            }
+            yuuka_plan_destroy(plan);
+        }
+
+        yuuka_buffer * vw = nullptr;
+        yuuka_buffer * vx = nullptr;
+        yuuka_buffer * vo = nullptr;
+        plan = nullptr;
+        if (check(yuuka_buffer_alloc(device, 34, &vw), "alloc valid w") &&
+            check(yuuka_buffer_alloc(device, 32 * 4, &vx), "alloc valid x") &&
+            check(yuuka_buffer_alloc(device, 4, &vo), "alloc valid out") &&
+            check(yuuka_plan_create(device, &plan), "valid plan create")) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_GEMV;
+            op.buf[0] = vw;
+            op.buf[1] = vx;
+            op.buf[2] = vo;
+            op.n[0] = 32;
+            op.n[1] = 1;
+            op.u[0] = YUUKA_DTYPE_Q8_0;
+            if (yuuka_plan_add(plan, &op) != YUUKA_OK) {
+                std::fprintf(stderr, "valid plan op was rejected: %s\n", yuuka_last_error());
+                ok = false;
+            }
+            yuuka_plan_destroy(plan);
+        }
+        yuuka_buffer_free(vo);
+        yuuka_buffer_free(vx);
+        yuuka_buffer_free(vw);
         yuuka_buffer_free(dummy);
     }
     yuuka_event_destroy(event);

@@ -159,7 +159,13 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
                         uint64_t n_in, uint64_t n_out, uint64_t batch,
                         uint32_t dtype, yuuka_event * completion);
 
-/* Plans batch generic device operations into one submission. */
+/* Plans batch generic device operations into one submission.
+ *
+ * GEMV, GEMM, and GEMV_BATCH operations are validated when added. Unsupported
+ * dtypes and widths that violate the quantization block layout fail with
+ * YUUKA_ERR_UNSUPPORTED; invalid dimensions, batch sizes, and undersized
+ * buffers fail with YUUKA_ERR_INVALID_ARGUMENT. A rejected operation is not
+ * appended, so execution cannot silently skip it. */
 YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out);
 YUUKA_API void yuuka_plan_destroy(yuuka_plan * plan);
 YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op);

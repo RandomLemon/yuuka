@@ -117,6 +117,12 @@ For every operator and quantization type:
 Tests must cover the actual packed layouts used by GGUF, not only dense FP16
 inputs.
 
+Plan submission is also tested: unsupported quantized dtypes, widths that
+violate the block layout, batches above the measured limit, null buffers, and
+undersized buffers must be rejected when the operation is added, not ignored at
+execution time. Every dtype supported by the batched GEMV kernel is checked at
+batch sizes 1, 2, 3, 4, 8, and 16.
+
 ### 3.4 End-to-end tests
 
 - Fixed prompt, greedy sampling, fixed seed where applicable.
