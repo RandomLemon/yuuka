@@ -38,12 +38,12 @@ The repository contains a working single-request vertical slice:
 - Qwen3.5 (`qwen35`) tokenizer, chat rendering, CPU reference forward pass, and
   golden token tests.
 - HIP C ABI, plan executor, and kernels for the full `qwen35` decode graph.
+- rocWMMA/rocBLAS prefill GEMM, causal GQA Flash Attention, and chunked prefill.
 - `yuuka` CLI and OpenAI-compatible `yuuka-server`.
-- Native CTest coverage for the ABI and quantized GEMV/operator kernels.
+- Native CTest coverage for the ABI, quantized GEMV, and prefill kernels.
 
-Not yet implemented: WMMA/rocBLAS prefill, Flash Attention, chunked prefill,
-paged KV, continuous batching, prefix cache, HIP Graph, SentencePiece
-tokenizers, and architectures other than `qwen35`.
+Not yet implemented: paged KV, continuous batching, prefix cache, HIP Graph, and
+HIP execution for architectures other than `qwen35`.
 
 Therefore:
 

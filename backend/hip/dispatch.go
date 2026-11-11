@@ -70,9 +70,11 @@ const (
 
 // SelectPrefillPath returns the measured prefill matmul choice for a dtype,
 // row count, and shape. Measurements are in docs/benchmarks.md. Batched GEMV
-// wins below four rows and for the tall-K projections at the smallest WMMA
-// batch. Above those points the custom WMMA GEMM beats per-row submission; the
-// rocBLAS FP16 baseline wins for F16 only in the measured shape classes below.
+// is selected below four rows and for the tall-K projections at the smallest
+// WMMA batch; at one row the sweep shows per-row submission is faster for F16,
+// Q8_0, and Q6_K, which remains a small-row follow-up. Above those points the
+// custom WMMA GEMM beats per-row submission; the rocBLAS FP16 baseline wins for
+// F16 only in the measured shape classes below.
 func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 	if rows <= 0 {
 		return PrefillBatchedGemv

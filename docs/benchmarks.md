@@ -168,9 +168,9 @@ completion wait:
 - `rocblas`: the rocBLAS FP16 baseline, including the FP32-to-FP16 cast
   submitted immediately before the GEMM.
 
-Values are milliseconds per submission, P50 of five measured repetitions after
-two warmups. `N` is output width and `K` is input width. Host timing includes
-the completion wait.
+Values are milliseconds per submission, the mean of five measured iterations
+after two warmups. `N` is output width and `K` is input width. Host timing
+includes the completion wait.
 
 `Q4_K`, milliseconds:
 
@@ -208,19 +208,24 @@ the completion wait.
 | 64 | 18.245 | — | 1.537 | 1.476 | 18.128 | — | 1.301 | 1.079 |
 | 128 | 36.424 | — | 2.751 | 1.612 | 35.975 | — | 1.581 | 2.298 |
 
-`Q8_0`, `Q5_K`, and `Q4_K` follow the same crossover: batched GEMV is fastest at
-`M = 1`; WMMA wins from `M = 4` for wide projections (`K <= N`) and from `M = 8`
-for tall projections (`K > N`). Rows 2560→9216 and 8192→2560 were measured; the
-shorter `Q8_0` table is omitted because the selected path is identical.
+`Q8_0`, `Q5_K`, and `Q4_K` follow the same crossover: the small-row paths are
+fastest at `M = 1` (per-row GEMV for `Q8_0`, batched GEMV for `Q5_K`, and
+effectively tied for `Q4_K`); WMMA wins from `M = 4` for wide projections
+(`K <= N`) and from `M = 8` for tall projections (`K > N`). Rows 2560→9216 and
+8192→2560 were measured; the shorter `Q8_0` table is omitted because the
+selected path is identical. `SelectPrefillPath` uses batched GEMV below four
+rows for every dtype; at `M = 1` the sweep shows per-row submission is faster
+for `F16`, `Q8_0`, and `Q6_K` (about 20-30%), so the small-row dispatch remains
+a follow-up.
 
 The dispatch table in `backend/hip.SelectPrefillPath` encodes these crossovers.
-For F16 it selects batched GEMV at `M = 4` for wide projections, rocBLAS where
-the measured baseline wins, and WMMA otherwise; for quantized dtypes it selects
-batched GEMV only at the measured small-row points. Differences below 5% are
-treated as run-to-run noise: the table selects rocBLAS only where it was
+For F16 it selects batched GEMV below `M = 8` for wide projections, rocBLAS
+where the measured baseline wins, and WMMA otherwise; for quantized dtypes it
+selects batched GEMV only at the measured small-row points. Differences below
+5% are treated as run-to-run noise: the table selects rocBLAS only where it was
 decisively faster and WMMA otherwise. The 2560→9216 `M = 64` case is a 4%
-rocBLAS advantage left on WMMA by that rule; the 8192→2560 `M = 4` batched
-choice is within 1% of WMMA.
+rocBLAS advantage left on WMMA by that rule; the tall `M = 4` cases select
+batched GEMV because it is decisively faster than WMMA.
 
 ### Prompt-length performance
 
@@ -305,9 +310,9 @@ Chunked prefill correctness is checked at two levels:
 
 A 32-token real-model prompt ("Write a short list of colors...") produces the
 same greedy continuation with chunk sizes 7, 16, and 32 as the CPU reference.
-Chunk 7 exercises a partial final chunk (7,7,7,7,4); chunk 32 selects the WMMA
-path; chunk 16 selects batched GEMV. Prefill time is 0.526 s, 0.265 s, and
-0.167 s respectively.
+Chunk 7 exercises a partial final chunk (7,7,7,7,4) and mixes WMMA for wide
+projections with batched GEMV for tall ones; chunks 16 and 32 select WMMA for
+every projection. Prefill time is 0.526 s, 0.265 s, and 0.167 s respectively.
 
 ### Kernel resource usage
 
