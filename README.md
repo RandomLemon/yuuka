@@ -1,4 +1,4 @@
-# yuuka
+# yuuka engine
 
 `yuuka` is a from-scratch LLM inference runtime for AMD **gfx1151** (RDNA 3.5)
 APUs. The runtime is written in Go; performance-critical device code is written
