@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"sort"
@@ -314,22 +315,21 @@ func runBench(args []string) error {
 			return err
 		}
 	}
-	var prefill, decode, ttft float64
-	var prefillPS, decodePS float64
+	prefillSamples := make([]float64, 0, *reps)
+	decodeSamples := make([]float64, 0, *reps)
+	ttftSamples := make([]float64, 0, *reps)
 	for i := 0; i < *reps; i++ {
 		result, err := run()
 		if err != nil {
 			return err
 		}
-		prefill += result.PrefillTime.Seconds()
-		decode += result.DecodeTime.Seconds()
-		ttft += result.TimeToFirst.Seconds()
-		prefillPS += result.PromptTokensPS
-		decodePS += result.DecodeTokensPS
+		prefillSamples = append(prefillSamples, result.PrefillTime.Seconds())
+		decodeSamples = append(decodeSamples, result.DecodeTime.Seconds())
+		ttftSamples = append(ttftSamples, result.TimeToFirst.Seconds())
 	}
-	n := float64(*reps)
 	fmt.Printf("model: %s\n", l.reader.Path())
-	fmt.Printf("architecture: %s  quantization: %s\n", l.model.Config.Architecture, l.quantizationLabel())
+	fmt.Printf("architecture: %s  quantization: %s  backend: %s\n",
+		l.model.Config.Architecture, l.quantizationLabel(), *backend)
 	if *hash {
 		sum, err := fileSHA256(l.reader.Path())
 		if err != nil {
@@ -337,11 +337,32 @@ func runBench(args []string) error {
 		}
 		fmt.Printf("sha256: %s\n", sum)
 	}
-	fmt.Printf("prompt_tokens: %d  decode_tokens: %d  reps: %d  warmup: %d\n",
-		*promptTokens, *decodeTokens, *reps, *warmup)
-	fmt.Printf("prefill: %.3fs (%.2f tok/s)\n", prefill/n, prefillPS/n)
-	fmt.Printf("ttft: %.3fs  decode: %.3fs (%.2f tok/s)\n", ttft/n, decode/n, decodePS/n)
+	fmt.Printf("prompt_tokens: %d  decode_tokens: %d  reps: %d  warmup: %d  context: %d\n",
+		*promptTokens, *decodeTokens, *reps, *warmup, capacity)
+	fmt.Printf("prefill: p50=%.3fs p95=%.3fs (%.2f tok/s p50)\n",
+		percentile(prefillSamples, 0.50), percentile(prefillSamples, 0.95),
+		float64(*promptTokens)/percentile(prefillSamples, 0.50))
+	fmt.Printf("ttft: p50=%.3fs p95=%.3fs\n", percentile(ttftSamples, 0.50), percentile(ttftSamples, 0.95))
+	fmt.Printf("decode: p50=%.3fs p95=%.3fs (%.2f tok/s p50)\n",
+		percentile(decodeSamples, 0.50), percentile(decodeSamples, 0.95),
+		float64(*decodeTokens-1)/percentile(decodeSamples, 0.50))
 	return nil
+}
+
+func percentile(values []float64, p float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	index := int(math.Ceil(p*float64(len(sorted)))) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
+	return sorted[index]
 }
 
 func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string) (*engine.Engine, error) {

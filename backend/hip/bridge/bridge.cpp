@@ -148,26 +148,25 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             break;
         }
         case YUUKA_OP_L2NORM: {
-            auto * dst = op_ptr<float>(op, 2);
-            const auto * src = op_ptr<const float>(op, 0);
-            const int64_t size = int64_t(op.n[1]);
-            for (uint64_t h = 0; h < op.n[0]; ++h) {
-                yuuka::launch_l2norm_f32(dst + h * size, src + h * size, size,
-                                         op.f[0], op.f[1], stream);
-            }
+            yuuka::launch_l2norm_heads_f32(
+                op_ptr<float>(op, 2), op_ptr<const float>(op, 0),
+                int(op.n[0]), int64_t(op.n[1]), int64_t(op.n[2]),
+                op.f[0], op.f[1], stream);
             break;
         }
         case YUUKA_OP_GATED_RMSNORM: {
-            auto * dst = op_ptr<float>(op, 3);
-            const auto * src = op_ptr<const float>(op, 0);
-            const auto * weight = op_ptr<const float>(op, 1);
-            const auto * gate = op_ptr<const float>(op, 2);
-            const int64_t size = int64_t(op.n[0]);
-            for (uint64_t h = 0; h < op.n[1]; ++h) {
-                yuuka::launch_gated_rmsnorm_f32(dst + h * size, src + h * size,
-                                                weight, gate + h * size, size,
-                                                op.f[0], stream);
-            }
+            yuuka::launch_gated_rmsnorm_heads_f32(
+                op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                int(op.n[1]), int64_t(op.n[0]), int64_t(op.n[2]),
+                op.f[0], stream);
+            break;
+        }
+        case YUUKA_OP_RMSNORM_HEADS: {
+            yuuka::launch_rmsnorm_heads_f32(
+                op_ptr<float>(op, 2), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), int(op.n[1]), int64_t(op.n[0]),
+                int64_t(op.n[2]), op.f[0], stream);
             break;
         }
         case YUUKA_OP_ROPE:
@@ -648,7 +647,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_KV_WRITE) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_RMSNORM_HEADS) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         plan->ops.push_back(*op);

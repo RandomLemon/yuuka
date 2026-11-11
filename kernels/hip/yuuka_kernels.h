@@ -28,6 +28,15 @@ void launch_l2norm_f32(float * dst, const float * src, int64_t n, float eps,
                        float extra_scale, hipStream_t stream);
 void launch_gated_rmsnorm_f32(float * dst, const float * src, const float * weight,
                               const float * gate, int64_t n, float eps, hipStream_t stream);
+void launch_rmsnorm_heads_f32(float * dst, const float * src, const float * weight,
+                              int heads, int64_t n, int64_t stride, float eps,
+                              hipStream_t stream);
+void launch_l2norm_heads_f32(float * dst, const float * src, int heads, int64_t n,
+                             int64_t stride, float eps, float extra_scale,
+                             hipStream_t stream);
+void launch_gated_rmsnorm_heads_f32(float * dst, const float * src, const float * weight,
+                                    const float * gate, int heads, int64_t n,
+                                    int64_t stride, float eps, hipStream_t stream);
 void launch_silu_mul_f32(float * out, const float * gate, const float * up,
                          int64_t n, hipStream_t stream);
 void launch_add_f32_buffers(float * x, const float * delta, int64_t n, hipStream_t stream);

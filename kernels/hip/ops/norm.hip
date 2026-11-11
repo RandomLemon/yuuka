@@ -61,6 +61,81 @@ __global__ void gated_rmsnorm_f32_kernel(float * dst, const float * src, const f
     }
 }
 
+__global__ void rmsnorm_heads_f32_kernel(float * dst, const float * src, const float * weight,
+                                         int64_t heads, int64_t n, int64_t stride, float eps) {
+    const int64_t head = blockIdx.x;
+    if (head >= heads) {
+        return;
+    }
+    __shared__ float scratch[kThreads];
+    const float * head_src = src + head * stride;
+    float * head_dst = dst + head * stride;
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        sum += head_src[i] * head_src[i];
+    }
+    sum = block_reduce_sum<kThreads>(sum, scratch);
+    if (threadIdx.x == 0) {
+        scratch[0] = rsqrtf(sum / static_cast<float>(n) + eps);
+    }
+    __syncthreads();
+    const float scale = scratch[0];
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        head_dst[i] = head_src[i] * scale * weight[i];
+    }
+}
+
+__global__ void l2norm_heads_f32_kernel(float * dst, const float * src, int64_t heads,
+                                        int64_t n, int64_t stride, float eps, float extra_scale) {
+    const int64_t head = blockIdx.x;
+    if (head >= heads) {
+        return;
+    }
+    __shared__ float scratch[kThreads];
+    const float * head_src = src + head * stride;
+    float * head_dst = dst + head * stride;
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        sum += head_src[i] * head_src[i];
+    }
+    sum = block_reduce_sum<kThreads>(sum, scratch);
+    if (threadIdx.x == 0) {
+        scratch[0] = rsqrtf(sum + eps) * extra_scale;
+    }
+    __syncthreads();
+    const float scale = scratch[0];
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        head_dst[i] = head_src[i] * scale;
+    }
+}
+
+__global__ void gated_rmsnorm_heads_f32_kernel(float * dst, const float * src, const float * weight,
+                                               const float * gate, int64_t heads, int64_t n,
+                                               int64_t stride, float eps) {
+    const int64_t head = blockIdx.x;
+    if (head >= heads) {
+        return;
+    }
+    __shared__ float scratch[kThreads];
+    const float * head_src = src + head * stride;
+    const float * head_gate = gate + head * stride;
+    float * head_dst = dst + head * stride;
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        sum += head_src[i] * head_src[i];
+    }
+    sum = block_reduce_sum<kThreads>(sum, scratch);
+    if (threadIdx.x == 0) {
+        scratch[0] = rsqrtf(sum / static_cast<float>(n) + eps);
+    }
+    __syncthreads();
+    const float scale = scratch[0];
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float g = head_gate[i];
+        head_dst[i] = head_src[i] * scale * weight[i] * (g / (1.0f + expf(-g)));
+    }
+}
+
 __global__ void silu_mul_f32_kernel(float * out, const float * gate, const float * up, int64_t n) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         const float g = gate[i];
@@ -103,6 +178,27 @@ void launch_l2norm_f32(float * dst, const float * src, int64_t n, float eps,
 void launch_gated_rmsnorm_f32(float * dst, const float * src, const float * weight,
                               const float * gate, int64_t n, float eps, hipStream_t stream) {
     gated_rmsnorm_f32_kernel<<<1, kThreads, 0, stream>>>(dst, src, weight, gate, n, eps);
+}
+
+void launch_rmsnorm_heads_f32(float * dst, const float * src, const float * weight,
+                              int heads, int64_t n, int64_t stride, float eps,
+                              hipStream_t stream) {
+    rmsnorm_heads_f32_kernel<<<heads, kThreads, 0, stream>>>(
+        dst, src, weight, heads, n, stride, eps);
+}
+
+void launch_l2norm_heads_f32(float * dst, const float * src, int heads, int64_t n,
+                             int64_t stride, float eps, float extra_scale,
+                             hipStream_t stream) {
+    l2norm_heads_f32_kernel<<<heads, kThreads, 0, stream>>>(
+        dst, src, heads, n, stride, eps, extra_scale);
+}
+
+void launch_gated_rmsnorm_heads_f32(float * dst, const float * src, const float * weight,
+                                    const float * gate, int heads, int64_t n,
+                                    int64_t stride, float eps, hipStream_t stream) {
+    gated_rmsnorm_heads_f32_kernel<<<heads, kThreads, 0, stream>>>(
+        dst, src, weight, gate, heads, n, stride, eps);
 }
 
 void launch_silu_mul_f32(float * out, const float * gate, const float * up,

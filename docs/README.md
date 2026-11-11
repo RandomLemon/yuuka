@@ -6,13 +6,13 @@ written in **HIP/C++**. It loads GGUF models directly and does not use
 llama.cpp, GGML, or Ollama as an inference execution kernel. Those projects are
 treated as format and correctness references only.
 
-> **Status: CPU reference vertical slice implemented.** The repository now
-> contains a validated GGUF reader, a Qwen3.5 tokenizer, a CPU reference
-> forward pass for the hybrid attention/gated-delta-net decoder, a CLI, an
-> OpenAI-compatible single-request server, and a HIP runtime plus quantized
-> GEMV kernel library. The full HIP model execution path, WMMA prefill,
-> paged KV, and batching remain future work. See the implementation status
-> below and [hardware.md](hardware.md).
+> **Status: CPU and HIP single-request vertical slice implemented.** The
+> repository contains a validated GGUF reader, a Qwen3.5 tokenizer, a CPU
+> reference forward pass, a HIP device executor for the same decoder, a CLI,
+> an OpenAI-compatible single-request server, and a validated kernel library.
+> WMMA/rocBLAS prefill, paged KV, and batching remain future work. See the
+> implementation status below, [hardware.md](hardware.md), and
+> [benchmarks.md](benchmarks.md).
 
 ## Target configuration
 
@@ -80,6 +80,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [npu.md](npu.md) | Deferred XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
+| [benchmarks.md](benchmarks.md) | CPU versus HIP single-request baseline and reproduction steps | All contributors |
 
 ## Implementation status
 
@@ -97,20 +98,27 @@ Implemented and tested:
 - `yuuka inspect`, `yuuka run`, and `yuuka bench`.
 - `yuuka-server` with `/v1/chat/completions`, SSE streaming, stop sequences,
   health, metrics, cancellation, and explicit busy rejection.
-- HIP C ABI for devices, buffers, streams, events, transfers, and quantized
-  GEMV; validated `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` kernels.
+- HIP C ABI for devices, buffers, streams, events, transfers, planned
+  operations, and quantized GEMV; validated `F16`, `Q8_0`, `Q4_K`, `Q5_K`,
+  and `Q6_K` kernels.
+- HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
+  full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
+  The CLI and server select it with `--backend hip` when built with
+  `-tags hip`.
+- Layer-by-layer and end-to-end GPU/CPU comparison; greedy tokens match and
+  first-step logits differ by less than `5e-5`.
 - Phase 0 hardware probe covering allocation, copy, memset, mapped memory,
   rocBLAS SGEMM, and a rocWMMA FP16 tile.
 
 Not yet implemented:
 
-- A HIP execution path for the model forward pass.
 - WMMA or rocBLAS prefill integration.
 - Paged KV, continuous batching, prefix cache, or HIP Graph.
 - Multiple architectures and quantization presets beyond the tested model.
 - NPU paths.
 
-The current end-to-end path is CPU-only. `general.architecture = qwen35` is the
+The CPU reference path is the default. The HIP path requires the native shared
+library and a `-tags hip` Go build. `general.architecture = qwen35` is the
 supported model family.
 
 ## Reading paths

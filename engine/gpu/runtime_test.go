@@ -75,7 +75,7 @@ func TestGPUMatchesCPU(t *testing.T) {
 	if cpuTop != gpuTop {
 		t.Fatalf("first token differs: cpu=%d gpu=%d (max logit diff %.3f)", cpuTop, gpuTop, maxDiff)
 	}
-	t.Logf("first step max logit diff %.3f", maxDiff)
+	t.Logf("first step max logit diff %.6g", maxDiff)
 
 	// Generate greedily on both paths.
 	cpuTokens := make([]int32, 0, 6)

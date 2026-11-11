@@ -289,10 +289,15 @@ The repository uses these commands:
 go build ./...
 go test ./...
 go test -race ./...
+go build -tags hip ./...
+go test -tags hip ./backend/hip ./engine/gpu
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
+
+The `hip` build tag is required for the HIP executor and its Go binding. The
+default build does not require the native shared library.
 
 Real-model tests are opt-in and skip when the variable is absent:
 
@@ -305,10 +310,12 @@ token sequences, determinism, logits tolerance against a llama.cpp CPU
 reference, and server request/stream behavior. GPU tests return the CTest skip
 code when no HIP device is available.
 
-The Phase 0 hardware probe is run explicitly:
+The Phase 0 hardware probe and the current CPU/HIP benchmark are run
+explicitly:
 
 ```bash
 ./build/yuuka_hardware_probe
+/tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 16 --decode-tokens 16
 ```
 
 ## 10. CI and test execution

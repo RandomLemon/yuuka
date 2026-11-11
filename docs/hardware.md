@@ -93,8 +93,9 @@ available to the toolchain and that a wave32 launch works on this device.
   round trip.
 - Quantized GEMV kernels for `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` match a
   CPU dequantization reference on random packed rows and alignment boundaries.
-- No kernel is integrated into the model executor yet; the current end-to-end
-  path is the CPU reference backend.
+- The HIP kernels are integrated into the model executor through a planned
+  operation stream. The CPU reference path remains the default and the
+  correctness oracle.
 
 ## Decisions recorded
 
@@ -103,8 +104,7 @@ available to the toolchain and that a wave32 launch works on this device.
 3. Host/device transfers use pinned staging buffers.
 4. Mapped host memory is measured but not selected by default.
 5. WMMA is available; the prefill GEMM path can target it in a later phase.
-6. The CPU reference path remains the correctness oracle until HIP execution is
-   integrated end to end.
+6. The CPU reference path remains the correctness oracle after HIP integration.
 
 ## Remaining Phase 0 work
 

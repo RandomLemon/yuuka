@@ -331,17 +331,13 @@ func (r *Runtime) addFullAttention(plan *hip.Plan, layerIndex int, layer *qwen35
 	if err := plan.AddGemv(v.buf, r.act.norm, r.act.v, hidden, kvDim, v.dtype); err != nil {
 		return err
 	}
-	for h := 0; h < cfg.HeadCount; h++ {
-		off := uint64(h) * uint64(headDim) * 2 * 4
-		if err := plan.AddRMSNormAt(r.act.q, off, qNorm.buf, r.act.q, off, headDim, cfg.RMSNormEps); err != nil {
-			return err
-		}
+	if err := plan.AddRMSNormHeadsAt(r.act.q, 0, qNorm.buf, r.act.q, 0,
+		cfg.HeadCount, headDim, 2*headDim, cfg.RMSNormEps); err != nil {
+		return err
 	}
-	for h := 0; h < cfg.KVHeadCount; h++ {
-		off := uint64(h) * uint64(headDim) * 4
-		if err := plan.AddRMSNormAt(r.act.k, off, kNorm.buf, r.act.k, off, headDim, cfg.RMSNormEps); err != nil {
-			return err
-		}
+	if err := plan.AddRMSNormHeadsAt(r.act.k, 0, kNorm.buf, r.act.k, 0,
+		cfg.KVHeadCount, headDim, headDim, cfg.RMSNormEps); err != nil {
+		return err
 	}
 	if err := plan.AddRoPE(r.act.q, cfg.HeadCount, int(2*headDim), int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase)); err != nil {
 		return err

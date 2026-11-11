@@ -23,10 +23,13 @@ duration depends on hardware availability and measured progress.
 ## 1.1 Current implementation status
 
 The Phase 0 toolchain is proven and recorded in [hardware.md](hardware.md).
-The CPU reference vertical slice for `qwen35` is implemented with a CLI and
-single-request server. HIP allocation, transfers, streams, events, and
-quantized GEMV kernels are implemented and tested. The HIP model executor,
-prefill GEMM, and serving features from later phases are not implemented yet.
+The CPU reference and HIP single-request vertical slices for `qwen35` are
+implemented with a CLI and server. HIP allocation, transfers, streams, events,
+planned operators, and the full decoder execution path are implemented and
+tested; CPU and HIP greedy tokens match with sub-`5e-5` first-step logits.
+WMMA/rocBLAS prefill, paged KV, batching, and prefix caching are not
+implemented yet. The current measured baseline is in
+[benchmarks.md](benchmarks.md).
 
 This status does not declare any phase exit gate complete. It identifies the
 current boundary for contributors.

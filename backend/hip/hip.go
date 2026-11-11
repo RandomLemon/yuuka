@@ -388,6 +388,7 @@ func (p *Plan) AddL2NormAt(src *Buffer, srcOff uint64, dst *Buffer, dstOff uint6
 	op.off[2] = C.uint64_t(dstOff)
 	op.n[0] = C.uint64_t(heads)
 	op.n[1] = C.uint64_t(size)
+	op.n[2] = C.uint64_t(size)
 	op.f[0] = C.float(eps)
 	op.f[1] = C.float(scale)
 	return p.add(op)
@@ -404,6 +405,24 @@ func (p *Plan) AddGatedRMSNorm(src, weight, gate, dst *Buffer, heads, size int64
 	op.buf[3] = dst.ptr
 	op.n[0] = C.uint64_t(size)
 	op.n[1] = C.uint64_t(heads)
+	op.n[2] = C.uint64_t(size)
+	op.f[0] = C.float(eps)
+	return p.add(op)
+}
+
+func (p *Plan) AddRMSNormHeadsAt(src *Buffer, srcOff uint64, weight *Buffer, dst *Buffer, dstOff uint64, heads int, size, stride int64, eps float32) error {
+	if err := p.check(src, weight, dst); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_RMSNORM_HEADS}
+	op.buf[0] = src.ptr
+	op.buf[1] = weight.ptr
+	op.buf[2] = dst.ptr
+	op.off[0] = C.uint64_t(srcOff)
+	op.off[2] = C.uint64_t(dstOff)
+	op.n[0] = C.uint64_t(size)
+	op.n[1] = C.uint64_t(heads)
+	op.n[2] = C.uint64_t(stride)
 	op.f[0] = C.float(eps)
 	return p.add(op)
 }
