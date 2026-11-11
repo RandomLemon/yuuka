@@ -137,3 +137,45 @@ func argmax(values []float32) int32 {
 	}
 	return int32(best)
 }
+
+func TestGPUGoldenPrompts(t *testing.T) {
+	reader, tok, model, _ := goldenPrompt(t)
+	rt, err := New(reader, model, 64)
+	if err != nil {
+		t.Skipf("HIP runtime unavailable: %v", err)
+	}
+	defer rt.Close()
+	cases := []struct {
+		prompt string
+		want   []int32
+	}{
+		{"The capital of France is", []int32{11751, 13, 198, 32, 13, 2912}},
+		{"1+1=", []int32{17, 3709, 17, 10, 17, 28}},
+		{"Once upon a time", []int32{11, 303, 264, 1814, 2400, 314}},
+	}
+	for _, tc := range cases {
+		rt.Reset()
+		ids, err := tok.Encode(tc.prompt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		logits, err := rt.Forward(ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]int32, 0, len(tc.want))
+		for i := 0; i < len(tc.want); i++ {
+			token := argmax(logits)
+			got = append(got, token)
+			if i+1 < len(tc.want) {
+				logits, err = rt.Step(token)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%q: tokens %v, want %v", tc.prompt, got, tc.want)
+		}
+	}
+}

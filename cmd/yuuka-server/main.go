@@ -59,6 +59,9 @@ func main() {
 	if *modelPath == "" {
 		log.Fatal("--model is required")
 	}
+	if *backend != "cpu" && *backend != "hip" {
+		log.Fatalf("unknown backend %q (want cpu or hip)", *backend)
+	}
 	reader, err := gguf.Open(*modelPath)
 	if err != nil {
 		log.Fatal(err)

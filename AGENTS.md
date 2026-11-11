@@ -30,22 +30,29 @@ First target:
 
 ## 3. Current repository state
 
-The repository currently contains documentation only. There is no Go module,
-CMake project, model loader, kernel library, or test suite yet.
+The repository contains a working single-request vertical slice:
+
+- Go module and package layout for GGUF, tokenizer, tensor, model, engine,
+  backends, CLI, and server.
+- Pure Go GGUF reader with validation and mmap-backed tensor storage.
+- Qwen3.5 (`qwen35`) tokenizer, chat rendering, CPU reference forward pass, and
+  golden token tests.
+- HIP C ABI, plan executor, and kernels for the full `qwen35` decode graph.
+- `yuuka` CLI and OpenAI-compatible `yuuka-server`.
+- Native CTest coverage for the ABI and quantized GEMV/operator kernels.
+
+Not yet implemented: WMMA/rocBLAS prefill, Flash Attention, chunked prefill,
+paged KV, continuous batching, prefix cache, HIP Graph, SentencePiece
+tokenizers, and architectures other than `qwen35`.
 
 Therefore:
 
-- Do not assume `go build ./...`, `go test ./...`, or `cmake` works until the
-  corresponding scaffold exists.
-- Do not claim a command passed if it could not run because the build system is
-  absent.
-- The default starting point is **Phase 0: Bootstrap and Hardware Validation**
-  in [docs/roadmap.md](docs/roadmap.md), unless the user assigns a specific
-  later slice.
-- When creating the scaffold, create the canonical commands described in
-  [section 11](#11-build-test-and-verification) and keep them working.
-- Do not implement serving, NPU, MoE, or speculative decoding while the
-  single-request correctness path is incomplete.
+- `go build ./...`, `go test ./...`, and `cmake` are expected to work.
+- The HIP Go packages require `-tags hip` and a built `libyuuka_hip.so`.
+- Do not claim later-phase behavior or performance that has no checked-in
+  evidence.
+- The default starting point for new work is the first incomplete item in the
+  roadmap, unless the user assigns a specific slice.
 
 ## 4. Source-of-truth documents
 
