@@ -9,6 +9,7 @@ import (
 
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
+	"github.com/yuuka-ai/yuuka/tensor"
 	"github.com/yuuka-ai/yuuka/tests/fixture"
 	"github.com/yuuka-ai/yuuka/tokenizer"
 )
@@ -76,6 +77,80 @@ func TestTinyGPUMatchesCPU(t *testing.T) {
 	}
 	if argmax(again) != argmax(gpuLogits) {
 		t.Fatal("tiny fixture GPU reset changed the top-1 token")
+	}
+}
+
+func TestTinyGPUKVFormats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny-qwen35.gguf")
+	if err := fixture.WriteTinyQwen35(path); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := gguf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	tok, err := tokenizer.NewFromGGUF(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := qwen35.Load(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := tok.Encode("Hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(format tensor.DType) ([]int32, []float32) {
+		rt, err := NewWithKVType(reader, model, 16, format)
+		if err != nil {
+			t.Skipf("HIP runtime unavailable: %v", err)
+		}
+		defer rt.Close()
+		logits, err := rt.Forward(ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens := make([]int32, 0, 4)
+		for range 4 {
+			token := argmax(logits)
+			tokens = append(tokens, token)
+			if len(tokens) < 4 {
+				logits, err = rt.Step(token)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return tokens, append([]float32(nil), logits...)
+	}
+	baseTokens, baseLogits := run(tensor.F32)
+	for _, tc := range []struct {
+		dtype tensor.DType
+		tol   float64
+	}{
+		{tensor.F16, 1e-2},
+		{tensor.Q8_0, 0.15},
+	} {
+		tokens, logits := run(tc.dtype)
+		for i := range baseTokens {
+			if tokens[i] != baseTokens[i] {
+				t.Fatalf("%s token %d: got %v want %v", tc.dtype, i, tokens, baseTokens)
+			}
+		}
+		maxDiff := 0.0
+		for i := range baseLogits {
+			diff := math.Abs(float64(logits[i] - baseLogits[i]))
+			if diff > maxDiff {
+				maxDiff = diff
+			}
+		}
+		if maxDiff > tc.tol {
+			t.Fatalf("%s logits differ from F32 by %.6g, tolerance %.6g",
+				tc.dtype, maxDiff, tc.tol)
+		}
+		t.Logf("%s max logit diff %.6g", tc.dtype, maxDiff)
 	}
 }
 

@@ -19,6 +19,13 @@ type scratch struct {
 	up     []float32
 	scores []float32
 	logits []float32
+
+	router        []float32
+	expertGate    []float32
+	expertUp      []float32
+	expertOut     []float32
+	expertIDs     []int32
+	expertWeights []float32
 }
 
 // State holds the per-request KV cache and reusable scratch buffers. It is not
@@ -62,6 +69,18 @@ func NewState(cfg *Config, capacity int) (*State, error) {
 		up:     make([]float32, cfg.FFNSize),
 		scores: make([]float32, capacity),
 		logits: make([]float32, cfg.VocabSize),
+	}
+	if cfg.IsMoE() {
+		ffn := cfg.FFNSize
+		if cfg.ExpertFFNSize > ffn {
+			ffn = cfg.ExpertFFNSize
+		}
+		st.scratch.router = make([]float32, cfg.ExpertCount)
+		st.scratch.expertGate = make([]float32, ffn)
+		st.scratch.expertUp = make([]float32, ffn)
+		st.scratch.expertOut = make([]float32, cfg.HiddenSize)
+		st.scratch.expertIDs = make([]int32, cfg.ExpertUsedCount)
+		st.scratch.expertWeights = make([]float32, cfg.ExpertUsedCount)
 	}
 	return st, nil
 }

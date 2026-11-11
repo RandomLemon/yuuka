@@ -26,6 +26,25 @@ __device__ __forceinline__ float segment_value(const uint8_t * row, int64_t k0,
         return *reinterpret_cast<const float *>(row + k * 4);
     } else if (DType == YUUKA_DTYPE_F16) {
         return load_f16_device(row + k * 2);
+    } else if (DType == YUUKA_DTYPE_Q4_0) {
+        const int64_t block = k0 / 32;
+        const uint8_t * blk = row + block * 18;
+        const uint8_t packed = blk[2 + (lane & 15)];
+        const int q = (lane < 16) ? (packed & 0xF) : (packed >> 4);
+        return load_f16_device(blk) * static_cast<float>(q - 8);
+    } else if (DType == YUUKA_DTYPE_Q5_0) {
+        const int64_t block = k0 / 32;
+        const uint8_t * blk = row + block * 22;
+        const uint8_t packed = blk[6 + (lane & 15)];
+        const uint32_t qh = static_cast<uint32_t>(blk[2]) |
+                            (static_cast<uint32_t>(blk[3]) << 8) |
+                            (static_cast<uint32_t>(blk[4]) << 16) |
+                            (static_cast<uint32_t>(blk[5]) << 24);
+        const int high = (lane < 16)
+                             ? static_cast<int>(((qh >> lane) << 4) & 0x10)
+                             : static_cast<int>((qh >> ((lane & 15) + 12)) & 0x10);
+        const int q = (lane < 16 ? (packed & 0xF) : (packed >> 4)) | high;
+        return load_f16_device(blk) * static_cast<float>(q - 16);
     } else if (DType == YUUKA_DTYPE_Q8_0) {
         const int64_t block = k0 / 32;
         return q8_value(row + block * 34, lane);
@@ -154,6 +173,10 @@ uint64_t packed_row_bytes(uint32_t dtype, uint64_t n_in) {
             return n_in * 4;
         case YUUKA_DTYPE_F16:
             return n_in * 2;
+        case YUUKA_DTYPE_Q4_0:
+            return (n_in / 32) * 18;
+        case YUUKA_DTYPE_Q5_0:
+            return (n_in / 32) * 22;
         case YUUKA_DTYPE_Q8_0:
             return (n_in / 32) * 34;
         case YUUKA_DTYPE_Q4_K:
@@ -194,6 +217,14 @@ void launch_gemm_wmma_f32out(float * out, const float * x, const void * w,
             break;
         case YUUKA_DTYPE_F16:
             gemm_wmma_kernel<YUUKA_DTYPE_F16><<<grid, kThreads, 0, stream>>>(
+                out, x, weights, in, on, m, row_bytes);
+            break;
+        case YUUKA_DTYPE_Q4_0:
+            gemm_wmma_kernel<YUUKA_DTYPE_Q4_0><<<grid, kThreads, 0, stream>>>(
+                out, x, weights, in, on, m, row_bytes);
+            break;
+        case YUUKA_DTYPE_Q5_0:
+            gemm_wmma_kernel<YUUKA_DTYPE_Q5_0><<<grid, kThreads, 0, stream>>>(
                 out, x, weights, in, on, m, row_bytes);
             break;
         case YUUKA_DTYPE_Q8_0:

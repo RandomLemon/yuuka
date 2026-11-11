@@ -163,3 +163,21 @@ follow-ups would strengthen the evidence but are not Phase 0 gates:
 - Longer thermal soak with fan and steady-state power recording.
 - A larger rocBLAS shape sweep and a WMMA tiled GEMM benchmark.
 - A final decision on which buffer classes, if any, should use mapped memory.
+
+## NPU capability probe (Phase 5)
+
+`go run ./cmd/yuuka npu-probe` on the reference host reports:
+
+```text
+state: device_only
+device: /dev/accel/accel0
+driver: true
+userspace: false
+reason: device and amdxdna driver are present, but no XRT userspace runtime was found
+fallback: selected backend
+```
+
+The XDNA device node and the `amdxdna` kernel module are present. No
+`xrt-smi`, `libxrt_core*`, or XRT installation directory was found, so the NPU
+userspace prerequisite is unmet. The project does not claim NPU inference
+support; see [npu.md](npu.md).

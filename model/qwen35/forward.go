@@ -70,6 +70,34 @@ func (m *Model) Prefill(tokens []int32, st *State, wantLogits bool) ([]float32, 
 	return nil, nil
 }
 
+// PrefillLogits processes tokens and returns logits for every position. The
+// returned slices are independent copies owned by the caller. It is used by
+// speculative verification, which needs the target distribution after each
+// candidate token.
+func (m *Model) PrefillLogits(tokens []int32, st *State) ([][]float32, error) {
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("empty token sequence")
+	}
+	if st == nil {
+		return nil, fmt.Errorf("nil state")
+	}
+	if st.Pos+len(tokens) > st.Capacity {
+		return nil, fmt.Errorf("token sequence of %d exceeds remaining context %d",
+			len(tokens), st.Capacity-st.Pos)
+	}
+	out := make([][]float32, len(tokens))
+	for i, token := range tokens {
+		if token < 0 || int(token) >= m.Config.VocabSize {
+			return nil, fmt.Errorf("token id %d is out of range", token)
+		}
+		if err := m.forwardOne(token, st, true, nil); err != nil {
+			return nil, err
+		}
+		out[i] = append([]float32(nil), st.scratch.logits...)
+	}
+	return out, nil
+}
+
 // MatVecOutput computes the LM-head logits for a normalized hidden vector.
 func (m *Model) MatVecOutput(dst, hidden []float32) error {
 	if len(hidden) != m.Config.HiddenSize {
@@ -153,18 +181,9 @@ func (m *Model) forwardFullAttention(index int, layer *Layer, st *State) error {
 	applyRoPE(s.q, cfg.HeadCount, 2*headDim, headDim, cfg.RoPEDim, st.Pos, cfg.RoPEFreqBase)
 	applyRoPE(s.k, cfg.KVHeadCount, headDim, headDim, cfg.RoPEDim, st.Pos, cfg.RoPEFreqBase)
 
-	kvDim := cfg.KVHeadCount * headDim
-	keys := st.pool.k[index]
-	values := st.pool.v[index]
-	if keys == nil || values == nil {
-		return fmt.Errorf("layer %d is recurrent and has no KV cache", index)
-	}
-	offset, err := st.pool.elementOffset(st.table, st.Pos)
-	if err != nil {
+	if err := st.pool.WriteRow(index, st.table, st.Pos, s.k, s.v); err != nil {
 		return err
 	}
-	copy(keys[offset:offset+kvDim], s.k)
-	copy(values[offset:offset+kvDim], s.v)
 
 	group := cfg.KVHeadsPerGroup()
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
@@ -174,24 +193,22 @@ func (m *Model) forwardFullAttention(index int, layer *Layer, st *State) error {
 		q := s.q[h*2*headDim : h*2*headDim+headDim]
 		scores := s.scores[:length]
 		for p := 0; p < length; p++ {
-			base, err := st.pool.elementOffset(st.table, p)
-			if err != nil {
+			if err := st.pool.ReadK(index, st.table, p, s.kvRow); err != nil {
 				return err
 			}
-			base += kvh * headDim
-			scores[p] = dot(q, keys[base:base+headDim]) * scale
+			base := kvh * headDim
+			scores[p] = dot(q, s.kvRow[base:base+headDim]) * scale
 		}
 		softmaxInPlace(scores)
 		out := s.attn[h*headDim : (h+1)*headDim]
 		clear(out)
 		for p := 0; p < length; p++ {
 			weight := scores[p]
-			base, err := st.pool.elementOffset(st.table, p)
-			if err != nil {
+			if err := st.pool.ReadV(index, st.table, p, s.kvRow); err != nil {
 				return err
 			}
-			base += kvh * headDim
-			v := values[base : base+headDim]
+			base := kvh * headDim
+			v := s.kvRow[base : base+headDim]
 			for d := range out {
 				out[d] += weight * v[d]
 			}

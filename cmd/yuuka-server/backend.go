@@ -12,7 +12,8 @@ import (
 func newBackend(reader *gguf.Reader, model *qwen35.Model, cfg backendConfig) (serving.Backend, error) {
 	switch cfg.Backend {
 	case "cpu":
-		return serving.NewQwen35Backend(model, cfg.ModelKey, cfg.Blocks, cfg.BlockSize)
+		return serving.NewQwen35BackendWithFormat(model, cfg.ModelKey, cfg.Blocks,
+			cfg.BlockSize, cfg.KVFormat)
 	case "hip":
 		return newHIPBackend(reader, model, cfg)
 	default:

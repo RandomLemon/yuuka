@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yuuka-ai/yuuka/backend/npu"
 	"github.com/yuuka-ai/yuuka/engine"
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
@@ -40,6 +41,7 @@ type backendConfig struct {
 	PrefillChunk int
 	Graph        bool
 	ModelKey     string
+	KVFormat     qwen35.KVFormat
 }
 
 type server struct {
@@ -71,6 +73,8 @@ func main() {
 	prefixEntries := flag.Int("prefix-entries", 64, "maximum cached prefixes")
 	prefixBlocks := flag.Int("prefix-blocks", 0, "maximum blocks held by the prefix cache (0 = pool)")
 	graph := flag.Bool("graph", false, "enable HIP Graph decode replay with fallback")
+	kvType := flag.String("kv-type", "f32", "KV cache format: f32, f16, or q8_0")
+	npuOpt := flag.Bool("npu", false, "request NPU execution and fall back to the GPU backend")
 	modelKey := flag.String("model-key", "", "override the prefix-cache model identity")
 	flag.Parse()
 
@@ -79,6 +83,11 @@ func main() {
 	}
 	if *backendName != "cpu" && *backendName != "hip" {
 		log.Fatalf("unknown backend %q (want cpu or hip)", *backendName)
+	}
+	if *npuOpt {
+		caps := npu.Probe()
+		device, reason := npu.Request(caps)
+		log.Printf("npu: %s; execution device %s", reason, device)
 	}
 	if *contextSize <= 0 {
 		log.Fatal("--ctx must be positive")
@@ -91,6 +100,10 @@ func main() {
 	}
 	if *queue < 0 {
 		log.Fatal("--max-queue must not be negative")
+	}
+	kvFormat, err := qwen35.ParseKVFormat(*kvType)
+	if err != nil {
+		log.Fatal(err)
 	}
 	if *kvBlocks <= 0 {
 		blocks := (*contextSize + *blockSize - 1) / *blockSize
@@ -108,6 +121,7 @@ func main() {
 		}
 		key = hashed
 	}
+	key += "|kv=" + kvFormat.String()
 
 	reader, err := gguf.Open(*modelPath)
 	if err != nil {
@@ -133,6 +147,7 @@ func main() {
 		PrefillChunk: *prefillChunk,
 		Graph:        *graph,
 		ModelKey:     key,
+		KVFormat:     kvFormat,
 	})
 	if err != nil {
 		log.Fatal(err)

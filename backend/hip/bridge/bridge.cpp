@@ -61,6 +61,8 @@ bool check_gemv_shapes(uint64_t n_in, uint32_t dtype) {
         case YUUKA_DTYPE_F32:
         case YUUKA_DTYPE_F16:
             return n_in != 0;
+        case YUUKA_DTYPE_Q4_0:
+        case YUUKA_DTYPE_Q5_0:
         case YUUKA_DTYPE_Q8_0:
             return n_in % 32 == 0;
         case YUUKA_DTYPE_Q4_K:
@@ -79,6 +81,12 @@ bool checked_row_bytes(uint64_t n_in, uint32_t dtype, uint64_t * out) {
             return !__builtin_mul_overflow(n_in, uint64_t(4), out);
         case YUUKA_DTYPE_F16:
             return !__builtin_mul_overflow(n_in, uint64_t(2), out);
+        case YUUKA_DTYPE_Q4_0:
+            blocks = n_in / 32;
+            return !__builtin_mul_overflow(blocks, uint64_t(18), out);
+        case YUUKA_DTYPE_Q5_0:
+            blocks = n_in / 32;
+            return !__builtin_mul_overflow(blocks, uint64_t(22), out);
         case YUUKA_DTYPE_Q8_0:
             blocks = n_in / 32;
             return !__builtin_mul_overflow(blocks, uint64_t(34), out);
@@ -94,6 +102,36 @@ bool checked_row_bytes(uint64_t n_in, uint32_t dtype, uint64_t * out) {
         default:
             return false;
     }
+}
+
+bool kv_dtype_ok(uint32_t dtype) {
+    return dtype == YUUKA_DTYPE_F32 || dtype == YUUKA_DTYPE_F16 ||
+           dtype == YUUKA_DTYPE_Q8_0;
+}
+
+bool kv_row_bytes(uint32_t dtype, uint64_t kv_dim, uint64_t * out) {
+    switch (dtype) {
+        case YUUKA_DTYPE_F32:
+            return !__builtin_mul_overflow(kv_dim, uint64_t(4), out);
+        case YUUKA_DTYPE_F16:
+            return !__builtin_mul_overflow(kv_dim, uint64_t(2), out);
+        case YUUKA_DTYPE_Q8_0:
+            return !__builtin_mul_overflow((kv_dim + 31) / 32, uint64_t(34), out);
+        default:
+            return false;
+    }
+}
+
+bool kv_pool_bytes(uint32_t dtype, uint64_t blocks, uint64_t block_size,
+                   uint64_t kv_dim, uint64_t * out) {
+    uint64_t row_bytes = 0;
+    uint64_t rows = 0;
+    if (!kv_row_bytes(dtype, kv_dim, &row_bytes) ||
+        __builtin_mul_overflow(blocks, block_size, &rows) ||
+        __builtin_mul_overflow(rows, row_bytes, out)) {
+        return false;
+    }
+    return true;
 }
 
 bool checked_float_bytes(uint64_t elements, uint64_t * out) {
@@ -350,7 +388,7 @@ yuuka_status validate_attention_prefill_plan_op(const yuuka_op & op) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "prefill attention buffer %d is null", i);
         }
     }
-    const uint64_t q_stride = heads * 2 * head_dim;
+    const uint64_t q_stride = heads * (op.u[3] != 0 ? head_dim : 2 * head_dim);
     const uint64_t o_stride = heads * head_dim;
     if (!range_elements(op.buf[0], op.off[0], rows, q_stride, q_stride) ||
         !range_elements(op.buf[3], op.off[3], rows, o_stride, o_stride) ||
@@ -510,8 +548,12 @@ yuuka_status validate_kv_write_paged_plan_op(const yuuka_op & op, bool batched) 
     const uint64_t rows = batched ? op.n[1] : 1;
     const uint64_t block_size = op.u[0];
     const uint64_t capacity = op.u[1];
+    const uint32_t dtype = op.u[2];
     if (kv_dim == 0 || rows == 0 || capacity < rows) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged KV write dimensions");
+    }
+    if (!kv_dtype_ok(dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported paged KV dtype %u", dtype);
     }
     for (int i = 0; i < 5; ++i) {
         if (op.buf[i] == nullptr) {
@@ -533,10 +575,8 @@ yuuka_status validate_kv_write_paged_plan_op(const yuuka_op & op, bool batched) 
         return status;
     }
     const uint64_t blocks = paged_blocks(capacity, block_size);
-    uint64_t pool_elems = 0;
     uint64_t pool_bytes = 0;
-    if (__builtin_mul_overflow(blocks * block_size, kv_dim, &pool_elems) ||
-        __builtin_mul_overflow(pool_elems, uint64_t(sizeof(float)), &pool_bytes)) {
+    if (!kv_pool_bytes(dtype, blocks, block_size, kv_dim, &pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged KV pool dimensions overflow");
     }
     if (!buffer_range_ok(op.buf[2], 0, pool_bytes) ||
@@ -554,9 +594,13 @@ yuuka_status validate_attention_paged_plan_op(const yuuka_op & op) {
     const uint64_t score_stride = op.n[4];
     const uint64_t block_size = op.u[0];
     const uint64_t capacity = op.u[1];
+    const uint32_t dtype = op.u[2];
     if (kv_heads == 0 || heads == 0 || head_dim == 0 || heads % kv_heads != 0 ||
         kv_dim != kv_heads * head_dim || score_stride < capacity) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged attention dimensions");
+    }
+    if (!kv_dtype_ok(dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported paged attention KV dtype %u", dtype);
     }
     if (head_dim > 256) {
         return fail(YUUKA_ERR_UNSUPPORTED, "paged attention head dimension exceeds 256");
@@ -570,11 +614,12 @@ yuuka_status validate_attention_paged_plan_op(const yuuka_op & op) {
     if (status != YUUKA_OK) {
         return status;
     }
+    const uint64_t q_elems = heads * (op.u[3] != 0 ? head_dim : 2 * head_dim);
     uint64_t q_bytes = 0;
     uint64_t out_bytes = 0;
     uint64_t score_bytes = 0;
     uint64_t blocks = paged_blocks(capacity, block_size);
-    if (__builtin_mul_overflow(heads * 2 * head_dim, uint64_t(sizeof(float)), &q_bytes) ||
+    if (__builtin_mul_overflow(q_elems, uint64_t(sizeof(float)), &q_bytes) ||
         __builtin_mul_overflow(heads * head_dim, uint64_t(sizeof(float)), &out_bytes) ||
         __builtin_mul_overflow(heads, score_stride, &score_bytes) ||
         __builtin_mul_overflow(score_bytes, uint64_t(sizeof(float)), &score_bytes)) {
@@ -586,10 +631,8 @@ yuuka_status validate_attention_paged_plan_op(const yuuka_op & op) {
         !buffer_range_ok(op.buf[4], op.off[4], score_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged attention buffer is too small");
     }
-    uint64_t pool_elems = 0;
     uint64_t pool_bytes = 0;
-    if (__builtin_mul_overflow(paged_blocks(capacity, block_size) * block_size, kv_dim, &pool_elems) ||
-        __builtin_mul_overflow(pool_elems, uint64_t(sizeof(float)), &pool_bytes)) {
+    if (!kv_pool_bytes(dtype, paged_blocks(capacity, block_size), block_size, kv_dim, &pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged attention pool dimensions overflow");
     }
     if (!buffer_range_ok(op.buf[1], 0, pool_bytes) ||
@@ -607,9 +650,13 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
     const uint64_t rows = op.n[4];
     const uint64_t block_size = op.u[0];
     const uint64_t capacity = op.u[1];
+    const uint32_t dtype = op.u[2];
     if (kv_heads == 0 || heads == 0 || head_dim == 0 || rows == 0 ||
         heads % kv_heads != 0 || kv_dim != kv_heads * head_dim || capacity < rows) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged prefill attention dimensions");
+    }
+    if (!kv_dtype_ok(dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported paged prefill KV dtype %u", dtype);
     }
     if (head_dim > 256) {
         return fail(YUUKA_ERR_UNSUPPORTED, "paged prefill attention head dimension exceeds 256");
@@ -624,21 +671,180 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
     if (status != YUUKA_OK) {
         return status;
     }
-    const uint64_t q_stride = heads * 2 * head_dim;
+    const uint64_t q_stride = heads * (op.u[3] != 0 ? head_dim : 2 * head_dim);
     const uint64_t o_stride = heads * head_dim;
     if (!range_elements(op.buf[0], op.off[0], rows, q_stride, q_stride) ||
         !range_elements(op.buf[3], op.off[3], rows, o_stride, o_stride)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention buffer is too small");
     }
-    uint64_t pool_elems = 0;
     uint64_t pool_bytes = 0;
-    if (__builtin_mul_overflow(paged_blocks(capacity, block_size) * block_size, kv_dim, &pool_elems) ||
-        __builtin_mul_overflow(pool_elems, uint64_t(sizeof(float)), &pool_bytes)) {
+    if (!kv_pool_bytes(dtype, paged_blocks(capacity, block_size), block_size, kv_dim, &pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill pool dimensions overflow");
     }
     if (!buffer_range_ok(op.buf[1], 0, pool_bytes) ||
         !buffer_range_ok(op.buf[2], 0, pool_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention pool is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_moe_route_plan_op(const yuuka_op & op) {
+    const uint64_t rows = op.n[0];
+    const uint64_t experts = op.n[1];
+    const uint64_t used = op.n[2];
+    if (rows == 0 || experts == 0 || used == 0 || used > experts) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid MoE route dimensions");
+    }
+    for (int i = 0; i < 7; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE route buffer %d is null", i);
+        }
+    }
+    uint64_t logits = 0;
+    uint64_t row_used = 0;
+    uint64_t buckets = 0;
+    if (__builtin_mul_overflow(rows, experts, &logits) ||
+        __builtin_mul_overflow(rows, used, &row_used) ||
+        __builtin_mul_overflow(experts, row_used, &buckets)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE route dimensions overflow");
+    }
+    uint64_t logits_bytes = 0;
+    uint64_t row_used_bytes = 0;
+    uint64_t count_bytes = 0;
+    uint64_t bucket_bytes = 0;
+    if (__builtin_mul_overflow(logits, uint64_t(4), &logits_bytes) ||
+        __builtin_mul_overflow(row_used, uint64_t(4), &row_used_bytes) ||
+        __builtin_mul_overflow(experts, uint64_t(4), &count_bytes) ||
+        __builtin_mul_overflow(buckets, uint64_t(4), &bucket_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE route dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, logits_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, row_used_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, row_used_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, count_bytes) ||
+        !buffer_range_ok(op.buf[4], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[5], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[6], 0, bucket_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE route buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_moe_gate_up_plan_op(const yuuka_op & op) {
+    const uint64_t hidden = op.n[0];
+    const uint64_t ffn = op.n[1];
+    const uint64_t rows = op.n[2];
+    const uint64_t experts = op.n[3];
+    const uint64_t used = op.n[4];
+    const uint32_t dtype = op.u[0];
+    if (hidden == 0 || ffn == 0 || rows == 0 || experts == 0 || used == 0 ||
+        used > experts || !check_gemv_shapes(hidden, dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "invalid MoE gate/up dimensions or dtype");
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE gate/up buffer %d is null", i);
+        }
+    }
+    uint64_t hidden_row = 0;
+    uint64_t weight_rows = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t norm_bytes = 0;
+    uint64_t out_elems = 0;
+    uint64_t out_bytes = 0;
+    uint64_t buckets = 0;
+    if (!checked_row_bytes(hidden, dtype, &hidden_row) ||
+        __builtin_mul_overflow(ffn, experts, &weight_rows) ||
+        __builtin_mul_overflow(weight_rows, hidden_row, &weight_bytes) ||
+        __builtin_mul_overflow(rows, hidden, &norm_bytes) ||
+        __builtin_mul_overflow(norm_bytes, uint64_t(4), &norm_bytes) ||
+        __builtin_mul_overflow(rows * used, ffn, &out_elems) ||
+        __builtin_mul_overflow(out_elems, uint64_t(4), &out_bytes) ||
+        __builtin_mul_overflow(experts * rows * used, uint64_t(4), &buckets)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE gate/up dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, norm_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, experts * 4) ||
+        !buffer_range_ok(op.buf[4], 0, buckets) ||
+        !buffer_range_ok(op.buf[5], 0, buckets) ||
+        !buffer_range_ok(op.buf[6], 0, out_bytes) ||
+        !buffer_range_ok(op.buf[7], 0, out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE gate/up buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_moe_down_plan_op(const yuuka_op & op) {
+    const uint64_t ffn = op.n[0];
+    const uint64_t hidden = op.n[1];
+    const uint64_t rows = op.n[2];
+    const uint64_t experts = op.n[3];
+    const uint64_t used = op.n[4];
+    const uint32_t dtype = op.u[0];
+    if (ffn == 0 || hidden == 0 || rows == 0 || experts == 0 || used == 0 ||
+        used > experts || !check_gemv_shapes(ffn, dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "invalid MoE down dimensions or dtype");
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE down buffer %d is null", i);
+        }
+    }
+    uint64_t ffn_row = 0;
+    uint64_t weight_rows = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t act_elems = 0;
+    uint64_t act_bytes = 0;
+    uint64_t out_elems = 0;
+    uint64_t out_bytes = 0;
+    uint64_t buckets = 0;
+    if (!checked_row_bytes(ffn, dtype, &ffn_row) ||
+        __builtin_mul_overflow(hidden, experts, &weight_rows) ||
+        __builtin_mul_overflow(weight_rows, ffn_row, &weight_bytes) ||
+        __builtin_mul_overflow(rows * used, ffn, &act_elems) ||
+        __builtin_mul_overflow(act_elems, uint64_t(4), &act_bytes) ||
+        __builtin_mul_overflow(rows * used, hidden, &out_elems) ||
+        __builtin_mul_overflow(out_elems, uint64_t(4), &out_bytes) ||
+        __builtin_mul_overflow(experts * rows * used, uint64_t(4), &buckets)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE down dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, act_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, experts * 4) ||
+        !buffer_range_ok(op.buf[3], 0, buckets) ||
+        !buffer_range_ok(op.buf[4], 0, buckets) ||
+        !buffer_range_ok(op.buf[5], 0, out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE down buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_moe_reduce_plan_op(const yuuka_op & op) {
+    const uint64_t hidden = op.n[0];
+    const uint64_t rows = op.n[1];
+    const uint64_t used = op.n[2];
+    if (hidden == 0 || rows == 0 || used == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid MoE reduce dimensions");
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE reduce buffer %d is null", i);
+        }
+    }
+    uint64_t x_bytes = 0;
+    uint64_t out_bytes = 0;
+    uint64_t weight_bytes = 0;
+    if (__builtin_mul_overflow(rows * hidden, uint64_t(4), &x_bytes) ||
+        __builtin_mul_overflow(rows * used * hidden, uint64_t(4), &out_bytes) ||
+        __builtin_mul_overflow(rows * used, uint64_t(4), &weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE reduce dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, x_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, out_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE reduce buffer is too small");
     }
     return YUUKA_OK;
 }
@@ -674,6 +880,12 @@ yuuka_status launch_gemv_batch_dispatch(yuuka_op const & op, hipStream_t stream)
             break;
         case YUUKA_DTYPE_F16:
             yuuka::launch_gemv_batch_f16(out, x, w, n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_Q4_0:
+            yuuka::launch_gemv_batch_q4_0(out, x, w, n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_Q5_0:
+            yuuka::launch_gemv_batch_q5_0(out, x, w, n_in, n_out, batch, stream);
             break;
         case YUUKA_DTYPE_Q8_0:
             yuuka::launch_gemv_batch_q8_0(out, x, w, n_in, n_out, batch, stream);
@@ -736,6 +948,12 @@ yuuka_status launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
             break;
         case YUUKA_DTYPE_F16:
             yuuka::launch_gemv_f16(out, x, w, n_in, n_out, stream);
+            break;
+        case YUUKA_DTYPE_Q4_0:
+            yuuka::launch_gemv_q4_0(out, x, w, n_in, n_out, stream);
+            break;
+        case YUUKA_DTYPE_Q5_0:
+            yuuka::launch_gemv_q5_0(out, x, w, n_in, n_out, stream);
             break;
         case YUUKA_DTYPE_Q8_0:
             yuuka::launch_gemv_q8_0(out, x, w, n_in, n_out, stream);
@@ -994,16 +1212,16 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             }
             if (dynamic != nullptr) {
                 yuuka::launch_kv_write_paged_dynamic_f32(
-                    op_ptr<float>(op, 2), op_ptr<float>(op, 3),
+                    op_ptr<void>(op, 2), op_ptr<void>(op, 3),
                     op_ptr<const float>(op, 0), op_ptr<const float>(op, 1),
                     int(rows), int(op.n[0]), op_ptr<const int32_t>(op, 4),
-                    dynamic, int(op.u[0]), stream);
+                    dynamic, int(op.u[0]), op.u[2], stream);
             } else {
                 yuuka::launch_kv_write_paged_f32(
-                    op_ptr<float>(op, 2), op_ptr<float>(op, 3),
+                    op_ptr<void>(op, 2), op_ptr<void>(op, 3),
                     op_ptr<const float>(op, 0), op_ptr<const float>(op, 1),
                     int(rows), int(op.n[0]), op_ptr<const int32_t>(op, 4),
-                    int(op.u[0]), int(position), stream);
+                    int(op.u[0]), int(position), op.u[2], stream);
             }
             break;
         }
@@ -1017,17 +1235,19 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             if (dynamic != nullptr) {
                 yuuka::launch_attention_paged_dynamic_f32(
                     op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
-                    op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                    op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<float>(op, 4), op_ptr<const int32_t>(op, 5), dynamic,
                     int(op.u[0]), int(op.n[0]), int(op.n[1]), int(op.n[2]),
-                    int(op.n[3]), int(op.n[4]), op.f[0], stream);
+                    int(op.n[3]), int(op.n[4]), op.f[0], op.u[2],
+                    int(op.u[3]), stream);
             } else {
                 yuuka::launch_attention_paged_f32(
                     op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
-                    op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                    op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                     op_ptr<float>(op, 4), op_ptr<const int32_t>(op, 5),
                     int(op.u[0]), int(op.n[0]), int(op.n[1]), int(op.n[2]),
-                    int(op.n[3]), int(position), int(op.n[4]), op.f[0], stream);
+                    int(op.n[3]), int(position), int(op.n[4]), op.f[0],
+                    op.u[2], int(op.u[3]), stream);
             }
             break;
         }
@@ -1042,10 +1262,67 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             }
             yuuka::launch_attention_prefill_paged_f32(
                 op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
-                op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                op_ptr<const void>(op, 1), op_ptr<const void>(op, 2),
                 op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
                 int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
-                int(position), op.f[0], stream);
+                int(position), op.f[0], op.u[2], int(op.u[3]), stream);
+            break;
+        }
+        case YUUKA_OP_MOE_ROUTE: {
+            const int rows = int(op.n[0]);
+            const int experts = int(op.n[1]);
+            const int used = int(op.n[2]);
+            const yuuka_status route_status = static_cast<yuuka_status>(
+                yuuka::launch_moe_route(
+                    op_ptr<const float>(op, 0), rows, experts, used, rows * used,
+                    op_ptr<int32_t>(op, 1), op_ptr<float>(op, 2),
+                    op_ptr<int32_t>(op, 3), op_ptr<int32_t>(op, 4),
+                    op_ptr<int32_t>(op, 5), op_ptr<float>(op, 6), stream));
+            if (route_status != YUUKA_OK) {
+                return fail(route_status, "MoE route launch failed");
+            }
+            break;
+        }
+        case YUUKA_OP_MOE_GATE_UP: {
+            const int hidden = int(op.n[0]);
+            const int ffn = int(op.n[1]);
+            const int rows = int(op.n[2]);
+            const int experts = int(op.n[3]);
+            const int used = int(op.n[4]);
+            uint64_t hidden_row_bytes = 0;
+            if (!checked_row_bytes(uint64_t(hidden), op.u[0], &hidden_row_bytes)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE gate/up row size overflow");
+            }
+            yuuka::launch_moe_gate_up_grouped(
+                op_ptr<const float>(op, 0), op_ptr<const void>(op, 1),
+                op_ptr<const void>(op, 2), op_ptr<const int32_t>(op, 3),
+                op_ptr<const int32_t>(op, 4), op_ptr<const int32_t>(op, 5),
+                op_ptr<float>(op, 6), op_ptr<float>(op, 7), rows, experts,
+                used, hidden, ffn, hidden_row_bytes, op.u[0], stream);
+            break;
+        }
+        case YUUKA_OP_MOE_DOWN: {
+            const int ffn = int(op.n[0]);
+            const int hidden = int(op.n[1]);
+            const int rows = int(op.n[2]);
+            const int experts = int(op.n[3]);
+            const int used = int(op.n[4]);
+            uint64_t ffn_row_bytes = 0;
+            if (!checked_row_bytes(uint64_t(ffn), op.u[0], &ffn_row_bytes)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE down row size overflow");
+            }
+            yuuka::launch_moe_down_grouped(
+                op_ptr<const float>(op, 0), op_ptr<const void>(op, 1),
+                op_ptr<const int32_t>(op, 2), op_ptr<const int32_t>(op, 3),
+                op_ptr<const int32_t>(op, 4), op_ptr<float>(op, 5), rows,
+                experts, used, hidden, ffn, ffn_row_bytes, op.u[0], stream);
+            break;
+        }
+        case YUUKA_OP_MOE_REDUCE_ADD: {
+            yuuka::launch_moe_reduce_add(
+                op_ptr<float>(op, 0), op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2), int(op.n[1]), int(op.n[2]),
+                int(op.n[0]), stream);
             break;
         }
         default:
@@ -1317,6 +1594,28 @@ YUUKA_API yuuka_status yuuka_memcpy_d2h(void * dst, const yuuka_buffer * src,
     });
 }
 
+YUUKA_API yuuka_status yuuka_memcpy_d2h_at(void * dst, const yuuka_buffer * src,
+                                           uint64_t offset, uint64_t bytes) {
+    return guard([&]() -> yuuka_status {
+        if (dst == nullptr || src == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "destination or source is null");
+        }
+        if (!buffer_range_ok(src, offset, bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "device-to-host range [%llu,%llu) exceeds buffer of %llu bytes",
+                        static_cast<unsigned long long>(offset),
+                        static_cast<unsigned long long>(offset + bytes),
+                        static_cast<unsigned long long>(src->bytes));
+        }
+        hipError_t err = hipMemcpy(dst, static_cast<const uint8_t *>(src->ptr) + offset,
+                                   bytes, hipMemcpyDeviceToHost);
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "hipMemcpy device-to-host: %s", hip_error(err));
+        }
+        return YUUKA_OK;
+    });
+}
+
 YUUKA_API yuuka_status yuuka_memset(yuuka_stream * stream, yuuka_buffer * dst,
                                     int value, uint64_t bytes) {
     return guard([&]() -> yuuka_status {
@@ -1469,6 +1768,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
         switch (dtype) {
             case YUUKA_DTYPE_F32: yuuka::launch_gemv_batch_f32(out_ptr, x_ptr, static_cast<const float *>(w->ptr), n_in, n_out, batch, stream->stream); break;
             case YUUKA_DTYPE_F16: yuuka::launch_gemv_batch_f16(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
+            case YUUKA_DTYPE_Q4_0: yuuka::launch_gemv_batch_q4_0(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
+            case YUUKA_DTYPE_Q5_0: yuuka::launch_gemv_batch_q5_0(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
             case YUUKA_DTYPE_Q8_0: yuuka::launch_gemv_batch_q8_0(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
             case YUUKA_DTYPE_Q4_K: yuuka::launch_gemv_batch_q4_k(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
             case YUUKA_DTYPE_Q5_K: yuuka::launch_gemv_batch_q5_k(out_ptr, x_ptr, w->ptr, n_in, n_out, batch, stream->stream); break;
@@ -1598,6 +1899,14 @@ YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
             case YUUKA_DTYPE_F16:
                 yuuka::launch_gemv_f16(out_ptr, x_ptr, w->ptr, n_in, n_out,
                                        stream->stream);
+                break;
+            case YUUKA_DTYPE_Q4_0:
+                yuuka::launch_gemv_q4_0(out_ptr, x_ptr, w->ptr, n_in, n_out,
+                                        stream->stream);
+                break;
+            case YUUKA_DTYPE_Q5_0:
+                yuuka::launch_gemv_q5_0(out_ptr, x_ptr, w->ptr, n_in, n_out,
+                                        stream->stream);
                 break;
             case YUUKA_DTYPE_Q8_0:
                 yuuka::launch_gemv_q8_0(out_ptr, x_ptr, w->ptr, n_in, n_out,
@@ -1874,7 +2183,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_ATTENTION_PREFILL_PAGED) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MOE_REDUCE_ADD) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -1923,6 +2232,18 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_ATTENTION_PREFILL_PAGED:
                 status = validate_attention_prefill_paged_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_ROUTE:
+                status = validate_moe_route_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_GATE_UP:
+                status = validate_moe_gate_up_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_DOWN:
+                status = validate_moe_down_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_REDUCE_ADD:
+                status = validate_moe_reduce_plan_op(*op);
                 break;
             default:
                 break;

@@ -33,6 +33,52 @@ func TestFloat16RoundTrip(t *testing.T) {
 	}
 }
 
+func TestDequantizeQ4_0(t *testing.T) {
+	src := make([]byte, 18)
+	putHalf(src, 0, 0.5)
+	for i := range 16 {
+		src[2+i] = byte((i & 0x0f) | ((15 - i) << 4))
+	}
+	dst := make([]float32, 32)
+	if err := DequantizeRow(dst, Q4_0, src); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 16 {
+		if want := 0.5 * float32(i-8); dst[i] != want {
+			t.Fatalf("low index %d: got %v want %v", i, dst[i], want)
+		}
+		if want := 0.5 * float32(15-i-8); dst[i+16] != want {
+			t.Fatalf("high index %d: got %v want %v", i, dst[i+16], want)
+		}
+	}
+}
+
+func TestDequantizeQ5_0(t *testing.T) {
+	src := make([]byte, 22)
+	putHalf(src, 0, 1)
+	// Set the high bit for value 0 and value 1 and leave the rest clear.
+	src[2] = 0x03
+	for i := range 16 {
+		src[6+i] = byte(i & 0x0f)
+	}
+	dst := make([]float32, 32)
+	if err := DequantizeRow(dst, Q5_0, src); err != nil {
+		t.Fatal(err)
+	}
+	if dst[0] != 0 {
+		t.Fatalf("index 0: got %v want 0", dst[0])
+	}
+	if dst[1] != 1 {
+		t.Fatalf("index 1: got %v want 1", dst[1])
+	}
+	if dst[2] != -14 {
+		t.Fatalf("index 2: got %v want -14", dst[2])
+	}
+	if dst[16] != -16 {
+		t.Fatalf("index 16: got %v want -16", dst[16])
+	}
+}
+
 func TestDequantizeQ8_0(t *testing.T) {
 	src := make([]byte, 34)
 	putHalf(src, 0, 0.5)
@@ -126,7 +172,7 @@ func TestDequantizeQ6K(t *testing.T) {
 
 func TestMatMulMatchesDequantizedDot(t *testing.T) {
 	const rows, cols = 3, 256
-	cases := []DType{F32, F16, Q8_0, Q4_K, Q5_K, Q6_K}
+	cases := []DType{F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}
 	for _, dtype := range cases {
 		t.Run(dtype.String(), func(t *testing.T) {
 			block, err := dtype.BlockLayout()
@@ -148,6 +194,14 @@ func TestMatMulMatchesDequantizedDot(t *testing.T) {
 				case F16:
 					for i := range cols {
 						putHalf(row, i*2, float32(i%5)-2)
+					}
+				case Q4_0:
+					for i := range cols / 32 {
+						putHalf(row, i*18, 0.03125)
+					}
+				case Q5_0:
+					for i := range cols / 32 {
+						putHalf(row, i*22, 0.03125)
 					}
 				case Q8_0:
 					for i := range cols / 32 {

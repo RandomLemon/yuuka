@@ -24,6 +24,26 @@ Phase-level splitting is the first candidate because it avoids per-layer
 handoffs. Subgraph partitioning is more complex and requires a cost model,
 device-affinity metadata, and transfer scheduling.
 
+## 2.1 Current probe result
+
+`yuuka npu-probe` and the opt-in `--npu` flag report the following on the
+reference host (2026-11-11):
+
+```text
+state: device_only
+device: /dev/accel/accel0
+driver: true
+userspace: false
+reason: device and amdxdna driver are present, but no XRT userspace runtime was found
+fallback: selected backend
+```
+
+The XDNA device node and the `amdxdna` kernel module are present, but no
+`xrt-smi`, `libxrt_core`, or XRT library directory was found. The toolchain
+prerequisite in section 6 is therefore unmet, and no NPU kernel, graph compiler,
+or subgraph partition is shipped. `--npu` records the probe result and falls back
+to the selected GPU backend; it never silently changes results.
+
 ## 3. Why it is deferred
 
 - The Linux NPU toolchain, driver, and runtime may not be available or stable
@@ -40,6 +60,7 @@ device-affinity metadata, and transfer scheduling.
 
 ## 4. Interface reservations
 
+`backend/npu` currently exposes only a capability probe and fallback decision.
 The architecture reserves the following concepts without implementing them in
 the first release:
 
@@ -77,7 +98,8 @@ Before an NPU path can be enabled, answer these with measurements:
 
 ## 6. Activation criteria
 
-An NPU path is considered only when:
+An NPU path is considered only when (none of these are met on the current host;
+the first condition fails because the XRT userspace runtime is absent):
 
 - the toolchain and runtime are available and reproducible on the target;
 - a correctness path exists against the CPU reference and GPU output;

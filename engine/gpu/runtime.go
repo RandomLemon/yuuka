@@ -1,8 +1,9 @@
 //go:build hip && linux
 
-// Package gpu executes the Qwen3.5 decoder on the HIP backend. A shared model
-// owns weights and KV pools; each request owns a block table and recurrent
-// state. Runtime is the single-request compatibility wrapper used by the CLI.
+// Package gpu executes the Qwen3.5 hybrid decoder and Qwen3 MoE on the HIP
+// backend. A shared model owns weights and KV pools; each request owns a block
+// table and optional recurrent state. Runtime and MoERuntime are the
+// single-request compatibility wrappers used by the CLI.
 package gpu
 
 import (
@@ -13,6 +14,7 @@ import (
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/memory"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
+	"github.com/yuuka-ai/yuuka/tensor"
 )
 
 // Runtime is a single-request HIP execution backend implementing
@@ -26,9 +28,14 @@ type Runtime struct {
 	closed      bool
 }
 
-// New uploads model weights and builds a single-request session with a
+// New uploads model weights and builds a single-request F32-KV session with a
 // contiguous block table covering capacity positions.
 func New(reader *gguf.Reader, model *qwen35.Model, capacity int) (*Runtime, error) {
+	return NewWithKVType(reader, model, capacity, tensor.F32)
+}
+
+// NewWithKVType is New with an explicit KV pool storage type.
+func NewWithKVType(reader *gguf.Reader, model *qwen35.Model, capacity int, kvType tensor.DType) (*Runtime, error) {
 	if model == nil {
 		return nil, fmt.Errorf("gpu: model is required")
 	}
@@ -50,6 +57,7 @@ func New(reader *gguf.Reader, model *qwen35.Model, capacity int) (*Runtime, erro
 		PrefillChunk:  chunk,
 		EnableGraph:   false,
 		GraphMinSteps: 1,
+		KVType:        kvType,
 	})
 	if err != nil {
 		return nil, err
@@ -127,6 +135,37 @@ func (r *Runtime) Step(token int32) ([]float32, error) {
 		return nil, fmt.Errorf("runtime is closed")
 	}
 	return r.session.Decode(token)
+}
+
+// PrefillLogits returns logits for every position in tokens.
+func (r *Runtime) PrefillLogits(tokens []int32) ([][]float32, error) {
+	if r == nil || r.closed {
+		return nil, fmt.Errorf("runtime is closed")
+	}
+	return r.session.PrefillLogits(tokens)
+}
+
+// SnapshotState captures recurrent state and the current position.
+func (r *Runtime) SnapshotState() ([]byte, int, error) {
+	if r == nil || r.closed {
+		return nil, 0, fmt.Errorf("runtime is closed")
+	}
+	data, err := r.session.Snapshot()
+	if err != nil {
+		return nil, 0, err
+	}
+	return data, r.session.Position(), nil
+}
+
+// RestoreState restores recurrent state and rewinds to position.
+func (r *Runtime) RestoreState(data []byte, position int) error {
+	if r == nil || r.closed {
+		return fmt.Errorf("runtime is closed")
+	}
+	if err := r.session.Restore(data); err != nil {
+		return err
+	}
+	return r.session.SetPosition(position)
 }
 
 // ForwardTrace returns logits and per-layer hidden state for the last token.

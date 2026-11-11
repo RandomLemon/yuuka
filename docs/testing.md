@@ -213,13 +213,14 @@ model output. A text-only comparison is insufficient.
 
 | Dimension | Values |
 | --- | --- |
-| Model | Qwen3.5-4B hybrid (primary), Qwen3 Dense, Llama Dense, small fixtures |
-| Quantization | F16, Q8_0, Q6_K, Q4_K |
+| Model | Qwen3.5-4B hybrid (primary), Qwen3 MoE fixture, Qwen3 Dense, Llama Dense, small fixtures |
+| Quantization | F16, Q8_0, Q6_K, Q5_K, Q4_K, Q5_0, Q4_0 |
+| KV format | F32, F16, Q8_0 |
 | Context | short, medium, maximum supported |
 | Prompt language | English, Chinese, mixed |
 | Batch | 1, small batch, continuous batch |
 | Concurrency | 1, 2, 4 |
-| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation |
+| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding, grouped MoE experts, NPU probe fallback |
 | Backends | CPU reference, HIP GPU, library fallback |
 
 ### 5.2 Performance matrix
@@ -229,7 +230,7 @@ model output. A text-only comparison is insufficient.
 | Prefill length | 128 / 512 / 2048 / 8192 / 32768 tokens |
 | Decode length | 128 / 256 tokens |
 | Concurrency | 1 / 2 / 4 / 8 / 16 requests |
-| Quantization | FP16, Q8_0, Q6_K, Q4_K |
+| Quantization | FP16, Q8_0, Q6_K, Q4_K, Q5_0, Q4_0 |
 | Modes | latency and throughput |
 | Comparison | llama.cpp HIP, llama.cpp Vulkan (same GGUF) |
 
@@ -376,7 +377,8 @@ YUUKA_TEST_MODEL=/path/to/model.gguf go test ./...
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
-reference, layer-by-layer hidden-state comparison, and the paged HIP executor.
+reference, layer-by-layer hidden-state comparison, the paged HIP executor, KV
+formats, and speculative decoding against the plain greedy path.
 HTTP API contract tests use the deterministic tiny fixture so they cover
 streaming, errors, stops, and cancellation independently of the optional model
 environment. SentencePiece golden IDs additionally accept
@@ -390,8 +392,12 @@ explicitly:
 ```bash
 ./build/yuuka_hardware_probe
 ./build/yuuka_gemv_sweep
+./build/yuuka_moe_sweep
+go run ./cmd/yuuka npu-probe
 scripts/thermal_probe.sh 15 ./build/yuuka_hardware_probe
 /tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 16 --decode-tokens 16
+/tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 128 \
+    --decode-tokens 32 --kv-type q8_0 --speculative
 go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
 /tmp/yuuka-serving-bench --model model.gguf --backend hip --ctx 256 \
     --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16

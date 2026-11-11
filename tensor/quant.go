@@ -39,6 +39,10 @@ func DequantizeRow(dst []float32, dtype DType, src []byte) error {
 		}
 	case Q8_0:
 		dequantizeQ8_0(dst, src)
+	case Q4_0:
+		dequantizeQ4_0(dst, src)
+	case Q5_0:
+		dequantizeQ5_0(dst, src)
 	case Q4_K:
 		dequantizeQ4K(dst, src)
 	case Q5_K:
@@ -49,6 +53,29 @@ func DequantizeRow(dst []float32, dtype DType, src []byte) error {
 		return fmt.Errorf("%w: %s", ErrUnsupportedDType, dtype)
 	}
 	return nil
+}
+
+func dequantizeQ4_0(dst []float32, src []byte) {
+	for off, si := 0, 0; si+18 <= len(src); off, si = off+32, si+18 {
+		d := Float16ToFloat32(binary.LittleEndian.Uint16(src[si:]))
+		for j := range 16 {
+			dst[off+j] = d * float32(int(src[si+2+j]&0x0f)-8)
+			dst[off+j+16] = d * float32(int(src[si+2+j]>>4)-8)
+		}
+	}
+}
+
+func dequantizeQ5_0(dst []float32, src []byte) {
+	for off, si := 0, 0; si+22 <= len(src); off, si = off+32, si+22 {
+		d := Float16ToFloat32(binary.LittleEndian.Uint16(src[si:]))
+		qh := binary.LittleEndian.Uint32(src[si+2:])
+		for j := range 16 {
+			xh0 := uint8(((qh >> uint(j)) << 4) & 0x10)
+			xh1 := uint8((qh >> uint(j+12)) & 0x10)
+			dst[off+j] = d * float32(int(src[si+6+j]&0x0f|xh0)-16)
+			dst[off+j+16] = d * float32(int(src[si+6+j]>>4|xh1)-16)
+		}
+	}
 }
 
 func dequantizeQ8_0(dst []float32, src []byte) {
@@ -275,6 +302,27 @@ func (m Matrix) matmulRows(dst, x []float32, batch int, rowStart, rowEnd int64, 
 					d := Float16ToFloat32(binary.LittleEndian.Uint16(src[si:]))
 					for i := 0; i < 32; i++ {
 						sum += xb[block*32+i] * d * float32(int8(src[si+2+i]))
+					}
+				}
+				dst[b*int(m.Rows)+int(row)] = sum
+			}
+		case Q4_0, Q5_0:
+			var values [32]float32
+			for b := 0; b < batch; b++ {
+				xb := x[b*cols : (b+1)*cols]
+				var sum float32
+				blockBytes := 18
+				if m.DType == Q5_0 {
+					blockBytes = 22
+				}
+				for block, si := 0, 0; block < cols/32; block, si = block+1, si+blockBytes {
+					if m.DType == Q4_0 {
+						dequantizeQ4_0(values[:], src[si:si+18])
+					} else {
+						dequantizeQ5_0(values[:], src[si:si+22])
+					}
+					for i := range 32 {
+						sum += xb[block*32+i] * values[i]
 					}
 				}
 				dst[b*int(m.Rows)+int(row)] = sum

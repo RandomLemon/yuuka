@@ -13,6 +13,10 @@ void launch_gemv_f32(float * out, const float * x, const float * w,
                      uint64_t n_in, uint64_t n_out, hipStream_t stream);
 void launch_gemv_f16(float * out, const float * x, const void * w,
                      uint64_t n_in, uint64_t n_out, hipStream_t stream);
+void launch_gemv_q4_0(float * out, const float * x, const void * w,
+                      uint64_t n_in, uint64_t n_out, hipStream_t stream);
+void launch_gemv_q5_0(float * out, const float * x, const void * w,
+                      uint64_t n_in, uint64_t n_out, hipStream_t stream);
 void launch_gemv_q8_0(float * out, const float * x, const void * w,
                       uint64_t n_in, uint64_t n_out, hipStream_t stream);
 void launch_gemv_q4_k(float * out, const float * x, const void * w,
@@ -28,6 +32,12 @@ void launch_gemv_batch_f32(float * out, const float * x, const float * w,
 void launch_gemv_batch_f16(float * out, const float * x, const void * w,
                            uint64_t n_in, uint64_t n_out, uint64_t batch,
                            hipStream_t stream);
+void launch_gemv_batch_q4_0(float * out, const float * x, const void * w,
+                            uint64_t n_in, uint64_t n_out, uint64_t batch,
+                            hipStream_t stream);
+void launch_gemv_batch_q5_0(float * out, const float * x, const void * w,
+                            uint64_t n_in, uint64_t n_out, uint64_t batch,
+                            hipStream_t stream);
 void launch_gemv_batch_q8_0(float * out, const float * x, const void * w,
                             uint64_t n_in, uint64_t n_out, uint64_t batch,
                             hipStream_t stream);
@@ -89,19 +99,19 @@ void launch_attention_f32(float * out, const float * q, const float * k_cache,
                           const float * v_cache, float * scores,
                           int kv_heads, int heads, int head_dim, int kv_dim,
                           int position, int capacity, float scale, hipStream_t stream);
-void launch_attention_paged_f32(float * out, const float * q, const float * k_pool,
-                                const float * v_pool, float * scores,
+void launch_attention_paged_f32(float * out, const float * q, const void * k_pool,
+                                const void * v_pool, float * scores,
                                 const int32_t * block_table, int block_size,
                                 int kv_heads, int heads, int head_dim, int kv_dim,
                                 int position, int score_stride, float scale,
-                                hipStream_t stream);
+                                uint32_t dtype, int dense, hipStream_t stream);
 void launch_attention_paged_dynamic_f32(float * out, const float * q,
-                                        const float * k_pool, const float * v_pool,
+                                        const void * k_pool, const void * v_pool,
                                         float * scores, const int32_t * block_table,
                                         const int32_t * dynamic, int block_size,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int score_stride, float scale,
-                                        hipStream_t stream);
+                                        uint32_t dtype, int dense, hipStream_t stream);
 void launch_conv1d_f32(float * state, const float * weights, const float * qkv,
                        float * out, int channels, int kernel, hipStream_t stream);
 void launch_gdn_f32(float * state, const float * q, const float * k, const float * v,
@@ -131,16 +141,16 @@ void launch_rope_batch_f32(float * data, int rows, int heads, int stride,
 void launch_kv_write_batch_f32(float * k_cache, float * v_cache, const float * k,
                                const float * v, int rows, int kv_dim, int position,
                                hipStream_t stream);
-void launch_kv_write_paged_f32(float * k_pool, float * v_pool, const float * k,
+void launch_kv_write_paged_f32(void * k_pool, void * v_pool, const float * k,
                                const float * v, int rows, int kv_dim,
                                const int32_t * block_table, int block_size,
-                               int position, hipStream_t stream);
-void launch_kv_write_paged_dynamic_f32(float * k_pool, float * v_pool,
+                               int position, uint32_t dtype, hipStream_t stream);
+void launch_kv_write_paged_dynamic_f32(void * k_pool, void * v_pool,
                                        const float * k, const float * v,
                                        int rows, int kv_dim,
                                        const int32_t * block_table,
                                        const int32_t * dynamic, int block_size,
-                                       hipStream_t stream);
+                                       uint32_t dtype, hipStream_t stream);
 void launch_embedding_batch_f32(float * out, const void * weights,
                                 const int32_t * tokens, int rows, uint64_t row_bytes,
                                 int64_t cols, uint32_t dtype, hipStream_t stream);
@@ -150,11 +160,37 @@ void launch_attention_prefill_f32(float * out, const float * q,
                                   int rows, int position, int capacity, float scale,
                                   hipStream_t stream);
 void launch_attention_prefill_paged_f32(float * out, const float * q,
-                                        const float * k_pool, const float * v_pool,
+                                        const void * k_pool, const void * v_pool,
                                         const int32_t * block_table, int block_size,
                                         int kv_heads, int heads, int head_dim,
                                         int kv_dim, int rows, int position,
-                                        float scale, hipStream_t stream);
+                                        float scale, uint32_t dtype, int dense,
+                                        hipStream_t stream);
+/* MoE routing and grouped expert kernels. ids/weights are [rows, used], counts
+ * and assignment buckets are [experts], and each bucket holds up to rows*used
+ * assignments. */
+int launch_moe_route(const float * logits, int rows, int experts, int used,
+                     int bucket_capacity, int32_t * ids, float * weights,
+                     int32_t * counts, int32_t * assign_rows,
+                     int32_t * assign_slots, float * assign_weights,
+                     hipStream_t stream);
+void launch_moe_gate_up_grouped(const float * norm, const void * gate_exps,
+                                const void * up_exps, const int32_t * counts,
+                                const int32_t * assign_rows,
+                                const int32_t * assign_slots, float * gate_out,
+                                float * up_out, int rows, int experts, int used,
+                                int hidden, int ffn, uint64_t hidden_row_bytes,
+                                uint32_t dtype, hipStream_t stream);
+void launch_moe_down_grouped(const float * act, const void * down_exps,
+                             const int32_t * counts, const int32_t * assign_rows,
+                             const int32_t * assign_slots, float * out, int rows,
+                             int experts, int used, int hidden, int ffn,
+                             uint64_t ffn_row_bytes, uint32_t dtype,
+                             hipStream_t stream);
+void launch_moe_reduce_add(float * x, const float * expert_out,
+                           const float * weights, int rows, int used, int hidden,
+                           hipStream_t stream);
+
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
                                 const float * qkv, const float * z,
                                 const float * alpha, const float * beta,

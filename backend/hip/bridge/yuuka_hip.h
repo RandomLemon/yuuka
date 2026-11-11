@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 3
+#define YUUKA_HIP_ABI_VERSION 4
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -73,6 +73,8 @@ YUUKA_API yuuka_status yuuka_event_wait(yuuka_event * event);
 /* Host transfers are synchronous with respect to the host buffer. */
 YUUKA_API yuuka_status yuuka_memcpy_h2d(yuuka_buffer * dst, const void * src, uint64_t bytes);
 YUUKA_API yuuka_status yuuka_memcpy_d2h(void * dst, const yuuka_buffer * src, uint64_t bytes);
+YUUKA_API yuuka_status yuuka_memcpy_d2h_at(void * dst, const yuuka_buffer * src,
+                                           uint64_t offset, uint64_t bytes);
 YUUKA_API yuuka_status yuuka_memset(yuuka_stream * stream, yuuka_buffer * dst, int value, uint64_t bytes);
 
 /* Asynchronous device-to-device copy on stream. Offsets and length must fit
@@ -128,7 +130,11 @@ typedef enum yuuka_op_code {
     YUUKA_OP_KV_WRITE_PAGED = 26,
     YUUKA_OP_ATTENTION_PAGED = 27,
     YUUKA_OP_KV_WRITE_BATCH_PAGED = 28,
-    YUUKA_OP_ATTENTION_PREFILL_PAGED = 29
+    YUUKA_OP_ATTENTION_PREFILL_PAGED = 29,
+    YUUKA_OP_MOE_ROUTE = 30,
+    YUUKA_OP_MOE_GATE_UP = 31,
+    YUUKA_OP_MOE_DOWN = 32,
+    YUUKA_OP_MOE_REDUCE_ADD = 33
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -157,6 +163,8 @@ typedef struct yuuka_graph yuuka_graph;
 typedef enum yuuka_dtype {
     YUUKA_DTYPE_F32 = 0,
     YUUKA_DTYPE_F16 = 1,
+    YUUKA_DTYPE_Q4_0 = 2,
+    YUUKA_DTYPE_Q5_0 = 6,
     YUUKA_DTYPE_Q8_0 = 8,
     YUUKA_DTYPE_Q4_K = 12,
     YUUKA_DTYPE_Q5_K = 13,
@@ -253,20 +261,39 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *
  * Paged family. The block table is an int32 buffer with ceil(capacity/block_size)
  * entries mapping logical token positions to pool blocks. The pool holds
- * ceil(capacity/block_size)*block_size rows of kv_dim FP32 values.
+ * ceil(capacity/block_size)*block_size rows of kv_dim values in u[2] format
+ * (F32, F16, or Q8_0). u[2] defaults to zero (F32). Q8_0 rows use one FP16
+ * scale and 32 int8 values per 32-column group, with a padded trailing group.
  *   KV_WRITE_PAGED:         buf0 k, buf1 v, buf2 k_pool, buf3 v_pool,
  *                           buf4 block table; n[0]=kv_dim; u[0]=block_size;
- *                           u[1]=capacity
+ *                           u[1]=capacity; u[2]=pool dtype
  *   KV_WRITE_BATCH_PAGED:   same buffers; n={kv_dim,rows,capacity};
- *                           u[0]=block_size
+ *                           u[0]=block_size; u[2]=pool dtype
  *   ATTENTION_PAGED:        buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
  *                           buf4 scores, buf5 block table;
  *                           n={kv_heads,heads,head_dim,kv_dim,score_stride};
- *                           u[0]=block_size; u[1]=capacity
+ *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype
  *   ATTENTION_PREFILL_PAGED: buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
  *                           buf4 block table;
  *                           n={kv_heads,heads,head_dim,kv_dim,rows};
- *                           u[0]=block_size; u[1]=capacity
+ *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype;
+ *                           u[3]=1 selects the dense query layout (no output
+ *                           gate), u[3]=0 selects the gated Qwen3.5 layout
+ *
+ * MoE family. ids and weights are [rows, used]. counts is [experts] and each of
+ * the three assignment buffers is [experts, rows*used]. The grouped kernels bin
+ * assignments by expert at runtime.
+ *   MOE_ROUTE:      buf0 logits [rows,experts], buf1 ids, buf2 weights,
+ *                   buf3 counts, buf4 assign_rows, buf5 assign_slots,
+ *                   buf6 assign_weights; n={rows,experts,used}
+ *   MOE_GATE_UP:    buf0 norm, buf1 gate_exps, buf2 up_exps, buf3 counts,
+ *                   buf4 assign_rows, buf5 assign_slots, buf6 gate_out,
+ *                   buf7 up_out; n={hidden,ffn,rows,experts,used}; u[0]=dtype
+ *   MOE_DOWN:       buf0 act, buf1 down_exps, buf2 counts, buf3 assign_rows,
+ *                   buf4 assign_slots, buf5 out; n={ffn,hidden,rows,experts,used};
+ *                   u[0]=dtype
+ *   MOE_REDUCE_ADD: buf0 x, buf1 expert_out, buf2 weights;
+ *                   n={hidden,rows,used}
  *
  * Graph capture executes a plan with device-resident dynamic parameters. Only
  * ops with dynamic-aware kernels may be captured; otherwise capture fails with

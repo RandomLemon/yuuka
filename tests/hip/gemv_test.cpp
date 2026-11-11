@@ -132,6 +132,38 @@ float dot_q6_k(const uint8_t * row, const float * x, int64_t n) {
     return sum;
 }
 
+float dot_q4_0(const uint8_t * row, const float * x, int64_t n) {
+    float sum = 0;
+    for (int64_t block = 0; block < n / 32; ++block) {
+        const uint8_t * blk = row + block * 18;
+        const float d = half_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+        for (int l = 0; l < 16; ++l) {
+            sum += x[block * 32 + l] * d * float((blk[2 + l] & 0xF) - 8);
+            sum += x[block * 32 + l + 16] * d * float((blk[2 + l] >> 4) - 8);
+        }
+    }
+    return sum;
+}
+
+float dot_q5_0(const uint8_t * row, const float * x, int64_t n) {
+    float sum = 0;
+    for (int64_t block = 0; block < n / 32; ++block) {
+        const uint8_t * blk = row + block * 22;
+        const float d = half_to_float(uint16_t(blk[0] | (blk[1] << 8)));
+        const uint32_t qh = uint32_t(blk[2]) | (uint32_t(blk[3]) << 8) |
+                            (uint32_t(blk[4]) << 16) | (uint32_t(blk[5]) << 24);
+        for (int l = 0; l < 16; ++l) {
+            const int xh0 = int(((qh >> l) << 4) & 0x10);
+            const int xh1 = int((qh >> (l + 12)) & 0x10);
+            const int q0 = int(blk[6 + l] & 0xF) | xh0;
+            const int q1 = int(blk[6 + l] >> 4) | xh1;
+            sum += x[block * 32 + l] * d * float(q0 - 16);
+            sum += x[block * 32 + l + 16] * d * float(q1 - 16);
+        }
+    }
+    return sum;
+}
+
 float dot_q8_0(const uint8_t * row, const float * x, int64_t n) {
     float sum = 0;
     for (int64_t block = 0; block < n / 32; ++block) {
@@ -209,6 +241,8 @@ bool make_case(yuuka_dtype dtype, const char * name, int64_t n_in, Case & tc) {
     switch (dtype) {
         case YUUKA_DTYPE_F32: tc.row_bytes = int(n_in * 4); tc.ref = dot_f32; break;
         case YUUKA_DTYPE_F16: tc.row_bytes = int(n_in * 2); tc.ref = dot_f16; break;
+        case YUUKA_DTYPE_Q4_0: tc.row_bytes = int(n_in / 32 * 18); tc.ref = dot_q4_0; break;
+        case YUUKA_DTYPE_Q5_0: tc.row_bytes = int(n_in / 32 * 22); tc.ref = dot_q5_0; break;
         case YUUKA_DTYPE_Q8_0: tc.row_bytes = int(n_in / 32 * 34); tc.ref = dot_q8_0; break;
         case YUUKA_DTYPE_Q4_K: tc.row_bytes = int(n_in / 256 * 144); tc.ref = dot_q4_k; break;
         case YUUKA_DTYPE_Q5_K: tc.row_bytes = int(n_in / 256 * 176); tc.ref = dot_q5_k; break;
@@ -227,6 +261,18 @@ void fill_weights(uint8_t * base, yuuka_dtype dtype, int64_t n_in, std::mt19937 
         }
     } else if (dtype == YUUKA_DTYPE_F16) {
         for (int64_t i = 0; i < n_in; ++i) put_half(base + i * 2, dist(rng) * 0.1f);
+    } else if (dtype == YUUKA_DTYPE_Q4_0) {
+        for (int64_t b = 0; b < n_in / 32; ++b) {
+            uint8_t * blk = base + b * 18;
+            put_half(blk, 0.03125f);
+            for (int i = 0; i < 16; ++i) blk[2 + i] = uint8_t(rng() % 256);
+        }
+    } else if (dtype == YUUKA_DTYPE_Q5_0) {
+        for (int64_t b = 0; b < n_in / 32; ++b) {
+            uint8_t * blk = base + b * 22;
+            put_half(blk, 0.03125f);
+            for (int i = 0; i < 20; ++i) blk[2 + i] = uint8_t(rng() % 256);
+        }
     } else if (dtype == YUUKA_DTYPE_Q8_0) {
         for (int64_t b = 0; b < n_in / 32; ++b) {
             uint8_t * blk = base + b * 34;
@@ -398,6 +444,10 @@ int main() {
     ok = ok && run_case(device, stream, event, YUUKA_DTYPE_F16, "F16", 37, 7, rng);
     ok = ok && run_case(device, stream, event, YUUKA_DTYPE_F16, "F16", 512, 17, rng);
     for (int64_t width : q8_widths) {
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q4_0, "Q4_0", width, 1, rng);
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q4_0, "Q4_0", width, 17, rng);
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q5_0, "Q5_0", width, 1, rng);
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q5_0, "Q5_0", width, 17, rng);
         ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q8_0, "Q8_0", width, 1, rng);
         ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q8_0, "Q8_0", width, 17, rng);
     }
@@ -418,6 +468,10 @@ int main() {
         ok = ok && run_batch_case(device, stream, event,
                                   YUUKA_DTYPE_F16, "F16", 37, 17, batch, rng);
         ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_Q4_0, "Q4_0", 96, 17, batch, rng);
+        ok = ok && run_batch_case(device, stream, event,
+                                  YUUKA_DTYPE_Q5_0, "Q5_0", 96, 17, batch, rng);
+        ok = ok && run_batch_case(device, stream, event,
                                   YUUKA_DTYPE_Q8_0, "Q8_0", 96, 17, batch, rng);
         ok = ok && run_batch_case(device, stream, event,
                                   YUUKA_DTYPE_Q4_K, "Q4_K", 512, 17, batch, rng);
@@ -436,6 +490,7 @@ int main() {
     yuuka_buffer * dummy = nullptr;
     if (ok && check(yuuka_buffer_alloc(device, 4, &dummy), "alloc dummy")) {
         const struct { yuuka_dtype dtype; uint64_t width; } invalid[] = {
+            {YUUKA_DTYPE_Q4_0, 33}, {YUUKA_DTYPE_Q5_0, 33},
             {YUUKA_DTYPE_Q4_K, 100}, {YUUKA_DTYPE_Q5_K, 100},
             {YUUKA_DTYPE_Q6_K, 100}, {YUUKA_DTYPE_Q8_0, 33},
         };
@@ -464,7 +519,7 @@ int main() {
             op.buf[2] = dummy;
             op.n[0] = 256;
             op.n[1] = 1;
-            op.u[0] = 2; /* GGML Q4_0 has no device kernel. */
+            op.u[0] = 100; /* No device kernel or block layout. */
             if (yuuka_plan_add(plan, &op) != YUUKA_ERR_UNSUPPORTED) {
                 std::fprintf(stderr, "unsupported plan dtype was not rejected\n");
                 ok = false;

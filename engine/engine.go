@@ -27,6 +27,9 @@ type GenerateOptions struct {
 	// OnToken receives each decoded text delta. It must not retain the slice
 	// beyond the call.
 	OnToken func(token int32, delta string) error
+	// Speculative enables exact greedy speculative decoding. It requires a
+	// runtime implementing SpeculativeRuntime and a greedy sampler.
+	Speculative *SpeculativeOptions
 }
 
 // GenerateResult reports emitted tokens, text, timings, and the stop reason.
@@ -41,6 +44,22 @@ type GenerateResult struct {
 	TimeToFirst    time.Duration
 	PromptTokensPS float64
 	DecodeTokensPS float64
+	// DraftTokens and AcceptedDraft report speculative verification results.
+	DraftTokens   int
+	AcceptedDraft int
+}
+
+// SpeculativeRuntime is the additional execution surface required for exact
+// greedy speculative decoding. It exposes per-position logits and a rollback
+// point for partially accepted draft blocks.
+type SpeculativeRuntime interface {
+	Runtime
+	// PrefillLogits processes tokens and returns logits for every position.
+	PrefillLogits(tokens []int32) ([][]float32, error)
+	// SnapshotState captures model state and the current absolute position.
+	SnapshotState() ([]byte, int, error)
+	// RestoreState restores a snapshot and rewinds to position.
+	RestoreState(data []byte, position int) error
 }
 
 // Runtime is the execution surface used by the generation loop. The CPU
@@ -70,6 +89,21 @@ func (r *cpuRuntime) Capacity() int  { return r.state.Capacity }
 func (r *cpuRuntime) VocabSize() int { return r.model.Config.VocabSize }
 func (r *cpuRuntime) Close() error   { return nil }
 
+func (r *cpuRuntime) PrefillLogits(tokens []int32) ([][]float32, error) {
+	return r.model.PrefillLogits(tokens, r.state)
+}
+
+func (r *cpuRuntime) SnapshotState() ([]byte, int, error) {
+	return r.state.Snapshot(), r.state.Pos, nil
+}
+
+func (r *cpuRuntime) RestoreState(data []byte, position int) error {
+	if err := r.state.Restore(data); err != nil {
+		return err
+	}
+	return r.state.SetPos(position)
+}
+
 // Engine owns a runtime, tokenizer, and sampler.
 type Engine struct {
 	Runtime   Runtime
@@ -77,10 +111,16 @@ type Engine struct {
 	Sampler   *Sampler
 }
 
-// New creates a CPU reference engine for a model and tokenizer. capacity must
-// not exceed the model context length.
+// New creates a CPU reference engine with an F32 KV cache. capacity must not
+// exceed the model context length.
 func New(model *qwen35.Model, tok *tokenizer.Tokenizer, capacity int, sampler *Sampler) (*Engine, error) {
-	state, err := qwen35.NewState(model.Config, capacity)
+	return NewWithKVFormat(model, tok, capacity, sampler, qwen35.KVF32)
+}
+
+// NewWithKVFormat creates a CPU reference engine with an explicit KV cache
+// format.
+func NewWithKVFormat(model *qwen35.Model, tok *tokenizer.Tokenizer, capacity int, sampler *Sampler, format qwen35.KVFormat) (*Engine, error) {
+	state, err := qwen35.NewStateWithFormat(model.Config, capacity, format)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +153,9 @@ func NewWithRuntime(runtime Runtime, tok *tokenizer.Tokenizer, sampler *Sampler)
 
 // Generate runs one prompt through the model and returns the generated tokens.
 func (e *Engine) Generate(ctx context.Context, prompt []int32, opts GenerateOptions) (*GenerateResult, error) {
+	if opts.Speculative != nil {
+		return e.generateSpeculative(ctx, prompt, opts)
+	}
 	if len(prompt) == 0 {
 		return nil, fmt.Errorf("prompt is empty")
 	}

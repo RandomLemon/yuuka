@@ -133,6 +133,9 @@ func (m *Model) forwardLayer(index int, layer *Layer, st *State) error {
 	}
 	addInPlace(s.x, s.tmp)
 
+	if cfg.IsMoE() {
+		return m.forwardMoEFFN(layer, st)
+	}
 	rmsNorm(s.norm, s.x, layer.FFNNorm, cfg.RMSNormEps)
 	if err := layer.Gate.MatVec(s.gate, s.norm); err != nil {
 		return fmt.Errorf("ffn_gate: %w", err)
@@ -148,6 +151,126 @@ func (m *Model) forwardLayer(index int, layer *Layer, st *State) error {
 	}
 	addInPlace(s.x, s.tmp)
 	return nil
+}
+
+// forwardMoEFFN routes one token to its top-k experts and accumulates the
+// weighted SwiGLU outputs. Expert selection is deterministic: equal router
+// logits choose the lower expert index.
+func (m *Model) forwardMoEFFN(layer *Layer, st *State) error {
+	cfg := m.Config
+	s := &st.scratch
+	rmsNorm(s.norm, s.x, layer.FFNNorm, cfg.RMSNormEps)
+	if err := layer.GateInp.MatVec(s.router, s.norm); err != nil {
+		return fmt.Errorf("ffn_gate_inp: %w", err)
+	}
+	selectExperts(s.router, s.expertIDs, s.expertWeights)
+	clear(s.tmp)
+	for slot, id := range s.expertIDs {
+		if id < 0 || int(id) >= cfg.ExpertCount {
+			return fmt.Errorf("router selected expert %d outside 0..%d", id, cfg.ExpertCount)
+		}
+		gate, err := expertSlice(layer.GateExps, int(id), cfg.ExpertFFNSize)
+		if err != nil {
+			return err
+		}
+		up, err := expertSlice(layer.UpExps, int(id), cfg.ExpertFFNSize)
+		if err != nil {
+			return err
+		}
+		down, err := expertSlice(layer.DownExps, int(id), cfg.HiddenSize)
+		if err != nil {
+			return err
+		}
+		gateOut := s.expertGate[:cfg.ExpertFFNSize]
+		upOut := s.expertUp[:cfg.ExpertFFNSize]
+		if err := gate.MatVec(gateOut, s.norm); err != nil {
+			return fmt.Errorf("expert %d ffn_gate: %w", id, err)
+		}
+		if err := up.MatVec(upOut, s.norm); err != nil {
+			return fmt.Errorf("expert %d ffn_up: %w", id, err)
+		}
+		for i := range gateOut {
+			gateOut[i] = silu(gateOut[i]) * upOut[i]
+		}
+		if err := down.MatVec(s.expertOut, gateOut); err != nil {
+			return fmt.Errorf("expert %d ffn_down: %w", id, err)
+		}
+		weight := s.expertWeights[slot]
+		for i := range s.tmp {
+			s.tmp[i] += weight * s.expertOut[i]
+		}
+	}
+	addInPlace(s.x, s.tmp)
+	return nil
+}
+
+// selectExperts chooses the top-k router logits and normalizes their softmax
+// weights. ids and weights must have length k and k must not exceed len(logits).
+func selectExperts(logits []float32, ids []int32, weights []float32) {
+	k := len(ids)
+	for slot := range k {
+		best := -1
+		for expert := range logits {
+			used := false
+			for prior := range slot {
+				if ids[prior] == int32(expert) {
+					used = true
+					break
+				}
+			}
+			if used {
+				continue
+			}
+			if best < 0 || logits[expert] > logits[best] {
+				best = expert
+			}
+		}
+		if best < 0 {
+			ids[slot] = 0
+			weights[slot] = 0
+			continue
+		}
+		ids[slot] = int32(best)
+	}
+	if k == 0 {
+		return
+	}
+	maxLogit := logits[ids[0]]
+	for _, id := range ids[1:] {
+		if logits[id] > maxLogit {
+			maxLogit = logits[id]
+		}
+	}
+	var total float32
+	for slot, id := range ids {
+		weight := float32(math.Exp(float64(logits[id] - maxLogit)))
+		weights[slot] = weight
+		total += weight
+	}
+	if total > 0 {
+		for slot := range weights {
+			weights[slot] /= total
+		}
+	}
+}
+
+// expertSlice exposes one expert's rows of a packed rank-3 expert matrix.
+func expertSlice(matrix tensor.Matrix, expert, rows int) (tensor.Matrix, error) {
+	rowBytes, err := matrix.DType.RowBytes(matrix.Cols)
+	if err != nil {
+		return tensor.Matrix{}, err
+	}
+	start := int64(expert) * int64(rows) * int64(rowBytes)
+	end := start + int64(rows)*int64(rowBytes)
+	if start < 0 || end > int64(len(matrix.Data)) {
+		return tensor.Matrix{}, fmt.Errorf("expert %d rows are outside the packed matrix", expert)
+	}
+	return tensor.Matrix{
+		Data:  matrix.Data[start:end],
+		Rows:  int64(rows),
+		Cols:  matrix.Cols,
+		DType: matrix.DType,
+	}, nil
 }
 
 func rmsNorm(dst, src, weight []float32, eps float32) {

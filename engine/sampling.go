@@ -53,6 +53,9 @@ func NewSampler(cfg SamplerConfig, vocabSize int) (*Sampler, error) {
 	}, nil
 }
 
+// Greedy reports whether the sampler always selects the highest logit.
+func (s *Sampler) Greedy() bool { return s.cfg.Temperature <= 0 || s.cfg.TopK == 1 }
+
 // Sample selects one token from logits. The input slice is not modified.
 func (s *Sampler) Sample(logits []float32) (int32, error) {
 	if len(logits) == 0 {

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yuuka-ai/yuuka/backend/npu"
 	"github.com/yuuka-ai/yuuka/engine"
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/model/dense"
@@ -38,6 +39,8 @@ func main() {
 		err = runGenerate(os.Args[2:])
 	case "bench":
 		err = runBench(os.Args[2:])
+	case "npu-probe":
+		err = runNPUProbe()
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -56,6 +59,7 @@ commands:
   inspect   print model metadata, configuration, and tensor types
   run       generate text from a prompt
   bench     measure prefill and decode throughput
+  npu-probe report NPU device, driver, and userspace runtime availability
 
 `)
 }
@@ -66,6 +70,32 @@ type loadedModel struct {
 	qwen      *qwen35.Model
 	dense     *dense.Model
 	arch      string
+}
+
+func runNPUProbe() error {
+	caps := npu.Probe()
+	fmt.Printf("state: %s\n", caps.State)
+	fmt.Printf("device: %s\n", caps.DevicePath)
+	fmt.Printf("driver: %t\n", caps.DriverLoaded)
+	fmt.Printf("userspace: %t\n", caps.Userspace)
+	if caps.RuntimePath != "" {
+		fmt.Printf("runtime: %s\n", caps.RuntimePath)
+	}
+	if caps.Reason != "" {
+		fmt.Printf("reason: %s\n", caps.Reason)
+	}
+	device, reason := npu.Request(caps)
+	fmt.Printf("fallback: %s (%s)\n", device, reason)
+	return nil
+}
+
+func requestNPU(enabled bool) {
+	if !enabled {
+		return
+	}
+	caps := npu.Probe()
+	device, reason := npu.Request(caps)
+	fmt.Fprintf(os.Stderr, "npu: %s; execution device %s\n", reason, device)
 }
 
 func load(path string) (*loadedModel, error) {
@@ -90,7 +120,7 @@ func load(path string) (*loadedModel, error) {
 	switch arch {
 	case qwen35.Architecture:
 		loaded.qwen, err = qwen35.Load(r)
-	case dense.Llama, dense.Qwen3:
+	case dense.Llama, dense.Qwen3, dense.Qwen3MoE:
 		loaded.dense, err = dense.Load(r)
 	default:
 		err = fmt.Errorf("model architecture %q is not supported", arch)
@@ -118,9 +148,9 @@ func (l *loadedModel) vocabSize() int {
 	return l.dense.Config.VocabSize
 }
 
-func (l *loadedModel) cpuEngine(capacity int, sampler *engine.Sampler) (*engine.Engine, error) {
+func (l *loadedModel) cpuEngine(capacity int, sampler *engine.Sampler, format qwen35.KVFormat) (*engine.Engine, error) {
 	if l.qwen != nil {
-		return engine.New(l.qwen, l.tokenizer, capacity, sampler)
+		return engine.NewWithKVFormat(l.qwen, l.tokenizer, capacity, sampler, format)
 	}
 	runtime, err := dense.NewRuntime(l.dense, capacity)
 	if err != nil {
@@ -171,6 +201,10 @@ func runInspect(args []string) error {
 			cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim, cfg.HasQKNorm)
 		fmt.Printf("context: %d  rms_eps: %g  rope_base: %g tied_output=%t\n",
 			cfg.Context, cfg.RMSNormEps, cfg.RoPEFreqBase, l.dense.OutputTied())
+		if cfg.IsMoE() {
+			fmt.Printf("moe: experts=%d used=%d expert_ffn=%d\n",
+				cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNSize)
+		}
 	}
 	fmt.Printf("tokenizer: model=%s pre=%s vocab=%d eos=%d\n",
 		l.tokenizerModel(), l.tokenizerPre(), l.tokenizer.VocabSize(), l.tokenizer.EOSToken())
@@ -241,7 +275,17 @@ func runGenerate(args []string) error {
 	topK := fs.Int("top-k", 40, "top-k sampling cutoff")
 	topP := fs.Float64("top-p", 0.95, "nucleus sampling cutoff")
 	seed := fs.Int64("seed", 0, "sampling seed")
+	kvType := fs.String("kv-type", "f32", "KV cache format: f32, f16, or q8_0")
+	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
+	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
+	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
+	npuOpt := fs.Bool("npu", false, "request NPU execution and fall back to the selected backend")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	requestNPU(*npuOpt)
+	kvFormat, err := qwen35.ParseKVFormat(*kvType)
+	if err != nil {
 		return err
 	}
 	l, err := load(*modelPath)
@@ -285,7 +329,7 @@ func runGenerate(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := buildEngine(l, *contextSize, sampler, *backend, *chunkSize)
+	runner, err := buildEngine(l, *contextSize, sampler, *backend, *chunkSize, kvFormat)
 	if err != nil {
 		return err
 	}
@@ -293,8 +337,13 @@ func runGenerate(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	started := time.Now()
+	var spec *engine.SpeculativeOptions
+	if *speculative {
+		spec = &engine.SpeculativeOptions{MaxDraft: *specDraft, MinMatch: *specMin}
+	}
 	result, err := runner.Generate(ctx, ids, engine.GenerateOptions{
-		MaxTokens: *maxTokens,
+		MaxTokens:   *maxTokens,
+		Speculative: spec,
 		OnToken: func(_ int32, delta string) error {
 			_, err := io.WriteString(os.Stdout, delta)
 			return err
@@ -312,6 +361,10 @@ func runGenerate(args []string) error {
 		result.PrefillTime.Seconds(), result.PromptTokensPS,
 		result.TimeToFirst.Seconds(), result.DecodeTime.Seconds(),
 		result.DecodeTokensPS, time.Since(started).Seconds())
+	if *speculative {
+		fmt.Fprintf(os.Stderr, "speculative draft=%d accepted=%d\n",
+			result.DraftTokens, result.AcceptedDraft)
+	}
 	return nil
 }
 
@@ -326,7 +379,17 @@ func runBench(args []string) error {
 	warmup := fs.Int("warmup", 1, "warmup repetitions")
 	reps := fs.Int("reps", 3, "measured repetitions")
 	hash := fs.Bool("hash", false, "print the model SHA-256")
+	kvType := fs.String("kv-type", "f32", "KV cache format: f32, f16, or q8_0")
+	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
+	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
+	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
+	npuOpt := fs.Bool("npu", false, "request NPU execution and fall back to the selected backend")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	requestNPU(*npuOpt)
+	kvFormat, err := qwen35.ParseKVFormat(*kvType)
+	if err != nil {
 		return err
 	}
 	if *promptTokens <= 0 || *decodeTokens <= 0 {
@@ -357,15 +420,20 @@ func runBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := buildEngine(l, capacity, sampler, *backend, *chunkSize)
+	runner, err := buildEngine(l, capacity, sampler, *backend, *chunkSize, kvFormat)
 	if err != nil {
 		return err
 	}
 	defer runner.Close()
+	var spec *engine.SpeculativeOptions
+	if *speculative {
+		spec = &engine.SpeculativeOptions{MaxDraft: *specDraft, MinMatch: *specMin}
+	}
 	run := func() (*engine.GenerateResult, error) {
 		return runner.Generate(context.Background(), ids, engine.GenerateOptions{
-			MaxTokens: *decodeTokens,
-			IgnoreEOS: true,
+			MaxTokens:   *decodeTokens,
+			IgnoreEOS:   true,
+			Speculative: spec,
 		})
 	}
 	for range *warmup {
@@ -386,8 +454,8 @@ func runBench(args []string) error {
 		ttftSamples = append(ttftSamples, result.TimeToFirst.Seconds())
 	}
 	fmt.Printf("model: %s\n", l.reader.Path())
-	fmt.Printf("architecture: %s  quantization: %s  backend: %s\n",
-		l.arch, l.quantizationLabel(), *backend)
+	fmt.Printf("architecture: %s  quantization: %s  backend: %s  kv: %s\n",
+		l.arch, l.quantizationLabel(), *backend, kvFormat)
 	if *hash {
 		sum, err := fileSHA256(l.reader.Path())
 		if err != nil {
@@ -404,6 +472,18 @@ func runBench(args []string) error {
 	fmt.Printf("decode: p50=%.3fs p95=%.3fs (%.2f tok/s p50)\n",
 		percentile(decodeSamples, 0.50), percentile(decodeSamples, 0.95),
 		float64(*decodeTokens-1)/percentile(decodeSamples, 0.50))
+	if *speculative {
+		result, err := run()
+		if err != nil {
+			return err
+		}
+		acceptance := 0.0
+		if result.DraftTokens > 0 {
+			acceptance = float64(result.AcceptedDraft) / float64(result.DraftTokens)
+		}
+		fmt.Printf("speculative: draft=%d accepted=%d acceptance=%.3f\n",
+			result.DraftTokens, result.AcceptedDraft, acceptance)
+	}
 	return nil
 }
 
@@ -423,12 +503,12 @@ func percentile(values []float64, p float64) float64 {
 	return sorted[index]
 }
 
-func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string, chunkSize int) (*engine.Engine, error) {
+func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string, chunkSize int, format qwen35.KVFormat) (*engine.Engine, error) {
 	switch backend {
 	case "cpu":
-		return l.cpuEngine(capacity, sampler)
+		return l.cpuEngine(capacity, sampler, format)
 	case "hip":
-		runtime, err := newHIPRuntime(l, capacity)
+		runtime, err := newHIPRuntime(l, capacity, format)
 		if err != nil {
 			return nil, err
 		}

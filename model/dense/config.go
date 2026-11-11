@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	Llama = "llama"
-	Qwen3 = "qwen3"
+	Llama    = "llama"
+	Qwen3    = "qwen3"
+	Qwen3MoE = "qwen3moe"
 )
 
 // Config is the validated runtime configuration for one dense model.
@@ -29,7 +30,15 @@ type Config struct {
 	RMSNormEps   float32
 	VocabSize    int
 	HasQKNorm    bool
+	// MoE fields are set only for Qwen3MoE. ExpertFFNSize is the width of one
+	// expert's SwiGLU hidden layer; ExpertUsedCount experts run per token.
+	ExpertCount     int
+	ExpertUsedCount int
+	ExpertFFNSize   int
 }
+
+// IsMoE reports whether the model uses sparse expert feed-forward layers.
+func (c *Config) IsMoE() bool { return c.ExpertCount > 0 }
 
 // LoadConfig reads and validates dense Transformer hyperparameters.
 func LoadConfig(r *gguf.Reader) (*Config, error) {
@@ -37,8 +46,9 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if arch != Llama && arch != Qwen3 {
-		return nil, fmt.Errorf("model architecture %q is not %q or %q", arch, Llama, Qwen3)
+	if arch != Llama && arch != Qwen3 && arch != Qwen3MoE {
+		return nil, fmt.Errorf("model architecture %q is not %q, %q, or %q",
+			arch, Llama, Qwen3, Qwen3MoE)
 	}
 	cfg := &Config{Architecture: arch}
 	intKey := func(key string) (int, error) {
@@ -68,6 +78,42 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 	}
 	if cfg.FFNSize, err = intKey(arch + ".feed_forward_length"); err != nil {
 		return nil, err
+	}
+	if arch == Qwen3MoE {
+		if cfg.ExpertCount, err = intKey(arch + ".expert_count"); err != nil {
+			return nil, err
+		}
+		if cfg.ExpertUsedCount, err = intKey(arch + ".expert_used_count"); err != nil {
+			return nil, err
+		}
+		value, ok := r.MetadataValue(arch + ".expert_feed_forward_length")
+		if !ok {
+			return nil, fmt.Errorf("missing required metadata %s.expert_feed_forward_length", arch)
+		}
+		if value.Type == gguf.MetaArray {
+			widths, err := value.AsInts()
+			if err != nil {
+				return nil, fmt.Errorf("%s.expert_feed_forward_length: %w", arch, err)
+			}
+			if len(widths) == 0 {
+				return nil, fmt.Errorf("%s.expert_feed_forward_length is empty", arch)
+			}
+			cfg.ExpertFFNSize = int(widths[0])
+			for i, width := range widths {
+				if width != widths[0] {
+					return nil, fmt.Errorf("%s.expert_feed_forward_length varies at layer %d", arch, i)
+				}
+			}
+		} else {
+			raw, err := value.AsInt()
+			if err != nil {
+				return nil, fmt.Errorf("%s.expert_feed_forward_length: %w", arch, err)
+			}
+			cfg.ExpertFFNSize = int(raw)
+		}
+		if cfg.ExpertFFNSize <= 0 || cfg.ExpertFFNSize > 1<<31 {
+			return nil, fmt.Errorf("invalid expert feed-forward length %d", cfg.ExpertFFNSize)
+		}
 	}
 	if cfg.HeadCount, err = intKey(arch + ".attention.head_count"); err != nil {
 		return nil, err
@@ -108,7 +154,7 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 	} else if cfg.VocabSize, err = intKey(arch + ".vocab_size"); err != nil {
 		return nil, fmt.Errorf("vocabulary size is unavailable")
 	}
-	cfg.HasQKNorm = arch == Qwen3
+	cfg.HasQKNorm = arch == Qwen3 || arch == Qwen3MoE
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -128,6 +174,15 @@ func (c *Config) validate() error {
 	}
 	if c.Context <= 0 || c.VocabSize <= 0 {
 		return fmt.Errorf("invalid context or vocabulary size")
+	}
+	if c.IsMoE() {
+		if c.ExpertUsedCount <= 0 || c.ExpertUsedCount > c.ExpertCount {
+			return fmt.Errorf("expert used count %d is outside 1..%d",
+				c.ExpertUsedCount, c.ExpertCount)
+		}
+		if c.ExpertFFNSize <= 0 {
+			return fmt.Errorf("invalid expert feed-forward size %d", c.ExpertFFNSize)
+		}
 	}
 	return nil
 }

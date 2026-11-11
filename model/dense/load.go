@@ -22,6 +22,11 @@ type Layer struct {
 	Gate     tensor.Matrix
 	Up       tensor.Matrix
 	Down     tensor.Matrix
+	// MoE fields are populated instead of Gate/Up/Down when Config.IsMoE.
+	GateInp  tensor.Matrix
+	GateExps tensor.Matrix
+	UpExps   tensor.Matrix
+	DownExps tensor.Matrix
 }
 
 // Model owns tensor descriptors that borrow the GGUF reader's mapping. The
@@ -99,14 +104,33 @@ func Load(r *gguf.Reader) (*Model, error) {
 				return nil, err
 			}
 		}
-		if layer.Gate, err = loadMatrix(r, prefix+"ffn_gate.weight", cfg.FFNSize, cfg.HiddenSize); err != nil {
-			return nil, err
-		}
-		if layer.Up, err = loadMatrix(r, prefix+"ffn_up.weight", cfg.FFNSize, cfg.HiddenSize); err != nil {
-			return nil, err
-		}
-		if layer.Down, err = loadMatrix(r, prefix+"ffn_down.weight", cfg.HiddenSize, cfg.FFNSize); err != nil {
-			return nil, err
+		if cfg.IsMoE() {
+			if layer.GateInp, err = loadMatrix(r, prefix+"ffn_gate_inp.weight",
+				cfg.ExpertCount, cfg.HiddenSize); err != nil {
+				return nil, err
+			}
+			if layer.GateExps, err = loadExperts(r, prefix+"ffn_gate_exps.weight",
+				cfg.ExpertFFNSize, cfg.HiddenSize, cfg.ExpertCount); err != nil {
+				return nil, err
+			}
+			if layer.UpExps, err = loadExperts(r, prefix+"ffn_up_exps.weight",
+				cfg.ExpertFFNSize, cfg.HiddenSize, cfg.ExpertCount); err != nil {
+				return nil, err
+			}
+			if layer.DownExps, err = loadExperts(r, prefix+"ffn_down_exps.weight",
+				cfg.HiddenSize, cfg.ExpertFFNSize, cfg.ExpertCount); err != nil {
+				return nil, err
+			}
+		} else {
+			if layer.Gate, err = loadMatrix(r, prefix+"ffn_gate.weight", cfg.FFNSize, cfg.HiddenSize); err != nil {
+				return nil, err
+			}
+			if layer.Up, err = loadMatrix(r, prefix+"ffn_up.weight", cfg.FFNSize, cfg.HiddenSize); err != nil {
+				return nil, err
+			}
+			if layer.Down, err = loadMatrix(r, prefix+"ffn_down.weight", cfg.HiddenSize, cfg.FFNSize); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return m, nil
@@ -129,6 +153,41 @@ func loadMatrix(r *gguf.Reader, name string, rows, cols int) (tensor.Matrix, err
 	}
 	if !info.DType.Supported() {
 		return tensor.Matrix{}, fmt.Errorf("tensor %q uses unsupported dtype %s", name, info.DType)
+	}
+	matrix, err := info.Matrix()
+	if err != nil {
+		return tensor.Matrix{}, err
+	}
+	if err := matrix.Validate(); err != nil {
+		return tensor.Matrix{}, fmt.Errorf("tensor %q: %w", name, err)
+	}
+	return matrix, nil
+}
+
+// loadExperts validates a rank-3 expert tensor and exposes it as a packed
+// matrix with one expert's rows per contiguous expert slice.
+func loadExperts(r *gguf.Reader, name string, rows, cols, experts int) (tensor.Matrix, error) {
+	info, ok := r.Tensor(name)
+	if !ok {
+		return tensor.Matrix{}, fmt.Errorf("missing required tensor %q", name)
+	}
+	if len(info.Dimensions) != 3 ||
+		info.Dimensions[0] != uint64(cols) ||
+		info.Dimensions[1] != uint64(rows) ||
+		info.Dimensions[2] != uint64(experts) {
+		return tensor.Matrix{}, fmt.Errorf("tensor %q has shape %s, want [%d,%d,%d]",
+			name, info.ShapeString(), cols, rows, experts)
+	}
+	if !info.DType.Supported() {
+		return tensor.Matrix{}, fmt.Errorf("tensor %q uses unsupported dtype %s", name, info.DType)
+	}
+	block, err := info.DType.BlockLayout()
+	if err != nil {
+		return tensor.Matrix{}, fmt.Errorf("tensor %q dtype %s: %w", name, info.DType, err)
+	}
+	if block.Elements > 1 && cols%int(block.Elements) != 0 {
+		return tensor.Matrix{}, fmt.Errorf("tensor %q column count %d does not match dtype %s",
+			name, cols, info.DType)
 	}
 	matrix, err := info.Matrix()
 	if err != nil {

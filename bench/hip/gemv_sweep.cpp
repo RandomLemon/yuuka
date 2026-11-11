@@ -49,6 +49,8 @@ bool check(yuuka_status status, const char * what) {
 uint64_t row_bytes(uint32_t dtype, int64_t n_in) {
     switch (dtype) {
         case YUUKA_DTYPE_F16: return uint64_t(n_in) * 2;
+        case YUUKA_DTYPE_Q4_0: return uint64_t(n_in / 32) * 18;
+        case YUUKA_DTYPE_Q5_0: return uint64_t(n_in / 32) * 22;
         case YUUKA_DTYPE_Q8_0: return uint64_t(n_in / 32) * 34;
         case YUUKA_DTYPE_Q4_K: return uint64_t(n_in / 256) * 144;
         case YUUKA_DTYPE_Q5_K: return uint64_t(n_in / 256) * 176;
@@ -67,7 +69,19 @@ void fill_weights(std::vector<uint8_t> & weights, uint32_t dtype, int64_t n_in,
                 put_half(base + i * 2, float(int(rng() % 200) - 100) / 1000.0f);
             }
         }
-        if (dtype == YUUKA_DTYPE_Q8_0) {
+        if (dtype == YUUKA_DTYPE_Q4_0) {
+            for (int64_t b = 0; b < n_in / 32; ++b) {
+                uint8_t * blk = base + b * 18;
+                put_half(blk, 0.01f);
+                for (int i = 0; i < 16; ++i) blk[2 + i] = uint8_t(rng() % 256);
+            }
+        } else if (dtype == YUUKA_DTYPE_Q5_0) {
+            for (int64_t b = 0; b < n_in / 32; ++b) {
+                uint8_t * blk = base + b * 22;
+                put_half(blk, 0.01f);
+                for (int i = 0; i < 20; ++i) blk[2 + i] = uint8_t(rng() % 256);
+            }
+        } else if (dtype == YUUKA_DTYPE_Q8_0) {
             for (int64_t b = 0; b < n_in / 32; ++b) {
                 uint8_t * blk = base + b * 34;
                 put_half(blk, 0.01f);
@@ -159,6 +173,7 @@ int main() {
     const int64_t n_out = 2560;
     const uint32_t dtypes[] = {YUUKA_DTYPE_Q4_K, YUUKA_DTYPE_Q5_K,
                                YUUKA_DTYPE_Q6_K, YUUKA_DTYPE_Q8_0,
+                               YUUKA_DTYPE_Q4_0, YUUKA_DTYPE_Q5_0,
                                YUUKA_DTYPE_F16};
     const int batches[] = {1, 2, 4, 8, 16};
     const int reps = 10;
@@ -204,7 +219,9 @@ int main() {
                         dtype == YUUKA_DTYPE_Q4_K ? "Q4_K" :
                         dtype == YUUKA_DTYPE_Q5_K ? "Q5_K" :
                         dtype == YUUKA_DTYPE_Q6_K ? "Q6_K" :
-                        dtype == YUUKA_DTYPE_Q8_0 ? "Q8_0" : "F16",
+                        dtype == YUUKA_DTYPE_Q8_0 ? "Q8_0" :
+                        dtype == YUUKA_DTYPE_Q4_0 ? "Q4_0" :
+                        dtype == YUUKA_DTYPE_Q5_0 ? "Q5_0" : "F16",
                         static_cast<long long>(n_in), static_cast<long long>(n_out),
                         batch, per_row_ms, batched_ms,
                         batched_ms > 0 ? per_row_ms / batched_ms : 0.0,

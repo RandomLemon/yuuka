@@ -186,8 +186,9 @@ Requirements and current behavior:
 
 ### 7.1 Configuration
 
-- FP32 keys and values. FP16 KV and quantized KV remain extension points because
-  the accepted numerical baselines use FP32.
+- F32 keys and values by default. `--kv-type f16` and `--kv-type q8_0` select
+  opt-in F16 and Q8_0 pools. The prefix-cache model key includes the format, and
+  the F32 path remains the numerical baseline.
 - Configurable block size; the server and benchmark default to 16 tokens.
 - One allocator per model with a fixed block count derived from context and
   concurrency, or set explicitly with `--kv-blocks`.
@@ -227,8 +228,8 @@ A prefix-cache entry represents one complete prompt processed by an earlier
 request.
 
 - **Key:** SHA-256 over a cache version tag, the model identity supplied by the
-  server (by default the SHA-256 of the GGUF file), the block size, the token
-  count, and every token. Lookup additionally compares the full token slice, so
+  server (by default the SHA-256 of the GGUF file plus the KV format), the block
+  size, the token count, and every token. Lookup additionally compares the full token slice, so
   a hash collision cannot produce incorrect reuse.
 - **Payload:** block references covering the prompt, the recurrent
   convolution/matrix state snapshot at the prompt boundary, and the logits for
@@ -280,8 +281,12 @@ shapes where host launch overhead is measured to matter.
 
 ### 9.1 CLI
 
-The CLI supports loading a GGUF model, interactive generation, inspection, and
-benchmark modes. Serving uses `yuuka-server`.
+The CLI supports loading a GGUF model, interactive generation, inspection,
+benchmark, and NPU-probe modes. `yuuka run` and `yuuka bench` accept
+`--kv-type f32|f16|q8_0`, `--speculative`, `--spec-max-draft`, and
+`--spec-min-match`. `--npu` records the NPU capability result and falls back to
+the selected backend. Serving uses `yuuka-server`, which also accepts
+`--kv-type` and `--npu`.
 
 ### 9.2 HTTP
 

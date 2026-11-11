@@ -112,6 +112,7 @@ hard-coded from another GPU.
 | `gemv_q4_k` | Single-token decode | Packed reads, fused dequantization, Wave reduction |
 | `gemv_q6_k` | Decode | High-precision K-quant layout |
 | `gemv_q8_0` | Decode / baseline | Simple, stable high-bandwidth quantization |
+| `gemv_q4_0` / `gemv_q5_0` | Decode / broader GGUF coverage | Nibble and high-bit unpack, batch reuse |
 | `gemm_fp16_wmma` | Prefill baseline | Tiling, WMMA, LDS, pipelining |
 | `gemm_q4_k_wmma` | Quantized prefill | Tiled dequantization plus WMMA |
 | `gemm_q6_k_wmma` | Quantized prefill | Scale handling, tile reuse |
@@ -119,6 +120,7 @@ hard-coded from another GPU.
 | `paged_attention` | Decode | Block table, shared KV heads, long-context split |
 | `rmsnorm` / `rope` | All stages | Minimize memory traffic and launches |
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
+| `moe_route` / `moe_expert_*` | Sparse MoE | Top-k routing, per-expert assignment bins, packed expert reads |
 | `sampling` | Output | GPU sampling or a low-cost host path |
 
 ## 5. Decode: quantized GEMV
@@ -164,7 +166,15 @@ The main design axes to benchmark:
 - batch sizes 1, 2, 4, 8, and 16 to find the GEMV/GEMM crossover;
 - accumulation precision and deterministic reduction order.
 
-### 5.4 Precision
+### 5.4 Q4_0 and Q5_0
+
+Q4_0 and Q5_0 use 32-value blocks. Q4_0 stores one FP16 scale and sixteen packed
+nibble bytes; values are `d * (q - 8)`. Q5_0 adds a four-byte high-bit plane;
+values are `d * (q - 16)`. Both are supported by the CPU reference, single and
+batched HIP GEMV, embedding, and WMMA prefill. Q4_1/Q5_1 and the IQ families are
+still capability failures.
+
+### 5.5 Precision
 
 For FP16/BF16 inputs, accumulate in FP32 unless a measured, documented
 tradeoff justifies otherwise. Quantization scales and mins must be applied
@@ -295,10 +305,34 @@ tiling and online softmax as the contiguous prefill kernel, but resolves each
 staged K row and each V read through the block table. `kv_write_paged` and
 `kv_write_batch_paged` map written positions through the same table.
 
+### 7.3 KV cache formats
+
+The paged KV family accepts an F32, F16, or Q8_0 pool selected by the plan. The
+same block table and pool geometry are used for every format; only the row byte
+size changes:
+
+| Format | Row layout |
+| --- | --- |
+| F32 | `kv_dim` FP32 values |
+| F16 | `kv_dim` FP16 values |
+| Q8_0 | `ceil(kv_dim/32)` groups of one FP16 scale plus 32 int8 values |
+
+`kv_write_paged` quantizes per 32-value group for Q8_0; attention kernels decode
+K and V through the same row format. Prefix-cache keys include the format so
+cached blocks are never reused across formats.
+
+### 7.4 Dense attention variant
+
+The original paged attention kernels assume the Qwen3.5 query layout with a
+sigmoid output gate in the second head-sized half. Qwen3 MoE uses a dense query
+row without that gate. The plan carries a dense flag in `u[3]`; the dense kernel
+skips the gate and uses `heads * head_dim` query stride. The Qwen3.5 path keeps
+the gated variant.
+
 Current limits:
 
-- FP32 KV only; the pool is `ceil(capacity / block_size) * block_size` rows per
-  full-attention layer.
+- Q8_0 KV is supported but not faster than F32 at short context; its benefit is
+  cache memory.
 - One workgroup per head; split-KV and WMMA attention are not implemented.
 - No mixed prefill/decode batch. Each step belongs to one request plan.
 - Block-table entries are immutable for a request; all blocks are allocated at
@@ -316,6 +350,33 @@ The logical KV view is block-based and independent of physical placement.
 Kernel-specific block layouts are backend-internal.
 
 ## 8. Fusion
+
+### 8.1 MoE expert pipeline
+
+`moe_route` selects top-k experts, normalizes the selected softmax weights, and
+bins `(row, slot)` assignments into one bucket per expert using atomics. The
+grouped kernels then index blocks by `(expert, output row)` and walk that
+expert's assignment list:
+
+- `moe_gate_up_grouped` reads one packed gate and up row per block and computes
+  all assigned token rows, so the packed weight row is reused across rows.
+- SwiGLU uses the existing fused `silu_mul` kernel.
+- `moe_down_grouped` performs the expert down projection over the same buckets.
+- `moe_reduce_add` applies routing weights and accumulates into the residual
+  stream.
+
+The routing and assignment buffers are sized `experts * rows * used`, which is
+safe because one row contributes exactly `used` assignments. A malformed plan
+that would exceed a bucket is rejected at plan construction.
+
+### 8.2 Speculative verification
+
+Speculative decoding reuses the chunked prefill graph with a tail that computes
+logits for every candidate row instead of only the last row. Verification reads
+those rows, accepts the matching greedy prefix, and on a mismatch restores the
+session snapshot and replays the accepted prefix plus the correction token.
+This is exact for greedy sampling and does not change the F32 KV or decode
+kernels.
 
 Implemented fusions, chosen because they remove launches or intermediate
 traffic without reducing occupancy:
@@ -416,9 +477,10 @@ A kernel is not complete until:
       boundary cases.
 - [x] Its numerical tolerance is documented and tested.
 - [x] It has a benchmark across the relevant shape classes.
-- [x] Its VGPR, LDS, scratch, and occupancy figures are recorded
-      (`scripts/kernel_resources.sh`, results in [benchmarks.md](benchmarks.md)).
-- [ ] Its VGPR, LDS, and occupancy characteristics are recorded.
-- [ ] The planner can select it and fall back from it.
-- [ ] It is integrated into an end-to-end model run.
-- [ ] It does not regress a previously accepted shape class.
+- [x] Its VGPR, LDS, scratch, and occupancy figures are recorded for the Phase
+      0-3 kernel families (`scripts/kernel_resources.sh`, results in
+      [benchmarks.md](benchmarks.md)).
+- [ ] New Phase 5 kernels have recorded VGPR, LDS, and occupancy figures.
+- [x] The planner can select it and fall back from it.
+- [x] It is integrated into an end-to-end model run.
+- [x] It does not regress a previously accepted shape class.

@@ -155,15 +155,15 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	if err := plan.AddRoPE(m.act.k, cfg.KVHeadCount, int(headDim), int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase)); err != nil {
 		return err
 	}
-	if err := plan.AddKVWritePagedAt(m.act.k, m.act.v, m.poolK[layerIndex], m.poolV[layerIndex],
-		s.tableBuf, kvDim, int64(s.capacity), m.blockSize); err != nil {
+	if err := plan.AddKVWritePagedFormatAt(m.act.k, m.act.v, m.poolK[layerIndex], m.poolV[layerIndex],
+		s.tableBuf, kvDim, int64(s.capacity), m.blockSize, m.kvType); err != nil {
 		return err
 	}
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	if err := plan.AddAttentionPagedAt(m.act.q, m.poolK[layerIndex], m.poolV[layerIndex],
+	if err := plan.AddAttentionPagedFormatAt(m.act.q, m.poolK[layerIndex], m.poolV[layerIndex],
 		m.act.attn, m.act.scores, s.tableBuf,
 		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim),
-		m.capacity, s.capacity, m.blockSize, scale); err != nil {
+		m.capacity, s.capacity, m.blockSize, scale, m.kvType); err != nil {
 		return err
 	}
 	if err := plan.AddGemv(o.buf, m.act.attn, m.act.tmp, oDim, hidden, o.dtype); err != nil {
@@ -297,7 +297,7 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 }
 
 // buildPrefillPlan constructs the chunked prompt graph for one session.
-func (m *Model) buildPrefillPlan(s *Session, rows int) (*hip.Plan, error) {
+func (m *Model) buildPrefillPlan(s *Session, rows int, allLogits bool) (*hip.Plan, error) {
 	plan, err := m.device.NewPlan()
 	if err != nil {
 		return nil, err
@@ -345,17 +345,36 @@ func (m *Model) buildPrefillPlan(s *Session, rows int) (*hip.Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	lastOff := uint64(rows-1) * uint64(cfg.HiddenSize) * 4
-	if err := plan.AddRMSNormAt(p.x, lastOff, outputNorm.buf, p.norm, 0,
-		int64(cfg.HiddenSize), cfg.RMSNormEps); err != nil {
-		return nil, err
-	}
 	outputName := "output.weight"
 	if _, ok := m.weights[outputName]; !ok {
 		outputName = "token_embd.weight"
 	}
 	output, err := m.weight(outputName)
 	if err != nil {
+		return nil, err
+	}
+	if allLogits {
+		if rows > maxSpecDraft {
+			return nil, fmt.Errorf("gpu: speculative logits rows %d exceed %d", rows, maxSpecDraft)
+		}
+		if err := plan.AddRMSNormBatchAt(p.x, 0, outputNorm.buf, p.norm, 0,
+			rows64, int64(cfg.HiddenSize), int64(cfg.HiddenSize), int64(cfg.HiddenSize),
+			cfg.RMSNormEps); err != nil {
+			return nil, err
+		}
+		for row := range rows {
+			if err := plan.AddGemvAt(output.buf, 0, p.norm,
+				uint64(row)*uint64(cfg.HiddenSize)*4, m.specLogits,
+				uint64(row)*uint64(cfg.VocabSize)*4, int64(cfg.HiddenSize),
+				int64(cfg.VocabSize), output.dtype); err != nil {
+				return nil, err
+			}
+		}
+		return plan, nil
+	}
+	lastOff := uint64(rows-1) * uint64(cfg.HiddenSize) * 4
+	if err := plan.AddRMSNormAt(p.x, lastOff, outputNorm.buf, p.norm, 0,
+		int64(cfg.HiddenSize), cfg.RMSNormEps); err != nil {
 		return nil, err
 	}
 	if err := plan.AddGemv(output.buf, p.norm, m.act.logits,
@@ -427,15 +446,15 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 		int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase), int64(cfg.KVHeadCount*cfg.HeadDim)); err != nil {
 		return err
 	}
-	if err := plan.AddKVWriteBatchPagedAt(p.k, 0, p.v, 0, m.poolK[layerIndex],
-		m.poolV[layerIndex], s.tableBuf, kvDim, rows, int64(s.capacity), m.blockSize); err != nil {
+	if err := plan.AddKVWriteBatchPagedFormatAt(p.k, 0, p.v, 0, m.poolK[layerIndex],
+		m.poolV[layerIndex], s.tableBuf, kvDim, rows, int64(s.capacity), m.blockSize, m.kvType); err != nil {
 		return err
 	}
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	if err := plan.AddAttentionPrefillPagedAt(p.q, 0, m.poolK[layerIndex],
+	if err := plan.AddAttentionPrefillPagedFormatAt(p.q, 0, m.poolK[layerIndex],
 		m.poolV[layerIndex], p.attn, 0, s.tableBuf,
 		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
-		s.capacity, m.blockSize, scale); err != nil {
+		s.capacity, m.blockSize, scale, m.kvType); err != nil {
 		return err
 	}
 	if err := m.prefillMatmul(plan, o, p.attn, 0, p.tmp, 0, oDim, hidden, rows); err != nil {

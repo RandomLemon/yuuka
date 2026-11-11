@@ -35,6 +35,7 @@ if(YUUKA_ENABLE_HIP)
         kernels/hip/gemm/gemm.hip
         kernels/hip/gemm/wmma_gemm.hip
         kernels/hip/gemm/gemm_blas.hip
+        kernels/hip/moe/moe.hip
         kernels/hip/ops/elementwise.hip
         kernels/hip/ops/norm.hip
         kernels/hip/ops/rope.hip
@@ -62,6 +63,9 @@ if(YUUKA_ENABLE_HIP)
 
         add_executable(yuuka_prefill_sweep bench/hip/prefill_sweep.cpp)
         target_link_libraries(yuuka_prefill_sweep PRIVATE yuuka_hip)
+
+        add_executable(yuuka_moe_sweep bench/hip/moe_sweep.cpp)
+        target_link_libraries(yuuka_moe_sweep PRIVATE yuuka_hip)
     endif()
 
     if(YUUKA_BUILD_TESTS)
@@ -95,5 +99,15 @@ if(YUUKA_ENABLE_HIP)
         target_link_libraries(yuuka_hip_paged_test PRIVATE yuuka_hip)
         add_test(NAME hip_paged_graph_correctness COMMAND yuuka_hip_paged_test)
         set_tests_properties(hip_paged_graph_correctness PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(yuuka_hip_embedding_test tests/hip/embedding_test.cpp)
+        target_link_libraries(yuuka_hip_embedding_test PRIVATE yuuka_hip)
+        add_test(NAME hip_embedding_correctness COMMAND yuuka_hip_embedding_test)
+        set_tests_properties(hip_embedding_correctness PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(yuuka_hip_moe_test tests/hip/moe_test.cpp)
+        target_link_libraries(yuuka_hip_moe_test PRIVATE yuuka_hip)
+        add_test(NAME hip_moe_correctness COMMAND yuuka_hip_moe_test)
+        set_tests_properties(hip_moe_correctness PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()

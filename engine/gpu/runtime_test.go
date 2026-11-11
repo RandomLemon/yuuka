@@ -3,14 +3,17 @@
 package gpu
 
 import (
+	"context"
 	"math"
 	"os"
 	"reflect"
 	"sort"
 	"testing"
 
+	"github.com/yuuka-ai/yuuka/engine"
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
+	"github.com/yuuka-ai/yuuka/tensor"
 	"github.com/yuuka-ai/yuuka/tokenizer"
 )
 
@@ -277,4 +280,97 @@ func TestGPUProfileDecode(t *testing.T) {
 		t.Logf("%-14s %8.3f ms  %5.1f%%", name, float64(item.ns)/1e6,
 			100*float64(item.ns)/float64(total))
 	}
+}
+
+func TestGPURealModelKVFormats(t *testing.T) {
+	reader, _, model, prompt := goldenPrompt(t)
+	run := func(kvType tensor.DType) ([]int32, []float32) {
+		rt, err := NewWithKVType(reader, model, 64, kvType)
+		if err != nil {
+			t.Skipf("HIP runtime unavailable: %v", err)
+		}
+		defer rt.Close()
+		logits, err := rt.Forward(prompt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens := make([]int32, 0, 6)
+		for i := 0; i < 6; i++ {
+			token := argmax(logits)
+			tokens = append(tokens, token)
+			if i+1 < 6 {
+				logits, err = rt.Step(token)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return tokens, append([]float32(nil), logits...)
+	}
+	baseTokens, baseLogits := run(tensor.F32)
+	for _, tc := range []struct {
+		dtype tensor.DType
+		tol   float64
+	}{
+		{tensor.F16, 0.05},
+		{tensor.Q8_0, 0.5},
+	} {
+		tokens, logits := run(tc.dtype)
+		if !reflect.DeepEqual(tokens, baseTokens) {
+			t.Fatalf("%s tokens %v, want %v", tc.dtype, tokens, baseTokens)
+		}
+		maxDiff := 0.0
+		for i := range baseLogits {
+			diff := math.Abs(float64(logits[i] - baseLogits[i]))
+			if diff > maxDiff {
+				maxDiff = diff
+			}
+		}
+		if maxDiff > tc.tol {
+			t.Fatalf("%s logits differ from F32 by %.6g, tolerance %.6g",
+				tc.dtype, maxDiff, tc.tol)
+		}
+		t.Logf("%s max logit diff %.6g", tc.dtype, maxDiff)
+	}
+}
+
+func TestGPURealModelSpeculativeMatchesGreedy(t *testing.T) {
+	reader, tok, model, _ := goldenPrompt(t)
+	rt, err := New(reader, model, 128)
+	if err != nil {
+		t.Skipf("HIP runtime unavailable: %v", err)
+	}
+	defer rt.Close()
+	runner, err := engine.NewWithRuntime(rt, tok, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := tok.Encode("The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := runner.Generate(context.Background(), prompt, engine.GenerateOptions{
+		MaxTokens: 24,
+		IgnoreEOS: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	speculative, err := runner.Generate(context.Background(), prompt, engine.GenerateOptions{
+		MaxTokens: 24,
+		IgnoreEOS: true,
+		Speculative: &engine.SpeculativeOptions{
+			MaxDraft: 4,
+			MinMatch: 2,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(speculative.Tokens, baseline.Tokens) {
+		t.Fatalf("speculative tokens %v, want %v", speculative.Tokens, baseline.Tokens)
+	}
+	t.Logf("baseline decode %.3fs, speculative decode %.3fs, draft=%d accepted=%d",
+		baseline.DecodeTime.Seconds(), speculative.DecodeTime.Seconds(),
+		speculative.DraftTokens, speculative.AcceptedDraft)
 }

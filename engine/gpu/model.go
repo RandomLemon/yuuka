@@ -66,6 +66,9 @@ type Options struct {
 	PrefillChunk  int
 	EnableGraph   bool
 	GraphMinSteps int
+	// KVType selects the full-attention KV pool storage. Zero is F32. F16 and
+	// Q8_0 are opt-in Phase 5 formats.
+	KVType tensor.DType
 }
 
 const maxPrefillChunk = 4096
@@ -90,10 +93,14 @@ type Model struct {
 	blockSize int
 	blocks    int
 	capacity  int
+	kvType    tensor.DType
+	kvRow     uint64
 
 	prefillRows int
 	prefillGen  int64
 	prefillAll  []*hip.Buffer
+
+	specLogits *hip.Buffer
 
 	stepMu sync.Mutex
 	all    []*hip.Buffer
@@ -109,6 +116,10 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		return nil, fmt.Errorf("gpu: KV pool needs positive blocks and block size")
 	}
 	if err := validateModelSupport(model); err != nil {
+		return nil, err
+	}
+	kvRow, err := hip.KVRowBytes(opts.KVType, int64(model.Config.KVHeadCount*model.Config.HeadDim))
+	if err != nil {
 		return nil, err
 	}
 	alloc, err := memory.NewAllocator(opts.Blocks, opts.BlockSize)
@@ -140,6 +151,8 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		blockSize: opts.BlockSize,
 		blocks:    opts.Blocks,
 		capacity:  opts.Blocks * opts.BlockSize,
+		kvType:    opts.KVType,
+		kvRow:     kvRow,
 		poolK:     make([]*hip.Buffer, model.Config.BlockCount),
 		poolV:     make([]*hip.Buffer, model.Config.BlockCount),
 	}
@@ -164,7 +177,10 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 	return m, nil
 }
 
-const defaultPrefillChunk = 512
+const (
+	defaultPrefillChunk = 512
+	maxSpecDraft        = 16
+)
 
 func (m *Model) setup(reader *gguf.Reader, model *qwen35.Model) error {
 	for _, info := range reader.Tensors() {
@@ -187,6 +203,11 @@ func (m *Model) setup(reader *gguf.Reader, model *qwen35.Model) error {
 	if err := m.allocPools(); err != nil {
 		return err
 	}
+	spec, err := m.allocDevice(uint64(maxSpecDraft) * uint64(m.config.VocabSize) * 4)
+	if err != nil {
+		return fmt.Errorf("allocate speculative logits: %w", err)
+	}
+	m.specLogits = spec
 	return m.stream.Synchronize()
 }
 
@@ -254,8 +275,7 @@ func (m *Model) allocActivations() error {
 // pools use allocator block IDs directly.
 func (m *Model) allocPools() error {
 	cfg := m.config
-	kvDim := uint64(cfg.KVHeadCount * cfg.HeadDim)
-	bytes := uint64(m.blocks) * uint64(m.blockSize) * kvDim * 4
+	bytes := uint64(m.blocks) * uint64(m.blockSize) * m.kvRow
 	for i := range cfg.BlockCount {
 		if cfg.IsRecurrent(i) {
 			continue
@@ -371,8 +391,7 @@ func (m *Model) CopyBlock(dst, src int) error {
 	}
 	m.stepMu.Lock()
 	defer m.stepMu.Unlock()
-	kvDim := m.config.KVHeadCount * m.config.HeadDim
-	rowBytes := uint64(m.blockSize * kvDim * 4)
+	rowBytes := uint64(m.blockSize) * m.kvRow
 	dstOff := uint64(dst) * rowBytes
 	srcOff := uint64(src) * rowBytes
 	copies := 0
@@ -402,6 +421,9 @@ func (m *Model) BlockSize() int { return m.blockSize }
 
 // VocabSize returns the model vocabulary size.
 func (m *Model) VocabSize() int { return m.config.VocabSize }
+
+// KVType returns the full-attention KV pool storage type.
+func (m *Model) KVType() tensor.DType { return m.kvType }
 
 // Capacity returns the maximum number of positions in the pool.
 func (m *Model) Capacity() int { return m.capacity }

@@ -1,11 +1,12 @@
 # Benchmark Report: Qwen3.5-4B Q4_K_M
 
 This report records single-request CPU-versus-HIP measurements, the Phase 2
-decode baseline, and the Phase 3 prefill results. It follows the metadata
-requirements in [testing.md](testing.md) as far as the current tooling allows.
-The decode section is a correctness-phase baseline, not a tuned performance
-result; the Phase 3 section records measured prefill behavior and its known
-gap to llama.cpp.
+decode baseline, the Phase 3 prefill results, Phase 4 serving results, and the
+Phase 5 KV-format, speculative-decoding, MoE, and quantization measurements. It
+follows the metadata requirements in [testing.md](testing.md) as far as the
+current tooling allows. The early decode section is a correctness-phase
+baseline, not a tuned performance result; the Phase 3 section records measured
+prefill behavior and its known gap to llama.cpp.
 
 ## Environment
 
@@ -482,6 +483,136 @@ go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
   --backend hip --ctx 256 --block-size 16 --kv-blocks 16 \
   --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
   --warmup 0 --graph --prefix-cache
+```
+
+## Phase 5 expansion features
+
+### Environment and protocol
+
+Phase 5 measurements use the same model, device, ROCm/HIP version, greedy
+sampling, warmup, and repetition settings as the Phase 2/4 sections unless a
+row states otherwise. The KV-format and speculative runs use a 128-token prompt
+and 32 generated tokens. The MoE sweep uses synthetic Q4_K weights at
+Qwen3-30B-A3B-like single-layer shapes because no standard `qwen3moe` GGUF is
+available on the target host.
+
+### KV cache formats
+
+Qwen3.5-4B has 8 full-attention layers, 4 KV heads, and head size 256. One KV
+row is 1024 values per layer. The three formats store:
+
+| Format | Bytes per token (K+V) | Relative to F32 | 4096-token request |
+| --- | ---: | ---: | ---: |
+| F32 | 65,536 | 1.00x | 256 MiB |
+| F16 | 32,768 | 0.50x | 128 MiB |
+| Q8_0 | 17,408 | 0.266x | 68 MiB |
+
+| KV format | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| F32 | 0.412 s | 0.412 s | 3.203 s | 9.68 |
+| F16 | 0.411 s | 0.411 s | 3.192 s | 9.71 |
+| Q8_0 | 0.428 s | 0.428 s | 3.180 s | 9.75 |
+
+The latency differences are within run-to-run noise. KV format is a memory
+feature, not a decode throughput feature, at this context length. The real-model
+correctness test generated the same six greedy tokens for F32, F16, and Q8_0;
+maximum logit differences from F32 were `1.12e-3` (F16) and `4.53e-2` (Q8_0).
+
+### Speculative decoding
+
+Exact greedy prompt-lookup speculation with `--speculative`, four draft tokens,
+and two-token minimum match, on the same 128-token repeated-prose prompt:
+
+| Path | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s | Acceptance |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HIP plain greedy | 0.412 s | 0.412 s | 3.203 s | 9.68 | — |
+| HIP speculative | 0.429 s | 0.575 s | 1.024 s | 30.26 | 32/32 draft tokens |
+| CPU plain greedy | 7.328 s | 7.329 s | 3.637 s | 1.92 | — |
+| CPU speculative | 7.327 s | 9.996 s | 6.277 s | 1.12 | 0/10 draft tokens |
+
+The generated token sequence is identical to the plain greedy path. TTFT rises
+because the first step drafts and verifies a block before emitting its first
+token. The measured decode speedup is about 3.1x; repeated runs ranged from 30.3
+to 31.2 tok/s. On a 24-token real-model test the same settings produced 2.333 s
+baseline decode versus 0.719 s speculative decode with identical tokens.
+
+The CPU reference path is not a speculative target. On the same model with a
+16-token prompt and 8 generated tokens, plain CPU decode was 3.637 s (1.92
+tok/s); speculative decode was 6.277 s (1.12 tok/s) with 10 draft tokens and 0
+accepted. Per-candidate LM-head work and no accepted draft made it slower. GPU
+speedup therefore depends on batched verification and real acceptance; the CPU
+result is recorded as a negative experiment, not a claim.
+
+Acceptance is prompt-dependent: a prompt with no repeated n-grams falls back to
+normal decode.
+
+### MoE grouped expert kernels
+
+Synthetic single-layer Q4_K shapes: 128 experts, top-8, hidden 2048, expert FFN
+768. Times are one route + grouped gate/up + SwiGLU + grouped down + weighted
+reduce on one HIP stream. Per-op times come from `yuuka_plan_execute_profiled`;
+total is the steady-state wall time including the plan submission.
+
+| Rows | Route ms | Gate/up ms | Down ms | Reduce ms | Total ms | Tokens/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.225 | 0.380 | 0.411 | 0.016 | 1.055 | 948 |
+| 2 | 0.231 | 1.022 | 0.778 | 0.018 | 2.061 | 970 |
+| 4 | 0.240 | 1.969 | 1.470 | 0.021 | 3.670 | 1090 |
+| 8 | 0.245 | 3.731 | 2.747 | 0.026 | 6.749 | 1185 |
+| 16 | 0.251 | 7.274 | 4.870 | 0.029 | 12.409 | 1289 |
+| 32 | 0.253 | 13.806 | 9.453 | 0.038 | 23.462 | 1364 |
+
+These are kernel-pipeline numbers, not end-to-end model throughput. Routing and
+reduction are negligible; gate/up and down are limited by packed-weight reads.
+The CPU reference and HIP pipeline agree within `3.9e-5` maximum logit
+difference on the synthetic fixture, and the native MoE test agrees within
+`8.7e-9` on its direct kernel comparison.
+
+### Q4_0 and Q5_0 GEMV
+
+`bench/hip/gemv_sweep` at 2560x2560, one projection per measurement:
+
+| dtype | Batch 1 per-row ms | Batch 1 batched ms | Batch 8 batched ms | Batch 16 batched ms | Weight MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_0 | 0.060 | 0.093 | 0.240 | 0.409 | 3.5 |
+| Q5_0 | 0.102 | 0.092 | 0.263 | 0.433 | 4.3 |
+
+Batched GEMV wins from batch 4 for Q4_0 and from batch 1 for Q5_0 in this sweep.
+The tensor, GEMV, embedding, and WMMA paths pass randomized and non-aligned
+shape tests.
+
+### NPU capability result
+
+`yuuka npu-probe` on the reference host reports:
+
+```text
+state: device_only
+device: /dev/accel/accel0
+driver: true
+userspace: false
+reason: device and amdxdna driver are present, but no XRT userspace runtime was found
+fallback: selected backend
+```
+
+No NPU prefill, decode, or subgraph execution result is claimed. The opt-in
+`--npu` flag records the probe and falls back to the selected backend.
+
+### Phase 5 reproduction
+
+```bash
+go test ./...
+go test -tags hip ./...
+ctest --test-dir build --output-on-failure
+
+go run -tags hip ./cmd/yuuka bench --model "$YUUKA_TEST_MODEL" --backend hip \
+  --prompt-tokens 128 --decode-tokens 32 --warmup 1 --reps 3 --kv-type f16
+go run -tags hip ./cmd/yuuka bench --model "$YUUKA_TEST_MODEL" --backend hip \
+  --prompt-tokens 128 --decode-tokens 32 --warmup 1 --reps 3 --speculative
+
+./build/yuuka_gemv_sweep
+./build/yuuka_moe_sweep
+YUUKA_TEST_MODEL="$YUUKA_TEST_MODEL" go test -tags hip ./engine/gpu/... \
+  -run 'TestGPURealModelKVFormats|TestGPURealModelSpeculativeMatchesGreedy' -v
 ```
 
 ## Reproduction

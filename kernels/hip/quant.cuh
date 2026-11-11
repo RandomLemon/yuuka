@@ -86,3 +86,46 @@ __device__ __forceinline__ float q8_value(const uint8_t * blk, int j) {
     const float d = load_f16_device(blk);
     return d * static_cast<float>(static_cast<int8_t>(blk[2 + j]));
 }
+
+// packed_value decodes element index of one packed GGUF weight row. The caller
+// selects dtype at runtime; the switch mirrors the host capability checks.
+__device__ __forceinline__ float packed_value(uint32_t dtype, const uint8_t * row,
+                                              int64_t index) {
+    switch (dtype) {
+        case YUUKA_DTYPE_F32:
+            return reinterpret_cast<const float *>(row)[index];
+        case YUUKA_DTYPE_F16:
+            return load_f16_device(row + index * 2);
+        case YUUKA_DTYPE_Q4_0: {
+            const uint8_t * blk = row + (index / 32) * 18;
+            const int64_t j = index % 32;
+            const uint8_t packed = blk[2 + (j & 15)];
+            const int q = (j < 16) ? (packed & 0xF) : (packed >> 4);
+            return load_f16_device(blk) * static_cast<float>(q - 8);
+        }
+        case YUUKA_DTYPE_Q5_0: {
+            const uint8_t * blk = row + (index / 32) * 22;
+            const int64_t j = index % 32;
+            const uint8_t packed = blk[6 + (j & 15)];
+            const uint32_t qh = static_cast<uint32_t>(blk[2]) |
+                                (static_cast<uint32_t>(blk[3]) << 8) |
+                                (static_cast<uint32_t>(blk[4]) << 16) |
+                                (static_cast<uint32_t>(blk[5]) << 24);
+            const int high = (j < 16)
+                                 ? static_cast<int>(((qh >> j) << 4) & 0x10)
+                                 : static_cast<int>((qh >> ((j & 15) + 12)) & 0x10);
+            const int q = (j < 16 ? (packed & 0xF) : (packed >> 4)) | high;
+            return load_f16_device(blk) * static_cast<float>(q - 16);
+        }
+        case YUUKA_DTYPE_Q8_0:
+            return q8_value(row + (index / 32) * 34, static_cast<int>(index % 32));
+        case YUUKA_DTYPE_Q4_K:
+            return q4k_value(row + (index / 256) * 144, static_cast<int>(index % 256));
+        case YUUKA_DTYPE_Q5_K:
+            return q5k_value(row + (index / 256) * 176, static_cast<int>(index % 256));
+        case YUUKA_DTYPE_Q6_K:
+            return q6k_value(row + (index / 256) * 210, static_cast<int>(index % 256));
+        default:
+            return 0.0f;
+    }
+}

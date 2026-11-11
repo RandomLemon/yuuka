@@ -42,7 +42,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 3
+const RequiredABI = 4
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -222,6 +222,19 @@ func (d *Device) DownloadFloats(dst []float32, src *Buffer) error {
 	}
 	bytes := unsafe.Slice((*byte)(unsafe.Pointer(&dst[0])), len(dst)*4)
 	return d.Download(bytes, src)
+}
+
+// DownloadFloatsAt copies len(dst) float32 values starting at a byte offset.
+func (d *Device) DownloadFloatsAt(dst []float32, src *Buffer, offset uint64) error {
+	if len(dst) == 0 {
+		return errors.New("hip: download is empty")
+	}
+	if src == nil || src.closed {
+		return errors.New("hip: download source is closed")
+	}
+	bytes := unsafe.Slice((*byte)(unsafe.Pointer(&dst[0])), len(dst)*4)
+	return status(C.yuuka_memcpy_d2h_at(unsafe.Pointer(&bytes[0]), src.ptr,
+		C.uint64_t(offset), C.uint64_t(len(bytes))), "memcpy_d2h_at")
 }
 
 // UploadInt32 copies an int32 slice into a device buffer.
@@ -879,26 +892,64 @@ func (p *Plan) AddAttentionPrefillAt(q *Buffer, qOff uint64, kCache, vCache, out
 	return p.add(op)
 }
 
-// AddKVWritePagedAt appends one K/V row write through a block table. capacity
-// is the number of request positions and blockSize is the paged geometry.
-func (p *Plan) AddKVWritePagedAt(k, v, kPool, vPool, table *Buffer, kvDim, capacity int64, blockSize int) error {
-	return p.addKVWritePaged(k, v, kPool, vPool, table, kvDim, 1, capacity, blockSize, C.YUUKA_OP_KV_WRITE_PAGED)
+// KVRowBytes returns the stored byte size of one KV row for dtype.
+func KVRowBytes(dtype tensor.DType, kvDim int64) (uint64, error) {
+	if kvDim <= 0 {
+		return 0, fmt.Errorf("hip: invalid KV row width %d", kvDim)
+	}
+	switch dtype {
+	case tensor.F32:
+		return uint64(kvDim) * 4, nil
+	case tensor.F16:
+		return uint64(kvDim) * 2, nil
+	case tensor.Q8_0:
+		return uint64((kvDim+31)/32) * 34, nil
+	default:
+		return 0, fmt.Errorf("hip: unsupported KV dtype %s", dtype)
+	}
 }
 
-// AddKVWriteBatchPagedAt appends rows K/V writes through a block table.
+func checkKVDType(dtype tensor.DType, kvDim int64) error {
+	_, err := KVRowBytes(dtype, kvDim)
+	return err
+}
+
+// AddKVWritePagedAt appends one K/V row write through a block table. capacity
+// is the number of request positions and blockSize is the paged geometry. The
+// pool is F32.
+func (p *Plan) AddKVWritePagedAt(k, v, kPool, vPool, table *Buffer, kvDim, capacity int64, blockSize int) error {
+	return p.AddKVWritePagedFormatAt(k, v, kPool, vPool, table, kvDim, capacity, blockSize, tensor.F32)
+}
+
+// AddKVWritePagedFormatAt appends one K/V row write with an explicit pool dtype.
+func (p *Plan) AddKVWritePagedFormatAt(k, v, kPool, vPool, table *Buffer, kvDim, capacity int64, blockSize int, dtype tensor.DType) error {
+	return p.addKVWritePaged(k, v, kPool, vPool, table, kvDim, 1, capacity, blockSize, dtype, C.YUUKA_OP_KV_WRITE_PAGED)
+}
+
+// AddKVWriteBatchPagedAt appends rows K/V writes through a block table. The
+// pool is F32.
 func (p *Plan) AddKVWriteBatchPagedAt(k *Buffer, kOff uint64, v *Buffer, vOff uint64, kPool, vPool, table *Buffer, kvDim, rows, capacity int64, blockSize int) error {
+	return p.AddKVWriteBatchPagedFormatAt(k, kOff, v, vOff, kPool, vPool, table, kvDim, rows, capacity, blockSize, tensor.F32)
+}
+
+// AddKVWriteBatchPagedFormatAt appends rows K/V writes with an explicit pool
+// dtype.
+func (p *Plan) AddKVWriteBatchPagedFormatAt(k *Buffer, kOff uint64, v *Buffer, vOff uint64, kPool, vPool, table *Buffer, kvDim, rows, capacity int64, blockSize int, dtype tensor.DType) error {
 	if kOff != 0 || vOff != 0 {
 		return errors.New("hip: paged batch KV write does not take source offsets")
 	}
-	return p.addKVWritePaged(k, v, kPool, vPool, table, kvDim, rows, capacity, blockSize, C.YUUKA_OP_KV_WRITE_BATCH_PAGED)
+	return p.addKVWritePaged(k, v, kPool, vPool, table, kvDim, rows, capacity, blockSize, dtype, C.YUUKA_OP_KV_WRITE_BATCH_PAGED)
 }
 
-func (p *Plan) addKVWritePaged(k, v, kPool, vPool, table *Buffer, kvDim, rows, capacity int64, blockSize int, code C.uint32_t) error {
+func (p *Plan) addKVWritePaged(k, v, kPool, vPool, table *Buffer, kvDim, rows, capacity int64, blockSize int, dtype tensor.DType, code C.uint32_t) error {
 	if kvDim <= 0 || rows <= 0 || capacity < rows || blockSize <= 0 {
 		return errors.New("hip: invalid paged KV write dimensions")
 	}
 	if int64(blockSize) > capacity {
 		return errors.New("hip: paged KV block size exceeds capacity")
+	}
+	if err := checkKVDType(dtype, kvDim); err != nil {
+		return err
 	}
 	if err := p.check(k, v, kPool, vPool, table); err != nil {
 		return err
@@ -915,17 +966,39 @@ func (p *Plan) addKVWritePaged(k, v, kPool, vPool, table *Buffer, kvDim, rows, c
 	}
 	op.u[0] = C.uint32_t(blockSize)
 	op.u[1] = C.uint32_t(capacity)
+	op.u[2] = C.uint32_t(dtype)
 	return p.add(op)
 }
 
 // AddAttentionPagedAt appends single-token attention through a block table.
 // scoreStride is the per-head stride of the scores workspace (usually the
-// maximum context); capacity bounds live positions.
+// maximum context); capacity bounds live positions. The pool is F32.
 func (p *Plan) AddAttentionPagedAt(q, kPool, vPool, out, scores, table *Buffer, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize int, scale float32) error {
+	return p.AddAttentionPagedFormatAt(q, kPool, vPool, out, scores, table, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize, scale, tensor.F32)
+}
+
+// AddAttentionPagedFormatAt appends single-token attention with an explicit
+// pool dtype.
+func (p *Plan) AddAttentionPagedFormatAt(q, kPool, vPool, out, scores, table *Buffer, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize int, scale float32, dtype tensor.DType) error {
+	return p.addAttentionPaged(q, kPool, vPool, out, scores, table, kvHeads, heads,
+		headDim, kvDim, scoreStride, capacity, blockSize, scale, dtype, false)
+}
+
+// AddAttentionPagedDenseFormatAt is AddAttentionPagedFormatAt for models whose
+// query row is heads*head_dim with no output gate.
+func (p *Plan) AddAttentionPagedDenseFormatAt(q, kPool, vPool, out, scores, table *Buffer, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize int, scale float32, dtype tensor.DType) error {
+	return p.addAttentionPaged(q, kPool, vPool, out, scores, table, kvHeads, heads,
+		headDim, kvDim, scoreStride, capacity, blockSize, scale, dtype, true)
+}
+
+func (p *Plan) addAttentionPaged(q, kPool, vPool, out, scores, table *Buffer, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
 	if heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
 		kvDim != kvHeads*headDim || headDim > 256 || capacity <= 0 ||
 		blockSize <= 0 || blockSize > capacity || scoreStride < capacity {
 		return errors.New("hip: invalid paged attention dimensions")
+	}
+	if err := checkKVDType(dtype, int64(kvDim)); err != nil {
+		return err
 	}
 	if err := p.check(q, kPool, vPool, out, scores, table); err != nil {
 		return err
@@ -944,17 +1017,146 @@ func (p *Plan) AddAttentionPagedAt(q, kPool, vPool, out, scores, table *Buffer, 
 	op.n[4] = C.uint64_t(scoreStride)
 	op.u[0] = C.uint32_t(blockSize)
 	op.u[1] = C.uint32_t(capacity)
+	op.u[2] = C.uint32_t(dtype)
+	if dense {
+		op.u[3] = 1
+	}
 	op.f[0] = C.float(scale)
 	return p.add(op)
 }
 
+// AddMoERoute appends top-k expert selection and assignment binning. logits is
+// [rows, experts]; ids and weights are [rows, used]. counts is [experts] and
+// the three assignment buffers are [experts, rows*used].
+func (p *Plan) AddMoERoute(logits, ids, weights, counts, assignRows, assignSlots, assignWeights *Buffer, rows, experts, used int64) error {
+	if rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid MoE route dimensions")
+	}
+	if err := p.check(logits, ids, weights, counts, assignRows, assignSlots, assignWeights); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_ROUTE}
+	op.buf[0] = logits.ptr
+	op.buf[1] = ids.ptr
+	op.buf[2] = weights.ptr
+	op.buf[3] = counts.ptr
+	op.buf[4] = assignRows.ptr
+	op.buf[5] = assignSlots.ptr
+	op.buf[6] = assignWeights.ptr
+	op.n[0] = C.uint64_t(rows)
+	op.n[1] = C.uint64_t(experts)
+	op.n[2] = C.uint64_t(used)
+	return p.add(op)
+}
+
+// AddMoEGateUpGrouped appends grouped gate/up expert projections. norm is
+// [rows, hidden], counts and assignments come from AddMoERoute, and gateOut and
+// upOut are [rows*used, ffn].
+func (p *Plan) AddMoEGateUpGrouped(norm, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut *Buffer, hidden, ffn, rows, experts, used int64, dtype tensor.DType) error {
+	if hidden <= 0 || ffn <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid MoE gate/up dimensions")
+	}
+	if err := checkGemvDType(dtype, hidden); err != nil {
+		return err
+	}
+	if err := p.check(norm, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_GATE_UP}
+	op.buf[0] = norm.ptr
+	op.buf[1] = gateExps.ptr
+	op.buf[2] = upExps.ptr
+	op.buf[3] = counts.ptr
+	op.buf[4] = assignRows.ptr
+	op.buf[5] = assignSlots.ptr
+	op.buf[6] = gateOut.ptr
+	op.buf[7] = upOut.ptr
+	op.n[0] = C.uint64_t(hidden)
+	op.n[1] = C.uint64_t(ffn)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(experts)
+	op.n[4] = C.uint64_t(used)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddMoEDownGrouped appends grouped expert down projections. act is
+// [rows*used, ffn] and out is [rows*used, hidden].
+func (p *Plan) AddMoEDownGrouped(act, downExps, counts, assignRows, assignSlots, out *Buffer, ffn, hidden, rows, experts, used int64, dtype tensor.DType) error {
+	if ffn <= 0 || hidden <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid MoE down dimensions")
+	}
+	if err := checkGemvDType(dtype, ffn); err != nil {
+		return err
+	}
+	if err := p.check(act, downExps, counts, assignRows, assignSlots, out); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_DOWN}
+	op.buf[0] = act.ptr
+	op.buf[1] = downExps.ptr
+	op.buf[2] = counts.ptr
+	op.buf[3] = assignRows.ptr
+	op.buf[4] = assignSlots.ptr
+	op.buf[5] = out.ptr
+	op.n[0] = C.uint64_t(ffn)
+	op.n[1] = C.uint64_t(hidden)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(experts)
+	op.n[4] = C.uint64_t(used)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddMoEReduceAdd appends weighted accumulation of per-slot expert outputs into
+// the residual stream x. expertOut is [rows*used, hidden] and weights is
+// [rows, used].
+func (p *Plan) AddMoEReduceAdd(x, expertOut, weights *Buffer, hidden, rows, used int64) error {
+	if hidden <= 0 || rows <= 0 || used <= 0 {
+		return errors.New("hip: invalid MoE reduce dimensions")
+	}
+	if err := p.check(x, expertOut, weights); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_REDUCE_ADD}
+	op.buf[0] = x.ptr
+	op.buf[1] = expertOut.ptr
+	op.buf[2] = weights.ptr
+	op.n[0] = C.uint64_t(hidden)
+	op.n[1] = C.uint64_t(rows)
+	op.n[2] = C.uint64_t(used)
+	return p.add(op)
+}
+
 // AddAttentionPrefillPagedAt appends causal tiled attention over a prompt chunk
-// through a block table.
+// through a block table. The pool is F32.
 func (p *Plan) AddAttentionPrefillPagedAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	return p.AddAttentionPrefillPagedFormatAt(q, qOff, kPool, vPool, out, outOff, table, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, tensor.F32)
+}
+
+// AddAttentionPrefillPagedFormatAt appends causal tiled attention with an
+// explicit pool dtype.
+func (p *Plan) AddAttentionPrefillPagedFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType) error {
+	return p.addAttentionPrefillPaged(q, qOff, kPool, vPool, out, outOff, table,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, false)
+}
+
+// AddAttentionPrefillPagedDenseFormatAt is
+// AddAttentionPrefillPagedFormatAt for models whose query row is
+// heads*head_dim with no output gate.
+func (p *Plan) AddAttentionPrefillPagedDenseFormatAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType) error {
+	return p.addAttentionPrefillPaged(q, qOff, kPool, vPool, out, outOff, table,
+		kvHeads, heads, headDim, kvDim, rows, capacity, blockSize, scale, dtype, true)
+}
+
+func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
 		kvDim != kvHeads*headDim || headDim > 256 || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity {
 		return errors.New("hip: invalid paged prefill attention dimensions")
+	}
+	if err := checkKVDType(dtype, int64(kvDim)); err != nil {
+		return err
 	}
 	if err := p.check(q, kPool, vPool, out, table); err != nil {
 		return err
@@ -974,6 +1176,10 @@ func (p *Plan) AddAttentionPrefillPagedAt(q *Buffer, qOff uint64, kPool, vPool, 
 	op.n[4] = C.uint64_t(rows)
 	op.u[0] = C.uint32_t(blockSize)
 	op.u[1] = C.uint32_t(capacity)
+	op.u[2] = C.uint32_t(dtype)
+	if dense {
+		op.u[3] = 1
+	}
 	op.f[0] = C.float(scale)
 	return p.add(op)
 }

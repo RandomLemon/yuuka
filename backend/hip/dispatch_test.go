@@ -137,7 +137,7 @@ func TestAddGemvAutoRejectsInvalidInputs(t *testing.T) {
 		{"zero batch", 0, 256, tensor.Q4_K},
 		{"negative batch", -1, 256, tensor.Q4_K},
 		{"misaligned width", 1, 100, tensor.Q4_K},
-		{"unsupported dtype", 1, 256, tensor.Q4_0},
+		{"unsupported dtype", 1, 256, tensor.Q2_K},
 	}
 	for _, tc := range cases {
 		if err := plan.AddGemvAuto(w, x, out, tc.nIn, 4, tc.batch, tc.dtype); err == nil {

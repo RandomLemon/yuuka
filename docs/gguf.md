@@ -77,9 +77,11 @@ Initial native kernel coverage targets:
 | --- | --- | --- |
 | `F16` / `F32` | Unquantized baseline | Reference and fallback |
 | `Q8_0` | Simple block quantization, high bandwidth | Decode baseline |
+| `Q4_0` | 32-value block, one scale, nibble pairs | Decode, embedding, prefill |
+| `Q5_0` | Q4_0 plus a high-bit plane | Decode, embedding, prefill |
 | `Q6_K` | K-quant superblock layout | Decode and prefill |
 | `Q4_K` | 256-weight superblock with scale/min encoding | Primary decode target |
-| `Q5_K` | K-quant layout related to Q4_K/Q6_K | Reader support; kernel timing depends on demand |
+| `Q5_K` | K-quant layout related to Q4_K/Q6_K | Decode and prefill |
 
 The reader validates block-size divisibility where the format requires it, but
 must not reject a tensor merely because a particular kernel does not support its
@@ -177,7 +179,7 @@ same string while producing different model behavior.
 | P0 | Qwen3 Dense | RMSNorm, RoPE, GQA, Q/K norm, SwiGLU |
 | P0 | Llama Dense | RMSNorm, RoPE, GQA, SwiGLU |
 | P1 | Gemma | Architecture-specific norm, attention, and logit details |
-| P1 | Qwen3 MoE | Routing, experts, grouped GEMM |
+| P1 | Qwen3 MoE (`qwen3moe`) | Routing, experts, grouped expert kernels |
 | P2 | DeepSeek-like | MLA, MoE, specialized KV representation |
 | P2 | Hybrid attention/SSM | Separate state cache and state-space operators |
 
@@ -192,7 +194,17 @@ Dense Llama and Qwen3 CPU reference paths are implemented with generated
 fixtures. The Llama fixture is cross-checked against llama.cpp greedy tokens;
 Qwen3 fixture coverage is structural and determinism-based because no real
 Qwen3 dense weight file is part of the test matrix. HIP execution for dense
-architectures is not implemented. Other architectures in the table are planned.
+Llama/Qwen3 is not implemented.
+
+`qwen3moe` is implemented as a CPU reference and a HIP decode/prefill path.
+Expert tensors are rank-3 `ffn_{gate,up,down}_exps` tensors with the GGUF layout
+`[columns, rows_per_expert, experts]` and a `ffn_gate_inp` router. The current
+adapter requires a scalar `expert_feed_forward_length` or a layer array whose
+entries are all equal; per-layer expert widths are rejected explicitly. Top-k routing
+and grouped expert kernels are shared by decode and chunked prefill. The HIP
+path is validated on a synthetic four-expert fixture because no standard
+`qwen3moe` GGUF is available on the target host. Other architectures in the
+table remain planned.
 
 ## 9. Quantization support by phase
 
@@ -206,11 +218,12 @@ architectures is not implemented. Other architectures in the table are planned.
 Support for a quantization type is not complete until it has reader validation,
 a correct reference path, a GPU kernel, and a benchmark entry.
 
-Current status: fused GEMV decode for `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and
-`Q6_K` and quantized WMMA prefill GEMM for `F16`, `F32`, `Q4_K`, `Q5_K`,
-`Q6_K`, and `Q8_0` are implemented for `qwen35`. The prefill dispatch table and
-benchmark evidence are in [kernels.md](kernels.md) and
-[benchmarks.md](benchmarks.md).
+Current status: fused GEMV decode for `F16`, `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`,
+`Q5_K`, and `Q6_K` and quantized WMMA prefill GEMM for `F16`, `F32`, `Q4_0`,
+`Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_0` are implemented. The prefill dispatch
+table and benchmark evidence are in [kernels.md](kernels.md) and
+[benchmarks.md](benchmarks.md). Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, and the IQ families
+remain capability failures.
 
 ## 10. Validation checklist
 

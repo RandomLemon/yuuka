@@ -32,6 +32,7 @@ type scratch struct {
 	scores  []float32
 	sk      []float32
 	d       []float32
+	kvRow   []float32
 	logits  []float32
 }
 
@@ -48,9 +49,15 @@ type State struct {
 	owned    *memory.Allocator
 }
 
-// NewState allocates a private KV pool and block table for capacity tokens.
+// NewState allocates a private F32 KV pool and block table for capacity tokens.
 // capacity must not exceed the model context length.
 func NewState(cfg *Config, capacity int) (*State, error) {
+	return NewStateWithFormat(cfg, capacity, KVF32)
+}
+
+// NewStateWithFormat allocates a private KV pool in format and a block table for
+// capacity tokens. capacity must not exceed the model context length.
+func NewStateWithFormat(cfg *Config, capacity int, format KVFormat) (*State, error) {
 	if capacity <= 0 {
 		return nil, fmt.Errorf("context capacity must be positive")
 	}
@@ -63,7 +70,7 @@ func NewState(cfg *Config, capacity int) (*State, error) {
 		blockSize = capacity
 	}
 	blocks := (capacity + blockSize - 1) / blockSize
-	pool, err := NewKVPool(cfg, blocks, blockSize)
+	pool, err := NewKVPoolWithFormat(cfg, blocks, blockSize, format)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +146,7 @@ func NewPagedState(cfg *Config, pool *KVPool, table *memory.Table, capacity int)
 		scores:  make([]float32, capacity),
 		sk:      make([]float32, cfg.SSMStateSize),
 		d:       make([]float32, cfg.SSMStateSize),
+		kvRow:   make([]float32, cfg.KVHeadCount*cfg.HeadDim),
 		logits:  make([]float32, cfg.VocabSize),
 	}
 	return st, nil

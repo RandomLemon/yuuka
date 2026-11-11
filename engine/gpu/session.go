@@ -41,6 +41,8 @@ type Session struct {
 
 	prefillPlans map[int]*hip.Plan
 	prefillGen   int64
+	logitsPlan   *hip.Plan
+	logitsRows   int
 
 	graph        *hip.Graph
 	graphTried   bool
@@ -239,6 +241,79 @@ func (s *Session) Prefill(tokens []int32, final bool) ([]float32, error) {
 	return s.logits, nil
 }
 
+// PrefillLogits processes tokens and returns logits for every position. It is
+// used by speculative verification and accepts at most maxSpecDraft tokens.
+func (s *Session) PrefillLogits(tokens []int32) ([][]float32, error) {
+	if s == nil || s.closed {
+		return nil, fmt.Errorf("gpu: session is closed")
+	}
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("gpu: empty token sequence")
+	}
+	if len(tokens) > maxSpecDraft {
+		return nil, fmt.Errorf("gpu: %d speculative tokens exceed %d", len(tokens), maxSpecDraft)
+	}
+	if len(tokens) > s.model.prefillRows {
+		return nil, fmt.Errorf("gpu: %d speculative tokens exceed prefill chunk %d",
+			len(tokens), s.model.prefillRows)
+	}
+	if s.position+len(tokens) > s.capacity {
+		return nil, fmt.Errorf("gpu: speculative tokens exceed remaining context")
+	}
+	for _, token := range tokens {
+		if token < 0 || int(token) >= s.model.config.VocabSize {
+			return nil, fmt.Errorf("gpu: token id %d is out of range", token)
+		}
+	}
+	s.model.stepMu.Lock()
+	defer s.model.stepMu.Unlock()
+	s.syncPrefillPlans()
+	if s.logitsPlan == nil || s.logitsRows != len(tokens) {
+		if s.logitsPlan != nil {
+			_ = s.logitsPlan.Close()
+			s.logitsPlan = nil
+		}
+		plan, err := s.model.buildPrefillPlan(s, len(tokens), true)
+		if err != nil {
+			return nil, err
+		}
+		s.logitsPlan = plan
+		s.logitsRows = len(tokens)
+	}
+	if err := s.model.device.UploadInt32(s.model.prefill.tokens, tokens); err != nil {
+		return nil, err
+	}
+	if err := s.logitsPlan.Execute(s.model.stream, 0, uint32(s.position), true, s.model.event); err != nil {
+		return nil, err
+	}
+	if err := s.model.event.Wait(); err != nil {
+		return nil, err
+	}
+	s.position += len(tokens)
+	out := make([][]float32, len(tokens))
+	buf := make([]float32, s.model.config.VocabSize)
+	for row := range tokens {
+		offset := uint64(row) * uint64(s.model.config.VocabSize) * 4
+		if err := s.model.device.DownloadFloatsAt(buf, s.model.specLogits, offset); err != nil {
+			return nil, err
+		}
+		out[row] = append([]float32(nil), buf...)
+	}
+	return out, nil
+}
+
+// SetPosition restores the absolute position after a speculative rollback.
+func (s *Session) SetPosition(position int) error {
+	if s == nil || s.closed {
+		return fmt.Errorf("gpu: session is closed")
+	}
+	if position < 0 || position > s.capacity {
+		return fmt.Errorf("gpu: position %d is outside capacity %d", position, s.capacity)
+	}
+	s.position = position
+	return nil
+}
+
 func (s *Session) syncPrefillPlans() {
 	if s.prefillGen == s.model.prefillGen {
 		return
@@ -247,6 +322,11 @@ func (s *Session) syncPrefillPlans() {
 		_ = plan.Close()
 	}
 	s.prefillPlans = make(map[int]*hip.Plan)
+	if s.logitsPlan != nil {
+		_ = s.logitsPlan.Close()
+		s.logitsPlan = nil
+		s.logitsRows = 0
+	}
 	s.prefillGen = s.model.prefillGen
 }
 
@@ -254,7 +334,7 @@ func (s *Session) prefillPlan(rows int) (*hip.Plan, error) {
 	if plan, ok := s.prefillPlans[rows]; ok {
 		return plan, nil
 	}
-	plan, err := s.model.buildPrefillPlan(s, rows)
+	plan, err := s.model.buildPrefillPlan(s, rows, false)
 	if err != nil {
 		return nil, err
 	}
@@ -537,6 +617,9 @@ func (s *Session) Close() error {
 	}
 	if s.tracePlan != nil {
 		_ = s.tracePlan.Close()
+	}
+	if s.logitsPlan != nil {
+		_ = s.logitsPlan.Close()
 	}
 	for _, plan := range s.prefillPlans {
 		_ = plan.Close()

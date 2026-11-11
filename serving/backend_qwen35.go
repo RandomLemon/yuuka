@@ -16,9 +16,15 @@ type Qwen35Backend struct {
 	key   string
 }
 
-// NewQwen35Backend creates a host KV pool with blocks fixed-size blocks. key
-// must identify the model and tokenizer configuration for prefix caching.
+// NewQwen35Backend creates a host F32 KV pool with fixed-size blocks. key must
+// identify the model and tokenizer configuration for prefix caching.
 func NewQwen35Backend(model *qwen35.Model, key string, blocks, blockSize int) (*Qwen35Backend, error) {
+	return NewQwen35BackendWithFormat(model, key, blocks, blockSize, qwen35.KVF32)
+}
+
+// NewQwen35BackendWithFormat creates a host KV pool in format. key must include
+// the format for prefix-cache correctness.
+func NewQwen35BackendWithFormat(model *qwen35.Model, key string, blocks, blockSize int, format qwen35.KVFormat) (*Qwen35Backend, error) {
 	if model == nil {
 		return nil, fmt.Errorf("serving: qwen35 model is required")
 	}
@@ -26,12 +32,15 @@ func NewQwen35Backend(model *qwen35.Model, key string, blocks, blockSize int) (*
 	if err != nil {
 		return nil, err
 	}
-	pool, err := qwen35.NewKVPool(model.Config, blocks, blockSize)
+	pool, err := qwen35.NewKVPoolWithFormat(model.Config, blocks, blockSize, format)
 	if err != nil {
 		return nil, err
 	}
 	return &Qwen35Backend{model: model, pool: pool, alloc: alloc, key: key}, nil
 }
+
+// KVFormat returns the host pool storage format.
+func (b *Qwen35Backend) KVFormat() qwen35.KVFormat { return b.pool.Format() }
 
 // ModelKey returns the prefix-cache identity.
 func (b *Qwen35Backend) ModelKey() string { return b.key }

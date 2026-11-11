@@ -189,12 +189,38 @@ __global__ void gemv_q6_k_kernel(float * out, const float * x, const void * w,
 }
 
 
-enum class GemvKind { F32, F16, Q8_0, Q4_K, Q5_K, Q6_K };
+enum class GemvKind { F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K };
+
+template <GemvKind Kind>
+__device__ __forceinline__ float weight_at(const uint8_t * row, int64_t i);
+
+template <GemvKind Kind>
+__global__ void gemv_packed_kernel(float * out, const float * x, const void * w,
+                                   int64_t n_in, int64_t n_out) {
+    const int64_t row = blockIdx.x;
+    if (row >= n_out) {
+        return;
+    }
+    const uint8_t * row_ptr = static_cast<const uint8_t *>(w) +
+                              row * ((Kind == GemvKind::Q4_0)
+                                         ? (n_in / 32) * 18
+                                         : (n_in / 32) * 22);
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < n_in; i += blockDim.x) {
+        sum += x[i] * weight_at<Kind>(row_ptr, i);
+    }
+    sum = block_reduce(sum);
+    if (threadIdx.x == 0) {
+        out[row] = sum;
+    }
+}
 
 template <GemvKind Kind>
 __device__ __forceinline__ int64_t batch_row_bytes(int64_t n_in) {
     if constexpr (Kind == GemvKind::F32) return n_in * 4;
     if constexpr (Kind == GemvKind::F16) return n_in * 2;
+    if constexpr (Kind == GemvKind::Q4_0) return (n_in / 32) * 18;
+    if constexpr (Kind == GemvKind::Q5_0) return (n_in / 32) * 22;
     if constexpr (Kind == GemvKind::Q8_0) return (n_in / 32) * 34;
     if constexpr (Kind == GemvKind::Q4_K) return (n_in / 256) * 144;
     if constexpr (Kind == GemvKind::Q5_K) return (n_in / 256) * 176;
@@ -215,6 +241,25 @@ __device__ __forceinline__ float weight_at(const uint8_t * row, int64_t i) {
         return reinterpret_cast<const float *>(row)[i];
     } else if constexpr (Kind == GemvKind::F16) {
         return load_f16(row + i * 2);
+    } else if constexpr (Kind == GemvKind::Q4_0) {
+        const uint8_t * blk = row + (i / 32) * 18;
+        const int64_t j = i % 32;
+        const uint8_t packed = blk[2 + (j & 15)];
+        const int q = (j < 16) ? (packed & 0xF) : (packed >> 4);
+        return load_f16(blk) * static_cast<float>(q - 8);
+    } else if constexpr (Kind == GemvKind::Q5_0) {
+        const uint8_t * blk = row + (i / 32) * 22;
+        const int64_t j = i % 32;
+        const uint8_t packed = blk[6 + (j & 15)];
+        const uint32_t qh = static_cast<uint32_t>(blk[2]) |
+                            (static_cast<uint32_t>(blk[3]) << 8) |
+                            (static_cast<uint32_t>(blk[4]) << 16) |
+                            (static_cast<uint32_t>(blk[5]) << 24);
+        const int high = (j < 16)
+                             ? static_cast<int>(((qh >> j) << 4) & 0x10)
+                             : static_cast<int>((qh >> ((j & 15) + 12)) & 0x10);
+        const int q = (j < 16 ? (packed & 0xF) : (packed >> 4)) | high;
+        return load_f16(blk) * static_cast<float>(q - 16);
     } else if constexpr (Kind == GemvKind::Q8_0) {
         const uint8_t * blk = row + (i / 32) * 34;
         return load_f16(blk) * static_cast<float>(static_cast<int8_t>(blk[2 + i % 32]));
@@ -321,6 +366,18 @@ void launch_gemv_f16(float * out, const float * x, const void * w,
         out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out));
 }
 
+void launch_gemv_q4_0(float * out, const float * x, const void * w,
+                      uint64_t n_in, uint64_t n_out, hipStream_t stream) {
+    gemv_packed_kernel<GemvKind::Q4_0><<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
+        out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out));
+}
+
+void launch_gemv_q5_0(float * out, const float * x, const void * w,
+                      uint64_t n_in, uint64_t n_out, hipStream_t stream) {
+    gemv_packed_kernel<GemvKind::Q5_0><<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
+        out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out));
+}
+
 void launch_gemv_q8_0(float * out, const float * x, const void * w,
                       uint64_t n_in, uint64_t n_out, hipStream_t stream) {
     gemv_q8_0_kernel<<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
@@ -356,6 +413,20 @@ void launch_gemv_batch_f16(float * out, const float * x, const void * w,
                            uint64_t n_in, uint64_t n_out, uint64_t batch,
                            hipStream_t stream) {
     gemv_batch_kernel<GemvKind::F16><<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
+        out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out), static_cast<int64_t>(batch));
+}
+
+void launch_gemv_batch_q4_0(float * out, const float * x, const void * w,
+                            uint64_t n_in, uint64_t n_out, uint64_t batch,
+                            hipStream_t stream) {
+    gemv_batch_kernel<GemvKind::Q4_0><<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
+        out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out), static_cast<int64_t>(batch));
+}
+
+void launch_gemv_batch_q5_0(float * out, const float * x, const void * w,
+                            uint64_t n_in, uint64_t n_out, uint64_t batch,
+                            hipStream_t stream) {
+    gemv_batch_kernel<GemvKind::Q5_0><<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
         out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out), static_cast<int64_t>(batch));
 }
 

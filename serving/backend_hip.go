@@ -7,6 +7,7 @@ import (
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/memory"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
+	"github.com/yuuka-ai/yuuka/tensor"
 )
 
 // Qwen35GPUBackend executes requests on the HIP backend over a shared paged KV
@@ -20,12 +21,21 @@ type Qwen35GPUBackend struct {
 // NewQwen35GPUBackend opens the shared device model and KV pools.
 func NewQwen35GPUBackend(reader *gguf.Reader, model *qwen35.Model, key string,
 	blocks, blockSize, prefillChunk int, graph bool) (*Qwen35GPUBackend, error) {
+	return NewQwen35GPUBackendWithKV(reader, model, key, blocks, blockSize,
+		prefillChunk, graph, tensor.F32)
+}
+
+// NewQwen35GPUBackendWithKV is NewQwen35GPUBackend with an explicit KV pool
+// storage type. key must include the format for prefix-cache correctness.
+func NewQwen35GPUBackendWithKV(reader *gguf.Reader, model *qwen35.Model, key string,
+	blocks, blockSize, prefillChunk int, graph bool, kvType tensor.DType) (*Qwen35GPUBackend, error) {
 	m, err := gpu.Open(reader, model, gpu.Options{
 		Blocks:        blocks,
 		BlockSize:     blockSize,
 		PrefillChunk:  prefillChunk,
 		EnableGraph:   graph,
 		GraphMinSteps: 1,
+		KVType:        kvType,
 	})
 	if err != nil {
 		return nil, err

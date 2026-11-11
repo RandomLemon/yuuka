@@ -13,14 +13,14 @@ import (
 func TestValidateModelSupportRejectsUnsupportedDType(t *testing.T) {
 	model := &qwen35.Model{
 		Config:    &qwen35.Config{},
-		Embedding: tensor.Matrix{DType: tensor.Q4_0, Rows: 1, Cols: 32},
+		Embedding: tensor.Matrix{DType: tensor.Q2_K, Rows: 1, Cols: 32},
 		Output:    tensor.Matrix{DType: tensor.F32, Rows: 1, Cols: 32},
 	}
 	err := validateModelSupport(model)
 	if err == nil {
 		t.Fatal("unsupported dtype was accepted")
 	}
-	if !strings.Contains(err.Error(), "token_embd.weight") || !strings.Contains(err.Error(), "Q4_0") {
+	if !strings.Contains(err.Error(), "token_embd.weight") || !strings.Contains(err.Error(), "Q2_K") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

@@ -138,7 +138,7 @@ func (d DType) RowBytes(columns int64) (uint64, error) {
 // Supported reports whether this build has a decoding kernel for the dtype.
 func (d DType) Supported() bool {
 	switch d {
-	case F32, F16, Q8_0, Q4_K, Q5_K, Q6_K:
+	case F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K:
 		return true
 	default:
 		return false

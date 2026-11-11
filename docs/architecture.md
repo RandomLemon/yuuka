@@ -200,6 +200,13 @@ serving scheduler interleaves requests on one model stream. HIP Graph capture
 and replay are implemented per session but opt-in; the plain stream path is the
 default because the measured decode gain was within noise.
 
+The CPU reference also covers dense Llama, dense Qwen3, and `qwen3moe`. The HIP
+backend executes `qwen35` and `qwen3moe`; MoE uses top-k routing, assignment
+bucketing, and grouped expert kernels that reuse one packed weight row across
+the tokens assigned to an expert. Speculative decoding is an opt-in greedy
+generation mode that verifies prompt-lookup drafts through an all-position
+prefill plan and restores session state on a partial rejection.
+
 Key rules:
 
 1. GGUF data is validated before any device allocation.
@@ -282,7 +289,7 @@ on the assumption that zero-copy access is optimal.
 | --- | --- | --- | --- |
 | **Weights** | Quantized weights, embedding tables, output head | Model lifetime | Device-resident; stable addresses preferred |
 | **Activation** | Layer scratch, attention workspace, logits | Per step or per batch | Reused across layers; sized from the plan |
-| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Paged `F32` block allocator; immutable per-request block table; see [serving.md](serving.md) |
+| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Paged block allocator with F32, F16, or Q8_0 rows; immutable per-request block table; see [serving.md](serving.md) |
 | **Staging** | Host/device transfer buffers | Transient | Reused; explicit synchronization |
 | **Graph workspace** | Stable-address buffers for replay | Session lifetime | Address stability is required while a captured graph is installed |
 
@@ -293,18 +300,18 @@ allocator block ID. A request owns a block table covering its prompt plus output
 budget; positions are resolved through that table by the CPU attention loop and
 by the paged HIP KV-write and attention kernels. Recurrent convolution and
 matrix state stay contiguous per session and are snapshotted for prefix reuse.
-The default block size is 16 tokens. FP16 KV and quantized KV remain extension
-points. The logical KV view exposed to model code does not expose physical block
-layout. Block allocation, reference counting, prefix sharing, cancellation, and
+The default block size is 16 tokens. F32 is the default KV storage; opt-in F16
+and Q8_0 formats use the same block table and are selected through `--kv-type`.
+The logical KV view exposed to model code does not expose physical block layout. Block allocation, reference counting, prefix sharing, cancellation, and
 eviction are specified in [serving.md](serving.md).
 
 ## 8. Backends and fallback
 
 | Backend | Role | Status |
 | --- | --- | --- |
-| HIP GPU | Primary execution path | Implemented for `qwen35` single and concurrent requests over a shared paged KV pool; opt-in graph replay |
-| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`; default backend; concurrent paged serving |
-| XDNA NPU | Optional heterogeneous acceleration | Deferred; see [npu.md](npu.md) |
+| HIP GPU | Primary execution path | Implemented for `qwen35` single and concurrent requests over a shared paged KV pool, and for `qwen3moe` single requests; opt-in graph replay |
+| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`, dense Llama/Qwen3, and `qwen3moe`; default backend; concurrent paged serving for `qwen35` |
+| XDNA NPU | Optional heterogeneous acceleration | Capability probe and explicit GPU fallback only; execution deferred; see [npu.md](npu.md) |
 
 The planner queries backend capabilities, including supported dtypes,
 quantization types, maximum batch, graph support, and memory properties. If a
@@ -375,9 +382,10 @@ yuuka/
 └── go.mod
 ```
 
-Planned but not present yet: a separate `backend/cpu/` package, `backend/npu/`,
-separate `model/llama/` and `model/qwen3/` packages, and
-`kernels/hip/sampling/`. The CPU reference model code is implemented in
+Planned but not present yet: a separate `backend/cpu/` package, separate
+`model/llama/` and `model/qwen3/` packages, and `kernels/hip/sampling/`.
+`backend/npu/` currently contains the opt-in capability probe, not an execution
+backend. The CPU reference model code is implemented in
 `model/qwen35` and `model/dense`; `engine` owns the single-request generation
 loop, while `serving` and `scheduler` own concurrent requests. The generic
 `backend` interfaces remain the target shape; the current executor uses
@@ -440,9 +448,10 @@ decision and the phase that may reopen it are recorded below.
    stream. Fusing multiple decode requests or prefill plus decode into one
    kernel batch is not implemented; it would require per-lane block tables and
    sequence lengths and is left to a later phase.
-8. **NPU integration boundary.** Deferred. NPU execution remains opt-in and must
-   fall back to the GPU path; the split is not selected before the Phase 5
-   criteria in [npu.md](npu.md) are met.
+8. **NPU integration boundary.** Deferred. `backend/npu` provides only an
+   opt-in capability probe and fallback decision. NPU execution, graph
+   compilation, and subgraph splitting are not shipped; activation criteria in
+   [npu.md](npu.md) are unmet on the reference host.
 
 ## 12. Extensibility rules
 
