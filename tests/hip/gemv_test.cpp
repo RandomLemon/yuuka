@@ -144,6 +144,15 @@ float dot_q8_0(const uint8_t * row, const float * x, int64_t n) {
     return sum;
 }
 
+float dot_f32(const uint8_t * row, const float * x, int64_t n) {
+    const float * w = reinterpret_cast<const float *>(row);
+    float sum = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        sum += x[i] * w[i];
+    }
+    return sum;
+}
+
 float dot_f16(const uint8_t * row, const float * x, int64_t n) {
     float sum = 0;
     for (int64_t i = 0; i < n; ++i) {
@@ -189,6 +198,111 @@ bool check(yuuka_status status, const char * what) {
 
 } // namespace
 
+bool run_case(yuuka_device * device, yuuka_stream * stream, yuuka_event * event,
+              yuuka_dtype dtype, const char * name, int64_t n_in, int64_t n_out,
+              std::mt19937 & rng) {
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+    std::vector<float> x(static_cast<size_t>(n_in));
+    for (float & value : x) value = xdist(rng);
+
+    struct Case {
+        const char * name;
+        yuuka_dtype dtype;
+        int row_bytes;
+        float (*ref)(const uint8_t *, const float *, int64_t);
+    } tc;
+    tc.name = name;
+    tc.dtype = dtype;
+    switch (dtype) {
+        case YUUKA_DTYPE_F32: tc.row_bytes = int(n_in * 4); tc.ref = dot_f32; break;
+        case YUUKA_DTYPE_F16: tc.row_bytes = int(n_in * 2); tc.ref = dot_f16; break;
+        case YUUKA_DTYPE_Q8_0: tc.row_bytes = int(n_in / 32 * 34); tc.ref = dot_q8_0; break;
+        case YUUKA_DTYPE_Q4_K: tc.row_bytes = int(n_in / 256 * 144); tc.ref = dot_q4_k; break;
+        case YUUKA_DTYPE_Q5_K: tc.row_bytes = int(n_in / 256 * 176); tc.ref = dot_q5_k; break;
+        case YUUKA_DTYPE_Q6_K: tc.row_bytes = int(n_in / 256 * 210); tc.ref = dot_q6_k; break;
+        default: return false;
+    }
+
+    std::vector<uint8_t> weights(static_cast<size_t>(tc.row_bytes) * n_out);
+    std::vector<float> expected(n_out);
+    for (int64_t row = 0; row < n_out; ++row) {
+        uint8_t * base = weights.data() + row * tc.row_bytes;
+        if (tc.dtype == YUUKA_DTYPE_F32) {
+            for (int64_t i = 0; i < n_in; ++i) {
+                const float value = xdist(rng) * 0.1f;
+                std::memcpy(base + i * 4, &value, sizeof(value));
+            }
+        } else if (tc.dtype == YUUKA_DTYPE_F16) {
+            for (int64_t i = 0; i < n_in; ++i) put_half(base + i * 2, xdist(rng) * 0.1f);
+        } else if (tc.dtype == YUUKA_DTYPE_Q8_0) {
+            for (int64_t b = 0; b < n_in / 32; ++b) {
+                uint8_t * blk = base + b * 34;
+                put_half(blk, 0.03125f);
+                for (int i = 0; i < 32; ++i) blk[2 + i] = uint8_t(rng() % 256);
+            }
+        } else if (tc.dtype == YUUKA_DTYPE_Q4_K) {
+            for (int64_t b = 0; b < n_in / 256; ++b) {
+                uint8_t * blk = base + b * 144;
+                put_half(blk, 0.02f);
+                put_half(blk + 2, 0.01f);
+                for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
+                for (int i = 0; i < 128; ++i) blk[16 + i] = uint8_t(rng() % 256);
+            }
+        } else if (tc.dtype == YUUKA_DTYPE_Q5_K) {
+            for (int64_t b = 0; b < n_in / 256; ++b) {
+                uint8_t * blk = base + b * 176;
+                put_half(blk, 0.02f);
+                put_half(blk + 2, 0.01f);
+                for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
+                for (int i = 0; i < 32; ++i) blk[16 + i] = uint8_t(rng() % 256);
+                for (int i = 0; i < 128; ++i) blk[48 + i] = uint8_t(rng() % 256);
+            }
+        } else if (tc.dtype == YUUKA_DTYPE_Q6_K) {
+            for (int64_t b = 0; b < n_in / 256; ++b) {
+                uint8_t * blk = base + b * 210;
+                for (int i = 0; i < 128; ++i) blk[i] = uint8_t(rng() % 256);
+                for (int i = 0; i < 64; ++i) blk[128 + i] = uint8_t(rng() % 256);
+                for (int i = 0; i < 16; ++i) blk[192 + i] = uint8_t(rng() % 256);
+                put_half(blk + 208, 0.01f);
+            }
+        }
+        expected[row] = tc.ref(base, x.data(), n_in);
+    }
+
+    yuuka_buffer * wbuf = nullptr;
+    yuuka_buffer * xbuf = nullptr;
+    yuuka_buffer * obuf = nullptr;
+    bool ok = check(yuuka_buffer_alloc(device, weights.size(), &wbuf), "alloc weights") &&
+              check(yuuka_buffer_alloc(device, x.size() * 4, &xbuf), "alloc x") &&
+              check(yuuka_buffer_alloc(device, n_out * 4, &obuf), "alloc out") &&
+              check(yuuka_memcpy_h2d(wbuf, weights.data(), weights.size()), "h2d weights") &&
+              check(yuuka_memcpy_h2d(xbuf, x.data(), x.size() * 4), "h2d x") &&
+              check(yuuka_gemv(stream, obuf, xbuf, wbuf, n_in, n_out, tc.dtype, event), "gemv") &&
+              check(yuuka_event_wait(event), "event wait");
+    std::vector<float> got(n_out);
+    ok = ok && check(yuuka_memcpy_d2h(got.data(), obuf, n_out * 4), "d2h");
+    if (ok) {
+        for (int64_t row = 0; row < n_out; ++row) {
+            const float tolerance = 2e-3f * (1.0f + std::fabs(expected[row]));
+            if (std::fabs(got[row] - expected[row]) > tolerance) {
+                std::fprintf(stderr, "%s n_in=%lld n_out=%lld row %lld: got %.6f expected %.6f\n",
+                             tc.name, static_cast<long long>(n_in),
+                             static_cast<long long>(n_out),
+                             static_cast<long long>(row), got[row], expected[row]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    std::printf("%s n_in=%lld n_out=%lld: %s\n", tc.name,
+                static_cast<long long>(n_in), static_cast<long long>(n_out),
+                ok ? "ok" : "FAILED");
+    yuuka_buffer_free(obuf);
+    yuuka_buffer_free(xbuf);
+    yuuka_buffer_free(wbuf);
+    return ok;
+}
+
 int main() {
     yuuka_device * device = nullptr;
     if (yuuka_device_open(0, &device) != YUUKA_OK) {
@@ -201,116 +315,44 @@ int main() {
         !check(yuuka_event_create(device, &event), "event")) {
         return 1;
     }
-
-    constexpr int64_t n_in = 512;
-    constexpr int64_t n_out = 17;
     std::mt19937 rng(1234);
-    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
-    std::vector<float> x(n_in);
-    for (float & value : x) value = xdist(rng);
-
-    struct Case {
-        const char * name;
-        yuuka_dtype dtype;
-        int row_bytes;
-        float (*ref)(const uint8_t *, const float *, int64_t);
-    };
-    const Case cases[] = {
-        {"F16", YUUKA_DTYPE_F16, int(n_in * 2), dot_f16},
-        {"Q8_0", YUUKA_DTYPE_Q8_0, int(n_in / 32 * 34), dot_q8_0},
-        {"Q4_K", YUUKA_DTYPE_Q4_K, int(n_in / 256 * 144), dot_q4_k},
-        {"Q5_K", YUUKA_DTYPE_Q5_K, int(n_in / 256 * 176), dot_q5_k},
-        {"Q6_K", YUUKA_DTYPE_Q6_K, int(n_in / 256 * 210), dot_q6_k},
-    };
-
-    for (const Case & tc : cases) {
-        std::vector<uint8_t> weights(size_t(tc.row_bytes) * n_out);
-        std::vector<float> expected(n_out);
-        for (int64_t row = 0; row < n_out; ++row) {
-            uint8_t * base = weights.data() + row * tc.row_bytes;
-            if (tc.dtype == YUUKA_DTYPE_F16) {
-                for (int64_t i = 0; i < n_in; ++i) put_half(base + i * 2, xdist(rng) * 0.1f);
-            } else if (tc.dtype == YUUKA_DTYPE_Q8_0) {
-                for (int64_t b = 0; b < n_in / 32; ++b) {
-                    uint8_t * blk = base + b * 34;
-                    put_half(blk, 0.03125f);
-                    for (int i = 0; i < 32; ++i) blk[2 + i] = uint8_t(rng() % 256);
-                }
-            } else if (tc.dtype == YUUKA_DTYPE_Q4_K) {
-                for (int64_t b = 0; b < n_in / 256; ++b) {
-                    uint8_t * blk = base + b * 144;
-                    put_half(blk, 0.02f);
-                    put_half(blk + 2, 0.01f);
-                    for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
-                    for (int i = 0; i < 128; ++i) blk[16 + i] = uint8_t(rng() % 256);
-                }
-            } else if (tc.dtype == YUUKA_DTYPE_Q5_K) {
-                for (int64_t b = 0; b < n_in / 256; ++b) {
-                    uint8_t * blk = base + b * 176;
-                    put_half(blk, 0.02f);
-                    put_half(blk + 2, 0.01f);
-                    for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() % 256);
-                    for (int i = 0; i < 32; ++i) blk[16 + i] = uint8_t(rng() % 256);
-                    for (int i = 0; i < 128; ++i) blk[48 + i] = uint8_t(rng() % 256);
-                }
-            } else if (tc.dtype == YUUKA_DTYPE_Q6_K) {
-                for (int64_t b = 0; b < n_in / 256; ++b) {
-                    uint8_t * blk = base + b * 210;
-                    for (int i = 0; i < 128; ++i) blk[i] = uint8_t(rng() % 256);
-                    for (int i = 0; i < 64; ++i) blk[128 + i] = uint8_t(rng() % 256);
-                    for (int i = 0; i < 16; ++i) blk[192 + i] = uint8_t(rng() % 256);
-                    put_half(blk + 208, 0.01f);
-                }
-            }
-            expected[row] = tc.ref(base, x.data(), n_in);
-        }
-
-        yuuka_buffer * wbuf = nullptr;
-        yuuka_buffer * xbuf = nullptr;
-        yuuka_buffer * obuf = nullptr;
-        bool ok = check(yuuka_buffer_alloc(device, weights.size(), &wbuf), "alloc weights") &&
-                  check(yuuka_buffer_alloc(device, x.size() * 4, &xbuf), "alloc x") &&
-                  check(yuuka_buffer_alloc(device, n_out * 4, &obuf), "alloc out") &&
-                  check(yuuka_memcpy_h2d(wbuf, weights.data(), weights.size()), "h2d weights") &&
-                  check(yuuka_memcpy_h2d(xbuf, x.data(), x.size() * 4), "h2d x") &&
-                  check(yuuka_gemv(stream, obuf, xbuf, wbuf, n_in, n_out, tc.dtype, event), "gemv") &&
-                  check(yuuka_event_wait(event), "event wait");
-        std::vector<float> got(n_out);
-        ok = ok && check(yuuka_memcpy_d2h(got.data(), obuf, n_out * 4), "d2h");
-        if (ok) {
-            for (int64_t row = 0; row < n_out; ++row) {
-                const float tolerance = 2e-3f * (1.0f + std::fabs(expected[row]));
-                if (std::fabs(got[row] - expected[row]) > tolerance) {
-                    std::fprintf(stderr, "%s row %lld: got %.6f expected %.6f\n",
-                                 tc.name, static_cast<long long>(row), got[row], expected[row]);
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        std::printf("%s: %s\n", tc.name, ok ? "ok" : "FAILED");
-        yuuka_buffer_free(obuf);
-        yuuka_buffer_free(xbuf);
-        yuuka_buffer_free(wbuf);
-        if (!ok) {
-            yuuka_event_destroy(event);
-            yuuka_stream_destroy(stream);
-            yuuka_device_close(device);
-            return 1;
-        }
+    bool ok = true;
+    const int64_t q8_widths[] = {32, 96, 160, 544};
+    const int64_t k_widths[] = {256, 512, 768};
+    ok = ok && run_case(device, stream, event, YUUKA_DTYPE_F32, "F32", 37, 1, rng);
+    ok = ok && run_case(device, stream, event, YUUKA_DTYPE_F32, "F32", 35, 7, rng);
+    ok = ok && run_case(device, stream, event, YUUKA_DTYPE_F16, "F16", 35, 1, rng);
+    ok = ok && run_case(device, stream, event, YUUKA_DTYPE_F16, "F16", 37, 7, rng);
+    ok = ok && run_case(device, stream, event, YUUKA_DTYPE_F16, "F16", 512, 17, rng);
+    for (int64_t width : q8_widths) {
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q8_0, "Q8_0", width, 1, rng);
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q8_0, "Q8_0", width, 17, rng);
+    }
+    for (int64_t width : k_widths) {
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q4_K, "Q4_K", width, 1, rng);
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q4_K, "Q4_K", width, 17, rng);
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q5_K, "Q5_K", width, 17, rng);
+        ok = ok && run_case(device, stream, event, YUUKA_DTYPE_Q6_K, "Q6_K", width, 17, rng);
     }
 
-    // Invalid shapes must fail explicitly.
     yuuka_buffer * dummy = nullptr;
-    if (check(yuuka_buffer_alloc(device, 4, &dummy), "alloc dummy")) {
-        if (yuuka_gemv(stream, dummy, dummy, dummy, 100, 1, YUUKA_DTYPE_Q4_K, nullptr) != YUUKA_ERR_UNSUPPORTED) {
-            std::fprintf(stderr, "invalid Q4_K width was not rejected\n");
-            return 1;
+    if (ok && check(yuuka_buffer_alloc(device, 4, &dummy), "alloc dummy")) {
+        const struct { yuuka_dtype dtype; uint64_t width; } invalid[] = {
+            {YUUKA_DTYPE_Q4_K, 100}, {YUUKA_DTYPE_Q5_K, 100},
+            {YUUKA_DTYPE_Q6_K, 100}, {YUUKA_DTYPE_Q8_0, 33},
+        };
+        for (const auto & item : invalid) {
+            if (yuuka_gemv(stream, dummy, dummy, dummy, item.width, 1, item.dtype, nullptr) !=
+                YUUKA_ERR_UNSUPPORTED) {
+                std::fprintf(stderr, "invalid width %llu for dtype %u was not rejected\n",
+                             static_cast<unsigned long long>(item.width), item.dtype);
+                ok = false;
+            }
         }
         yuuka_buffer_free(dummy);
     }
     yuuka_event_destroy(event);
     yuuka_stream_destroy(stream);
     yuuka_device_close(device);
-    return 0;
+    return ok ? 0 : 1;
 }
