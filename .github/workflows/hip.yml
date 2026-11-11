@@ -1,0 +1,35 @@
+name: hip
+
+# The HIP tier requires the reference gfx1151 host with ROCm, rocBLAS, and
+# rocWMMA installed. It is manual and self-hosted so pull requests from forks
+# cannot execute on the shared GPU runner.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  gfx1151:
+    name: gfx1151 native and HIP tests
+    runs-on: [self-hosted, linux, x64, gfx1151]
+    env:
+      YUUKA_TEST_MODEL: ${{ secrets.YUUKA_TEST_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Configure native library
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build native library and tests
+        run: cmake --build build -j"$(nproc)"
+      - name: Run native tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Build HIP-tagged Go packages
+        run: go build -tags hip ./...
+      - name: Run HIP-tagged Go tests
+        run: go test -tags hip -count=1 ./backend/hip ./engine/gpu

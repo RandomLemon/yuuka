@@ -328,15 +328,21 @@ explicitly:
 | **GPU performance** | gfx1151 runner, controlled power profile | Tracked benchmark subset, nightly or per-release |
 | **Compatibility** | gfx1151 runner | llama.cpp HIP/Vulkan comparison on the same GGUF |
 
-Current status: no CI configuration is checked in yet. Go unit tests and native
-CTest binaries are run locally; GPU tiers are run manually on the reference
-machine. Real-model tests require `YUUKA_TEST_MODEL`, and no fixture download or
-generation script is checked in yet.
+Current status: the CPU tier is checked in as `.github/workflows/ci.yml` and
+runs formatting, `go vet`, `go build`, and `go test -race` on every push and
+pull request. The gfx1151 tier is `.github/workflows/hip.yml`; it is manual and
+nightly because it requires a self-hosted ROCm runner with rocBLAS and rocWMMA.
+The HIP workflow builds the native library, runs `ctest`, builds the `hip` Go
+tags, and runs the HIP-tagged tests. Set the `YUUKA_TEST_MODEL` repository
+secret to enable the real-model cases on that runner.
 
-Large model files are not committed to the repository. When the CI tiers are
-implemented, fixtures will be downloaded by hash or generated synthetically.
-GPU tests must skip with a clear message when no supported device is present;
-they must not silently pass.
+Tests that need a model fall back to a generated tiny GGUF fixture when
+`YUUKA_TEST_MODEL` is unset. The fixture is produced by `tests/fixture` and is
+not committed as a model artifact. Real-model coverage remains opt-in.
+
+Large model files are not committed to the repository. GPU tests must skip with
+a clear message when no supported device is present; they must not silently
+pass.
 
 ## 11. Milestone acceptance
 
