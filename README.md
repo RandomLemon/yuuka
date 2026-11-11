@@ -44,7 +44,7 @@ The following are rejected explicitly rather than approximated:
 
 - other architectures such as Qwen3 dense, Qwen2, Llama, Gemma, MoE, or
   DeepSeek-style models;
-- SentencePiece tokenizers and non-Qwen chat templates;
+- non-Qwen chat templates;
 - unsupported tensor types such as `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K`,
   `Q3_K`, `Q8_K`, and IQ formats;
 - image, audio, tool, and other non-text chat content.
@@ -271,8 +271,8 @@ skip with exit code 77 when the requested HIP device is unavailable.
 
 - The supported architecture is `qwen35` only; there are no dense Llama, Qwen3,
   Gemma, MoE, or multimodal model adapters.
-- The tokenizer implementation covers Qwen byte-level BPE only. SentencePiece
-  and non-Qwen chat templates are not implemented.
+- The tokenizer implementation covers Qwen byte-level BPE and Llama-family
+  SentencePiece vocabularies. Non-Qwen chat templates are not implemented.
 - Prefill executes one token at a time. There is no batched prefill, WMMA or
   rocBLAS GEMM path, or Flash Attention.
 - KV cache is contiguous `F32`. Paged KV, quantized KV, prefix caching, and

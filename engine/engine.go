@@ -171,7 +171,7 @@ func (e *Engine) Generate(ctx context.Context, prompt []int32, opts GenerateOpti
 			result.FinishReason = "stop"
 			break
 		}
-		piece, err := e.Tokenizer.Decode([]int32{token})
+		piece, err := e.Tokenizer.DecodeToken(token)
 		if err != nil {
 			return nil, err
 		}

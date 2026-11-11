@@ -379,7 +379,10 @@ func parseFile(path string, data []byte) (*fileMeta, error) {
 
 	dataStart := alignUp(uint64(c.off), alignment)
 	if dataStart > uint64(len(data)) {
-		return nil, fmt.Errorf("%w: %s: tensor data starts beyond end of file", ErrMalformed, path)
+		if tensorCount != 0 {
+			return nil, fmt.Errorf("%w: %s: tensor data starts beyond end of file", ErrMalformed, path)
+		}
+		dataStart = uint64(len(data))
 	}
 	return &fileMeta{
 		version:   version,

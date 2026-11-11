@@ -150,9 +150,10 @@ support the tokenizer families used by the target models:
 - chat template rendering from GGUF metadata;
 - BOS/EOS insertion rules and stop conditions.
 
-Current implementation: Qwen2/Qwen3.5 GPT-2 byte-level BPE, special-token
-matching, byte fallback, and Qwen chat rendering are implemented. SentencePiece
-vocabularies and non-Qwen chat templates are rejected explicitly and are not yet
+Current implementation: Qwen2/Qwen3.5 GPT-2 byte-level BPE and Llama-family
+SentencePiece vocabularies are implemented, including special-token matching,
+byte fallback, SentencePiece scores, dummy-prefix handling, and Qwen chat
+rendering. Non-Qwen chat templates are rejected explicitly and are not yet
 implemented.
 
 Correctness checks must compare **token IDs**, not only decoded text, against a

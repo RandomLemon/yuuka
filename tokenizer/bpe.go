@@ -19,20 +19,25 @@ var ErrUnsupported = fmt.Errorf("unsupported tokenizer")
 
 // Tokenizer is immutable after construction and safe for concurrent encoding.
 type Tokenizer struct {
-	vocab    []string
-	ids      map[string]int32
-	merges   map[string]int
-	byteRune [256]rune
-	runeByte map[rune]byte
-	specials []special
-	eos      int32
-	bos      int32
-	pad      int32
-	model    string
-	pre      string
-	template string
-	scores   []float32
-	addBOS   bool
+	vocab          []string
+	ids            map[string]int32
+	merges         map[string]int
+	byteRune       [256]rune
+	runeByte       map[rune]byte
+	specials       []special
+	eos            int32
+	bos            int32
+	pad            int32
+	model          string
+	pre            string
+	template       string
+	scores         []float32
+	tokenTypes     []int64
+	byteIDs        [256]int32
+	byteOfID       map[int32]byte
+	spm            bool
+	addSpacePrefix bool
+	addBOS         bool
 }
 
 type special struct {
@@ -46,17 +51,24 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if model != "gpt2" {
-		return nil, fmt.Errorf("%w: tokenizer model %q (only gpt2 byte-level BPE is implemented)", ErrUnsupported, model)
+	spm := model == "llama" || model == "spm"
+	if model != "gpt2" && !spm {
+		return nil, fmt.Errorf("%w: tokenizer model %q", ErrUnsupported, model)
 	}
 	pre, _ := r.String("tokenizer.ggml.pre")
 	if pre == "" {
-		pre = "gpt2"
+		if spm {
+			pre = "default"
+		} else {
+			pre = "gpt2"
+		}
 	}
-	switch pre {
-	case "qwen35", "qwen2":
-	default:
-		return nil, fmt.Errorf("%w: tokenizer pre-tokenizer %q", ErrUnsupported, pre)
+	if !spm {
+		switch pre {
+		case "qwen35", "qwen2":
+		default:
+			return nil, fmt.Errorf("%w: tokenizer pre-tokenizer %q", ErrUnsupported, pre)
+		}
 	}
 	tokensValue, ok := r.MetadataValue("tokenizer.ggml.tokens")
 	if !ok {
@@ -71,17 +83,26 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 	}
 
 	t := &Tokenizer{
-		vocab:    tokens,
-		ids:      make(map[string]int32, len(tokens)),
-		merges:   make(map[string]int, 256),
-		runeByte: make(map[rune]byte, 256),
-		model:    model,
-		pre:      pre,
-		eos:      -1,
-		bos:      -1,
-		pad:      -1,
+		vocab:          tokens,
+		ids:            make(map[string]int32, len(tokens)),
+		merges:         make(map[string]int, 256),
+		runeByte:       make(map[rune]byte, 256),
+		model:          model,
+		pre:            pre,
+		byteIDs:        [256]int32{},
+		byteOfID:       make(map[int32]byte, 256),
+		spm:            spm,
+		addSpacePrefix: spm,
+		eos:            -1,
+		bos:            -1,
+		pad:            -1,
 	}
-	t.byteRune, t.runeByte = buildByteMaps()
+	for i := range t.byteIDs {
+		t.byteIDs[i] = -1
+	}
+	if !spm {
+		t.byteRune, t.runeByte = buildByteMaps()
+	}
 	for i, token := range tokens {
 		if _, exists := t.ids[token]; exists {
 			return nil, fmt.Errorf("duplicate vocabulary token %q", token)
@@ -89,28 +110,30 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 		t.ids[token] = int32(i)
 	}
 
-	mergeValue, ok := r.MetadataValue("tokenizer.ggml.merges")
-	if !ok {
-		return nil, fmt.Errorf("%w: missing tokenizer.ggml.merges", ErrUnsupported)
-	}
-	merges, err := mergeValue.AsStrings()
-	if err != nil {
-		return nil, fmt.Errorf("tokenizer.ggml.merges: %w", err)
-	}
-	for i, merge := range merges {
-		space := strings.IndexByte(merge, ' ')
-		if space <= 0 || space == len(merge)-1 {
-			return nil, fmt.Errorf("merge %d has invalid format %q", i, merge)
+	if !spm {
+		mergeValue, ok := r.MetadataValue("tokenizer.ggml.merges")
+		if !ok {
+			return nil, fmt.Errorf("%w: missing tokenizer.ggml.merges", ErrUnsupported)
 		}
-		left, right := merge[:space], merge[space+1:]
-		if strings.IndexByte(right, ' ') >= 0 {
-			return nil, fmt.Errorf("merge %d has more than two symbols: %q", i, merge)
+		merges, err := mergeValue.AsStrings()
+		if err != nil {
+			return nil, fmt.Errorf("tokenizer.ggml.merges: %w", err)
 		}
-		key := pairKey(left, right)
-		if _, exists := t.merges[key]; exists {
-			return nil, fmt.Errorf("duplicate merge %q", merge)
+		for i, merge := range merges {
+			space := strings.IndexByte(merge, ' ')
+			if space <= 0 || space == len(merge)-1 {
+				return nil, fmt.Errorf("merge %d has invalid format %q", i, merge)
+			}
+			left, right := merge[:space], merge[space+1:]
+			if strings.IndexByte(right, ' ') >= 0 {
+				return nil, fmt.Errorf("merge %d has more than two symbols: %q", i, merge)
+			}
+			key := pairKey(left, right)
+			if _, exists := t.merges[key]; exists {
+				return nil, fmt.Errorf("duplicate merge %q", merge)
+			}
+			t.merges[key] = i
 		}
-		t.merges[key] = i
 	}
 
 	if value, ok := r.MetadataValue("tokenizer.ggml.eos_token_id"); ok {
@@ -140,6 +163,12 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 			t.addBOS = add
 		}
 	}
+	if value, ok := r.MetadataValue("tokenizer.ggml.add_space_prefix"); ok {
+		add, err := value.AsBool()
+		if err == nil {
+			t.addSpacePrefix = add
+		}
+	}
 	if value, ok := r.MetadataValue("tokenizer.chat_template"); ok {
 		text, err := value.AsString()
 		if err == nil {
@@ -148,12 +177,18 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 	}
 	if value, ok := r.MetadataValue("tokenizer.ggml.scores"); ok {
 		scores, err := value.AsFloats()
-		if err == nil && len(scores) == len(tokens) {
-			t.scores = make([]float32, len(scores))
-			for i := range scores {
-				t.scores[i] = float32(scores[i])
-			}
+		if err != nil {
+			return nil, fmt.Errorf("tokenizer.ggml.scores: %w", err)
 		}
+		if len(scores) != len(tokens) {
+			return nil, fmt.Errorf("score count %d does not match vocabulary %d", len(scores), len(tokens))
+		}
+		t.scores = make([]float32, len(scores))
+		for i := range scores {
+			t.scores[i] = float32(scores[i])
+		}
+	} else if spm {
+		return nil, fmt.Errorf("%w: missing tokenizer.ggml.scores", ErrUnsupported)
 	}
 
 	if value, ok := r.MetadataValue("tokenizer.ggml.token_type"); ok {
@@ -164,10 +199,25 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 		if len(types) != len(tokens) {
 			return nil, fmt.Errorf("token_type count %d does not match vocabulary %d", len(types), len(tokens))
 		}
+		t.tokenTypes = types
 		for i, typ := range types {
 			switch typ {
 			case 3, 4: // control and user-defined tokens are matched literally
 				t.specials = append(t.specials, special{text: tokens[i], id: int32(i)})
+			case 6:
+				if spm {
+					if byteValue, ok := parseByteToken(tokens[i]); ok {
+						t.byteIDs[byteValue] = int32(i)
+						t.byteOfID[int32(i)] = byteValue
+					}
+				}
+			}
+		}
+	}
+	if spm {
+		for i, id := range t.byteIDs {
+			if id < 0 {
+				return nil, fmt.Errorf("%w: SentencePiece vocabulary has no byte token for 0x%02X", ErrUnsupported, i)
 			}
 		}
 	}
@@ -233,16 +283,26 @@ func (t *Tokenizer) TokenText(id int32) (string, error) {
 func (t *Tokenizer) Encode(text string) ([]int32, error) {
 	out := make([]int32, 0, len(text)/3+1)
 	start := 0
+	prevSpecial := true
+	encodeRaw := func(raw string) error {
+		if raw == "" {
+			return nil
+		}
+		if t.spm && prevSpecial && t.addSpacePrefix {
+			raw = " " + raw
+		}
+		prevSpecial = false
+		return t.encodeOrdinary(raw, &out)
+	}
 	for i := 0; i < len(text); {
 		if id, n, ok := t.matchSpecial(text[i:]); ok {
-			if start < i {
-				if err := t.encodeOrdinary(text[start:i], &out); err != nil {
-					return nil, err
-				}
+			if err := encodeRaw(text[start:i]); err != nil {
+				return nil, err
 			}
 			out = append(out, id)
 			i += n
 			start = i
+			prevSpecial = true
 			continue
 		}
 		_, width := utf8.DecodeRuneInString(text[i:])
@@ -252,7 +312,7 @@ func (t *Tokenizer) Encode(text string) ([]int32, error) {
 		i += width
 	}
 	if start < len(text) {
-		if err := t.encodeOrdinary(text[start:], &out); err != nil {
+		if err := encodeRaw(text[start:]); err != nil {
 			return nil, err
 		}
 	}
@@ -269,6 +329,9 @@ func (t *Tokenizer) matchSpecial(s string) (int32, int, bool) {
 }
 
 func (t *Tokenizer) encodeOrdinary(text string, out *[]int32) error {
+	if t.spm {
+		return t.encodeSPM(text, out)
+	}
 	for _, piece := range t.preTokenize(text) {
 		ids, err := t.bpe(piece)
 		if err != nil {
@@ -311,9 +374,22 @@ func (t *Tokenizer) bpe(piece string) ([]int32, error) {
 	return ids, nil
 }
 
+// DecodeToken converts one token ID to its text piece. Unlike Decode, it does
+// not remove a SentencePiece dummy-prefix space, so callers can stream pieces
+// without losing inter-token spaces.
+func (t *Tokenizer) DecodeToken(id int32) (string, error) {
+	if t.spm {
+		return t.decodeSPMToken(id)
+	}
+	return t.Decode([]int32{id})
+}
+
 // Decode converts token IDs to bytes. Invalid IDs return an error; the returned
 // string may contain invalid UTF-8 when the model emits a partial byte token.
 func (t *Tokenizer) Decode(ids []int32) (string, error) {
+	if t.spm {
+		return t.decodeSPM(ids)
+	}
 	var out strings.Builder
 	for _, id := range ids {
 		if id < 0 || int(id) >= len(t.vocab) {
