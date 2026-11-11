@@ -34,7 +34,8 @@ type Budget interface {
 }
 
 // StepStats reports work performed by one task call. Durations cover only the
-// corresponding phase; SamplingTime is part of DecodeTime.
+// corresponding phase; SamplingTime is reported separately and is not included
+// in DecodeTime or PrefillTime.
 type StepStats struct {
 	PromptTokens int
 	OutputTokens int
@@ -85,6 +86,34 @@ type Config struct {
 	QueueTimeout    time.Duration
 	Budget          Budget
 	OnStep          func(Step)
+}
+
+// Limits is the effective scheduling configuration after defaults are applied.
+// It is safe to expose to observability endpoints; callbacks and the budget
+// interface are omitted.
+type Limits struct {
+	MaxActive       int
+	MaxQueue        int
+	MaxBatch        int
+	PrefillChunk    int
+	PrefillPerCycle int
+	DecodePerCycle  int
+	RequestTimeout  time.Duration
+	QueueTimeout    time.Duration
+}
+
+// Limits returns the scheduler configuration in effect for this instance.
+func (s *Scheduler) Limits() Limits {
+	return Limits{
+		MaxActive:       s.cfg.MaxActive,
+		MaxQueue:        s.cfg.MaxQueue,
+		MaxBatch:        s.cfg.MaxBatch,
+		PrefillChunk:    s.cfg.PrefillChunk,
+		PrefillPerCycle: s.cfg.PrefillPerCycle,
+		DecodePerCycle:  s.cfg.DecodePerCycle,
+		RequestTimeout:  s.cfg.RequestTimeout,
+		QueueTimeout:    s.cfg.QueueTimeout,
+	}
 }
 
 // Step records the explicit batch composition of one scheduler iteration.

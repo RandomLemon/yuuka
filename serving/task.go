@@ -69,7 +69,11 @@ func newGenerationTask(
 	initialState []byte,
 	initialPosition int,
 	sink func(int32, string) error,
+	started time.Time,
 ) *generationTask {
+	if started.IsZero() {
+		started = time.Now()
+	}
 	stopSet := make(map[int32]struct{}, len(stops)+1)
 	for _, token := range stops {
 		stopSet[token] = struct{}{}
@@ -87,7 +91,7 @@ func newGenerationTask(
 		stops:        stopSet,
 		sink:         sink,
 		filter:       newStopFilter(stopStrings),
-		started:      time.Now(),
+		started:      started,
 		promptOffset: initialPosition,
 		initial:      initialLogits,
 		promptState:  initialState,

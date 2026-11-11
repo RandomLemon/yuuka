@@ -192,6 +192,13 @@ func TestGPUCancellationReleasesBlocks(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	stats := manager.Metrics().KV
+	if stats.Allocated != stats.Released {
+		t.Fatalf("cancelled request left allocation imbalance: %+v", stats)
+	}
+	if active := manager.Metrics().Scheduler.Active; active != 0 {
+		t.Fatalf("cancelled request still active: %d", active)
+	}
 }
 
 func TestGPURepeatedRequestsDoNotGrowMemory(t *testing.T) {

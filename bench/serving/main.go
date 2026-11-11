@@ -11,7 +11,12 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -179,6 +184,9 @@ func main() {
 	fmt.Printf("model=%s size=%d sha256=%s backend=%s context=%d block=%d blocks=%d concurrency=%d requests=%d prompt=%d decode=%d prefix_cache=%v graph=%v\n",
 		*modelPath, size, key, *backendName, *contextSize, *blockSize, *kvBlocks,
 		*concurrency, *requests, *promptTokens, *decodeTokens, *prefixCache, *graph)
+	fmt.Printf("metadata commit=%s go=%s host_cpu=%q kernel=%s rocm_hip=%s power=%s sampling=greedy warmup=%d requests=%d concurrency=%d\n",
+		buildRevision(), runtime.Version(), hostCPU(), hostKernel(), rocmVersion(), powerProfile(),
+		*warmup, *requests, *concurrency)
 	printSummary("latency", valid, func(s sample) time.Duration { return s.latency })
 	printSummary("queue_wait", valid, func(s sample) time.Duration { return s.queue })
 	printSummary("ttft", valid, func(s sample) time.Duration { return s.ttft })
@@ -234,4 +242,90 @@ func fileIdentity(path string) (string, int64, error) {
 		return "", 0, err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), size, nil
+}
+
+// buildRevision reports the VCS revision embedded by the Go toolchain. A dirty
+// working tree is marked so a result cannot be mistaken for a clean checkout.
+func buildRevision() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	revision, modified := "", false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if revision == "" {
+		return "unknown"
+	}
+	if modified {
+		return revision + "-dirty"
+	}
+	return revision
+}
+
+func hostKernel() string {
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func hostCPU() string {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return "unknown"
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "model name") {
+			if _, value, ok := strings.Cut(line, ":"); ok {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return "unknown"
+}
+
+func rocmVersion() string {
+	candidates := []string{"/opt/rocm/bin/hipconfig"}
+	if matches, _ := filepath.Glob("/opt/rocm/*/bin/hipconfig"); len(matches) > 0 {
+		candidates = append(candidates, matches...)
+	}
+	candidates = append(candidates, "hipconfig")
+	for _, candidate := range candidates {
+		output, err := exec.Command(candidate, "--version").Output()
+		if err != nil {
+			continue
+		}
+		if version := strings.TrimSpace(string(output)); version != "" {
+			return version
+		}
+	}
+	matches, _ := filepath.Glob("/opt/rocm/*/.info/version")
+	for _, path := range matches {
+		if data, err := os.ReadFile(path); err == nil {
+			if version := strings.TrimSpace(string(data)); version != "" {
+				return version
+			}
+		}
+	}
+	return "unknown"
+}
+
+func powerProfile() string {
+	matches, _ := filepath.Glob("/sys/class/drm/card*/device/power_dpm_force_performance_level")
+	for _, path := range matches {
+		if data, err := os.ReadFile(path); err == nil {
+			if profile := strings.TrimSpace(string(data)); profile != "" {
+				return profile
+			}
+		}
+	}
+	return "unknown"
 }

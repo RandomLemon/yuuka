@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/yuuka-ai/yuuka/engine"
 	"github.com/yuuka-ai/yuuka/memory"
@@ -171,6 +172,7 @@ func (m *Manager) CheckAdmission(promptTokens, outputTokens int) error {
 // deltas from the scheduler goroutine. A non-nil error may accompany a partial
 // Result when generation failed or was cancelled.
 func (m *Manager) Generate(ctx context.Context, req Request) (*Result, error) {
+	arrival := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -202,7 +204,7 @@ func (m *Manager) Generate(ctx context.Context, req Request) (*Result, error) {
 		PromptTokens: len(req.Prompt),
 		MaxOutput:    maxTokens,
 		Build: func(context.Context) (scheduler.Task, error) {
-			task, err := m.build(req, maxTokens)
+			task, err := m.build(req, maxTokens, arrival)
 			if err != nil {
 				return nil, err
 			}
@@ -237,7 +239,7 @@ func (m *Manager) Generate(ctx context.Context, req Request) (*Result, error) {
 
 // build allocates the request block table, attaches a prefix hit, and creates
 // the backend sequence.
-func (m *Manager) build(req Request, maxTokens int) (*managedTask, error) {
+func (m *Manager) build(req Request, maxTokens int, started time.Time) (*managedTask, error) {
 	table := memory.NewTable(m.alloc)
 	cached := 0
 	var state []byte
@@ -269,7 +271,7 @@ func (m *Manager) build(req Request, maxTokens int) (*managedTask, error) {
 		return nil, err
 	}
 	task := newGenerationTask(req.ID, req.Prompt, maxTokens, seq, req.Sampler, m.tok,
-		req.StopTokens, req.StopStrings, req.IgnoreEOS, logits, state, cached, req.Sink)
+		req.StopTokens, req.StopStrings, req.IgnoreEOS, logits, state, cached, req.Sink, started)
 	return &managedTask{generationTask: task, manager: m, table: table}, nil
 }
 
@@ -344,6 +346,31 @@ func (m *Manager) Metrics() Metrics {
 	}
 	if m.cache != nil {
 		out.Prefix = m.cache.Stats()
+	}
+	return out
+}
+
+// Limits returns the effective scheduler, KV, and prefix-cache configuration.
+func (m *Manager) Limits() Limits {
+	sched := m.sched.Limits()
+	out := Limits{
+		ContextSize:           m.opts.ContextSize,
+		BlockSize:             m.backend.BlockSize(),
+		KVBlocks:              m.alloc.Blocks(),
+		MaxActive:             sched.MaxActive,
+		MaxQueue:              sched.MaxQueue,
+		MaxBatch:              sched.MaxBatch,
+		PrefillChunk:          sched.PrefillChunk,
+		PrefillPerCycle:       sched.PrefillPerCycle,
+		DecodePerCycle:        sched.DecodePerCycle,
+		RequestTimeoutSeconds: sched.RequestTimeout.Seconds(),
+		QueueTimeoutSeconds:   sched.QueueTimeout.Seconds(),
+		PrefixEnabled:         m.cache != nil,
+	}
+	if m.cache != nil {
+		stats := m.cache.Stats()
+		out.PrefixEntries = stats.MaxEntries
+		out.PrefixBlocks = stats.MaxBlocks
 	}
 	return out
 }

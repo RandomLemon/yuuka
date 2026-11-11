@@ -131,8 +131,9 @@ Implemented and tested:
   rocBLAS SGEMM, and a rocWMMA FP16 tile.
 - Prefill performance curves at 128-32768 prompt tokens, resource usage, and a
   same-GGUF comparison with llama.cpp HIP and Vulkan.
-- Paged KV with a block allocator, continuous batching, a collision-safe prefix
-  cache, opt-in HIP Graph replay, and an OpenAI-compatible server.
+- Paged KV with a block allocator, iteration-level continuous scheduling, a
+  collision-safe prefix cache, opt-in HIP Graph replay, and an
+  OpenAI-compatible server.
 - Opt-in F16 and Q8_0 KV formats with CPU and HIP write/attention kernels.
 - `qwen3moe` HIP execution with top-k routing, per-expert assignment buckets,
   and grouped expert kernels that keep expert weights packed.

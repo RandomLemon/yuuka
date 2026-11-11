@@ -326,6 +326,14 @@ func TestHealthMetricsAndPprof(t *testing.T) {
 	if health.StatusCode != http.StatusOK || healthPayload["status"] != "ok" {
 		t.Fatalf("health %d %+v", health.StatusCode, healthPayload)
 	}
+	limits, ok := healthPayload["limits"].(map[string]any)
+	if !ok {
+		t.Fatalf("health limits missing: %+v", healthPayload)
+	}
+	if limits["max_active"] != float64(2) || limits["max_queue"] != float64(4) ||
+		limits["prefill_chunk"] != float64(16) {
+		t.Fatalf("health limits = %+v", limits)
+	}
 
 	metrics, err := http.Get(httpServer.URL + "/metrics")
 	if err != nil {
@@ -340,6 +348,9 @@ func TestHealthMetricsAndPprof(t *testing.T) {
 		"yuuka_kv_blocks_used",
 		"yuuka_prefix_hits_total",
 		"yuuka_sampling_seconds_total",
+		"yuuka_max_concurrency",
+		"yuuka_max_queue",
+		"yuuka_prefix_max_entries",
 	} {
 		if !strings.Contains(string(data), name) {
 			t.Fatalf("metrics missing %s:\n%s", name, data)

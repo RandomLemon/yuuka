@@ -247,6 +247,7 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics := s.manager.Metrics()
+	limits := s.manager.Limits()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":       "ok",
 		"model":        s.modelName,
@@ -260,6 +261,7 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"active":       metrics.Scheduler.Active,
 		"kv_blocks":    metrics.KV.Total,
 		"kv_used":      metrics.KV.Used,
+		"limits":       limits,
 	})
 }
 
@@ -270,6 +272,7 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	metrics := s.manager.Metrics()
+	limits := s.manager.Limits()
 	sched := metrics.Scheduler
 	kv := metrics.KV
 	prefix := metrics.Prefix
@@ -321,6 +324,16 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE yuuka_prefix_evictions_total counter\nyuuka_prefix_evictions_total %d\n", prefix.Evictions)
 	fmt.Fprintf(w, "# TYPE yuuka_model_loaded gauge\nyuuka_model_loaded 1\n")
 	fmt.Fprintf(w, "# TYPE yuuka_context_size gauge\nyuuka_context_size %d\n", s.contextSize)
+	fmt.Fprintf(w, "# TYPE yuuka_max_concurrency gauge\nyuuka_max_concurrency %d\n", limits.MaxActive)
+	fmt.Fprintf(w, "# TYPE yuuka_max_queue gauge\nyuuka_max_queue %d\n", limits.MaxQueue)
+	fmt.Fprintf(w, "# TYPE yuuka_max_batch gauge\nyuuka_max_batch %d\n", limits.MaxBatch)
+	fmt.Fprintf(w, "# TYPE yuuka_prefill_chunk gauge\nyuuka_prefill_chunk %d\n", limits.PrefillChunk)
+	fmt.Fprintf(w, "# TYPE yuuka_prefill_per_cycle gauge\nyuuka_prefill_per_cycle %d\n", limits.PrefillPerCycle)
+	fmt.Fprintf(w, "# TYPE yuuka_decode_per_cycle gauge\nyuuka_decode_per_cycle %d\n", limits.DecodePerCycle)
+	fmt.Fprintf(w, "# TYPE yuuka_request_timeout_seconds gauge\nyuuka_request_timeout_seconds %f\n", limits.RequestTimeoutSeconds)
+	fmt.Fprintf(w, "# TYPE yuuka_queue_timeout_seconds gauge\nyuuka_queue_timeout_seconds %f\n", limits.QueueTimeoutSeconds)
+	fmt.Fprintf(w, "# TYPE yuuka_prefix_max_entries gauge\nyuuka_prefix_max_entries %d\n", limits.PrefixEntries)
+	fmt.Fprintf(w, "# TYPE yuuka_prefix_max_blocks gauge\nyuuka_prefix_max_blocks %d\n", limits.PrefixBlocks)
 	fmt.Fprintf(w, "# TYPE yuuka_uptime_seconds gauge\nyuuka_uptime_seconds %f\n", time.Since(s.started).Seconds())
 }
 

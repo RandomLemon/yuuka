@@ -12,16 +12,17 @@ Current implementation:
   request, queue, batch, chunk, timeout, and concurrency limits.
 - Paged KV cache: a reference-counted block allocator, per-request immutable
   block tables, shared prefix blocks, and explicit release on cancellation and
-  failure. The current pool is FP32; FP16 and quantized KV remain extension
-  points.
+  failure. The pool defaults to FP32; F16 and Q8_0 are opt-in through
+  `--kv-type`.
 - Prefix cache keyed by the model identity, block size, and exact token prefix.
   Entries retain KV blocks, the recurrent state snapshot, and the prompt logits.
   Reuse is longest-prefix and collision-safe (full token comparison), with LRU
   eviction under block pressure.
-- Continuous batching at the scheduler level: prefill and decode steps are
+- Iteration-level continuous scheduling: prefill and decode steps are
   interleaved between requests, and each iteration records its batch
   composition. One model stream executes one request plan at a time; mixed
-  prefill/decode shapes are not submitted to a single kernel batch.
+  prefill/decode shapes are not submitted to a single kernel batch. This is not
+  fused multi-request batching.
 - HIP Graph capture and replay for decode, using device-resident token and
   position parameters. Graph capture is opt-in because the Phase 4
   measurements on Qwen3.5-4B Q4_K_M showed no material decode gain at 256
@@ -130,15 +131,20 @@ Implementation policy:
 | `--graph` | false | Enable HIP Graph capture/replay with fallback |
 | `--model-key` | file SHA-256 | Override the prefix-cache model identity |
 
-The HTTP request body limit is 8 MiB. Limits are reported by `/healthz` and
-`/metrics`, and rejected requests include an opaque request ID.
+The HTTP request body limit is 8 MiB. Effective limits are reported in the
+`limits` object of `/healthz` and as `yuuka_max_concurrency`, `yuuka_max_queue`,
+`yuuka_max_batch`, `yuuka_prefill_chunk`, `yuuka_prefill_per_cycle`,
+`yuuka_decode_per_cycle`, `yuuka_request_timeout_seconds`,
+`yuuka_queue_timeout_seconds`, `yuuka_prefix_max_entries`, and
+`yuuka_prefix_max_blocks` gauges on `/metrics`. Rejected requests include an
+opaque request ID.
 
 ## 5. Scheduling modes
 
 | Mode | Goal | Batch policy |
 | --- | --- | --- |
 | **Latency** | Minimize TTFT and TPOT for one user | Small batches; prioritize the active request; avoid unnecessary prefill interleaving |
-| **Throughput** | Maximize aggregate tokens/s | Continuous batching; reuse weights across requests; interleave prefill and decode within budget |
+| **Throughput** | Maximize aggregate tokens/s | Iteration-level interleaving; reuse weights across requests; interleave prefill and decode within budget. Fused multi-request batching is deferred. |
 
 The mode is a server-level or request-class configuration. It must not change
 model semantics or numerical results.
@@ -160,12 +166,13 @@ latency/throughput mode switch is not exposed yet.
 - Metrics and per-request results record queue wait, prefill, decode, and
   sampling separately.
 
-## 6. Continuous batching and chunked prefill
+## 6. Iteration-level continuous scheduling and chunked prefill
 
-Continuous batching admits new requests between decode steps rather than
-waiting for the entire batch to finish. The batch is recomposed as requests
-arrive, complete, or cancel. Every iteration records its decode and prefill
-request IDs through the scheduler's `OnStep` hook.
+Iteration-level continuous scheduling admits new requests between decode steps
+rather than waiting for the entire batch to finish. The active set is recomposed
+as requests arrive, complete, or cancel. Every iteration records its decode and
+prefill request IDs through the scheduler's `OnStep` hook. This is scheduler
+interleaving, not fused multi-request execution.
 
 Requirements and current behavior:
 
@@ -336,7 +343,10 @@ The scheduler records:
 
 - queue depth, active requests, last and maximum batch size, maximum active;
 - queue wait, prefill, decode, and sampling totals;
-- TTFT and TPOT P50/P95/P99 and maximum over a bounded sample window;
+- TTFT and TPOT P50/P95/P99 and maximum over a bounded sample window. TTFT is
+  measured from request arrival and includes queue wait and prefill; queue wait
+  is also reported separately. Sampling time is reported separately and is not
+  included in prefill or decode time;
 - prompt and generated token totals;
 - submissions, admissions, completions, failures, cancellations, timeouts,
   queue-full rejections, and capacity rejections.

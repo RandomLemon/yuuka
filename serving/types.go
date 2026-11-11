@@ -96,3 +96,23 @@ type Metrics struct {
 	Model      string            `json:"model"`
 	MaxContext int               `json:"max_context"`
 }
+
+// Limits is the effective configuration reported by health and metrics
+// endpoints. Durations are seconds so they serialize cleanly as JSON and
+// Prometheus gauges.
+type Limits struct {
+	ContextSize           int     `json:"context_size"`
+	BlockSize             int     `json:"block_size"`
+	KVBlocks              int     `json:"kv_blocks"`
+	MaxActive             int     `json:"max_active"`
+	MaxQueue              int     `json:"max_queue"`
+	MaxBatch              int     `json:"max_batch"`
+	PrefillChunk          int     `json:"prefill_chunk"`
+	PrefillPerCycle       int     `json:"prefill_per_cycle"`
+	DecodePerCycle        int     `json:"decode_per_cycle"`
+	RequestTimeoutSeconds float64 `json:"request_timeout_s"`
+	QueueTimeoutSeconds   float64 `json:"queue_timeout_s"`
+	PrefixEnabled         bool    `json:"prefix_enabled"`
+	PrefixEntries         int     `json:"prefix_entries"`
+	PrefixBlocks          int     `json:"prefix_blocks"`
+}

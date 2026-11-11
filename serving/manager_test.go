@@ -195,6 +195,56 @@ func TestConcurrentRequestsMatchIsolatedRuns(t *testing.T) {
 	}
 }
 
+func TestTimeToFirstIncludesQueueWait(t *testing.T) {
+	h := newTinyHarness(t)
+	backend, err := NewQwen35Backend(h.model, "tiny-ttft-test", 32, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := h.newStoppedManager(t, backend, 32, 96, false,
+		scheduler.Config{MaxActive: 1, MaxQueue: 4, RequestTimeout: time.Minute})
+	prompt := h.prompt(t, "Hello world")
+	sampler := samplerFor(t, h.tok.VocabSize())
+	done := make(chan struct {
+		result *Result
+		err    error
+	}, 1)
+	go func() {
+		result, err := manager.Generate(context.Background(), Request{
+			ID: "queued", Prompt: prompt, MaxTokens: 2,
+			Sampler: sampler, IgnoreEOS: true,
+		})
+		done <- struct {
+			result *Result
+			err    error
+		}{result, err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for manager.Metrics().Scheduler.Submissions == 0 {
+		if time.Now().After(deadline) {
+			_ = manager.Start(context.Background())
+			<-done
+			t.Fatal("request was not submitted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Hold the scheduler stopped so the request spends measurable time queued.
+	time.Sleep(40 * time.Millisecond)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	out := <-done
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	if out.result.QueueWait < 20*time.Millisecond {
+		t.Fatalf("queue wait = %s, want at least 20ms", out.result.QueueWait)
+	}
+	if out.result.TimeToFirst < out.result.QueueWait {
+		t.Fatalf("TTFT %s excludes queue wait %s", out.result.TimeToFirst, out.result.QueueWait)
+	}
+}
+
 func TestPrefixCacheReuseMatchesFreshRun(t *testing.T) {
 	h := newTinyHarness(t)
 	cached := h.newManager(t, 48, 8, 128, true, scheduler.Config{MaxActive: 1, MaxQueue: 4, RequestTimeout: time.Minute})

@@ -59,15 +59,16 @@ M tile plus scalar attention are follow-up optimizations rather than exit
 criteria.
 
 Phase 4 exit criteria are met: paged KV with a block allocator and immutable
-per-request block tables, continuous scheduling with explicit prefill/decode
-interleaving, a collision-safe LRU prefix cache that also snapshots recurrent
-state, opt-in HIP Graph capture/replay with fallback, an OpenAI-compatible SSE
-API, health/metrics/pprof endpoints, cancellation and timeout handling, and
-resource-reclamation tests are implemented. Concurrent CPU and HIP requests
-reproduce isolated-run tokens, repeated request cycles leave no KV blocks
-allocated, and cancellation releases every block. Aggregate decode throughput
-does not scale with concurrency because mixed-shape batched kernels are not
-implemented; requests are interleaved on one stream.
+per-request block tables, iteration-level continuous scheduling with explicit
+prefill/decode interleaving, a collision-safe LRU prefix cache that also
+snapshots recurrent state, opt-in HIP Graph capture/replay with fallback, an
+OpenAI-compatible SSE API, health/metrics/pprof endpoints, cancellation and
+timeout handling, and resource-reclamation tests are implemented. Concurrent CPU
+and HIP requests reproduce isolated-run tokens, repeated request cycles with the
+prefix cache disabled leave no KV blocks allocated, and cancellation releases
+every block. This is not fused multi-request batching: aggregate decode
+throughput does not scale with concurrency because mixed-shape batched kernels
+are not implemented; requests are interleaved on one stream.
 
 Phase 5 features are implemented and opt-in: `qwen3moe` expert routing with
 grouped HIP expert kernels, F16 and Q8_0 KV cache formats, exact greedy
@@ -87,7 +88,7 @@ acceleration.
 | **1. Minimal loop** | Correct single-request generation | GGUF reader, tokenizer, Qwen3/Llama dense, CPU reference ops, HIP FP16 baseline, CLI | Fixed-prompt token IDs match or logits are within documented tolerance; generation stops correctly |
 | **2. Quantized decode** | Native low-bit decode | Q4_K/Q6_K/Q8_0 GEMV, fused unpack/scale, dispatch thresholds, profiling | Qwen3.5-4B Q4_K_M runs correctly; decode bottleneck is attributable to a kernel and memory behavior |
 | **3. High-performance prefill** | Fast prompt processing | WMMA quantized GEMM, Flash Attention, chunked prefill, key fusions, tuning tables | Performance curves at 128/512/2048/8192/32768 tokens and same-condition comparison with llama.cpp |
-| **4. Multi-request serving** | Concurrent, cache-aware service | Paged KV, continuous batching, prefix cache, HIP Graph, SSE/OpenAI API, metrics | Reproducible latency and throughput; cancellation and reclamation are leak-free |
+| **4. Multi-request serving** | Concurrent, cache-aware service | Paged KV, iteration-level continuous scheduling, prefix cache, HIP Graph, SSE/OpenAI API, metrics | Reproducible latency and throughput; cancellation and reclamation are leak-free |
 | **5. Expansion** | Broader models and research | MoE/grouped GEMM, KV quantization, speculative decoding, NPU experiments, more architectures | Each feature is opt-in, measured, and does not regress the GPU-only path |
 
 ## 3. Phase 0 — Bootstrap and Hardware Validation
@@ -257,7 +258,9 @@ efficient KV reuse.
 
 - Paged KV cache with block allocator, per-request block table, reference
   counting, and cleanup.
-- Continuous batching and scheduler-level chunked prefill interleaving.
+- Iteration-level continuous scheduling: admission between steps, explicit
+  prefill/decode interleaving, and batch-composition metrics. Fused
+  multi-request or mixed-shape kernel batching is deferred.
 - Prefix cache with a documented key and eviction policy.
 - HIP Graph capture and replay for stable decode shapes, with fallback.
 - SSE streaming and an OpenAI-compatible chat/completions endpoint.
@@ -271,13 +274,15 @@ efficient KV reuse.
       percentiles plus aggregate throughput with full metadata; the Phase 4
       table is in [benchmarks.md](benchmarks.md).
 - [x] Concurrent requests produce outputs identical to isolated runs under the
-      same sampling settings. CPU and HIP serving tests run the same prompts at
-      concurrency 1 and 2 and compare tokens and text exactly.
+      same sampling settings. CPU and HIP serving tests compare isolated and
+      concurrent runs of the same prompts and compare tokens and text exactly.
 - [x] Cancellation and failures return all KV blocks and buffers. Cancellation
-      tests assert allocator `Used == 0` and balanced allocation/release counts
-      for both backends.
+      tests assert allocator `Used == 0`, zero active requests, and balanced
+      allocation/release counts for both backends.
 - [x] Repeated request cycles show no unbounded memory growth. Twelve sequential
-      cycles leave zero used blocks and no active requests.
+      cycles with the prefix cache disabled leave zero used blocks and no active
+      requests. With the prefix cache enabled, retained blocks are cache
+      occupancy, not a request leak.
 - [x] Graph replay falls back correctly when shapes, addresses, or block tables
       cannot be updated. Native tests cover capture/replay with dynamic
       positions and rejection of non-dynamic plans; a Go test invalidates the
@@ -385,7 +390,7 @@ destabilizing the core GPU path.
 | **M1: Correct generation** | Single-request Qwen3/Llama generation with CPU/GPU agreement | Token and logits comparison report |
 | **M2: Quantized decode** | Qwen3.5-4B Q4_K_M generation with native GEMV | Per-kernel correctness and decode baseline |
 | **M3: Prefill performance** | Prompt-length performance curves | Benchmark report vs llama.cpp |
-| **M4: Concurrent service** | Paged KV, continuous batching, SSE API | Latency/throughput report and leak checks |
+| **M4: Concurrent service** | Paged KV, iteration-level continuous scheduling, SSE API | Latency/throughput report and leak checks |
 | **M5: Expansion** | At least one new architecture/feature with measured benefit | Feature report and regression run |
 
 A milestone is "done" only when its evidence is checked in or linked from the

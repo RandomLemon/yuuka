@@ -385,6 +385,9 @@ count used.
 | Model size | 2,740,937,888 bytes |
 | Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
 | ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
+| Host CPU / kernel | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S; Linux 6.17.13-21-pve |
+| Commit / Go | `6a9127e` plus the Phase 4 fixes in this change; Go 1.24.4. `bench/serving` prints `vcs.revision`, `-dirty`, and the toolchain metadata |
+| Power performance level | `auto` reported by the amdgpu sysfs interface |
 | Backend | HIP, paged FP32 KV, block size 16 |
 | Context | 256 positions |
 | Sampling | Greedy, temperature 0 |
@@ -395,8 +398,13 @@ count used.
 | Warmup | one request for latency/throughput runs; none for prefix runs |
 
 Measurements use `bench/serving`, which reports queue wait, TTFT, prefill,
-decode, and sampling separately. Run one benchmark process at a time; two
-processes sharing the GPU invalidate both results.
+decode, and sampling separately. TTFT is measured from request arrival and
+therefore includes queue wait; queue wait is also reported on its own. The
+benchmark prints the model hash and size, VCS revision (with `-dirty` when
+applicable), Go version, host CPU, kernel, `hipconfig` version, amdgpu power
+performance level, sampling mode, warmup, requests, and concurrency. Run one
+benchmark process at a time; two processes sharing the GPU invalidate both
+results.
 
 ### Single-user latency and graph replay
 
@@ -404,8 +412,8 @@ Concurrency 1, 3 measured requests, one warmup request.
 
 | Configuration | Latency P50 | TTFT P50 | Prefill P50 | Decode P50 | Sampling P50 | Tokens/s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Graph replay | 1.793 s | 0.249 s | 0.241 s | 1.533 s | 1.61 ms | 8.93 |
-| Plain stream | 1.796 s | 0.258 s | 0.249 s | 1.530 s | 1.68 ms | 8.90 |
+| Graph replay | 1.796 s | 0.257 s | 0.245 s | 1.530 s | 1.69 ms | 8.91 |
+| Plain stream | 1.797 s | 0.258 s | 0.246 s | 1.529 s | 3.04 ms | 8.91 |
 
 Graph replay changes decode time by less than run-to-run noise at this context,
 so the server default is the plain stream path. Queue wait was about 2 µs in
@@ -417,27 +425,30 @@ Concurrency 4, 8 measured requests, 64 KV blocks, graph replay enabled.
 
 | Metric | P50 | P95 |
 | --- | ---: | ---: |
-| End-to-end latency | 6.820 s | 7.324 s |
-| Queue wait | 0.258 s | 0.351 s |
-| TTFT | 0.557 s | 0.824 s |
-| Prefill | 0.244 s | 0.248 s |
-| Decode | 1.532 s | 1.534 s |
-| Sampling | 1.66 ms | 1.71 ms |
+| End-to-end latency | 6.919 s | 7.212 s |
+| Queue wait | 0.205 s | 0.452 s |
+| TTFT | 1.010 s | 1.084 s |
+| Prefill | 0.239 s | 0.245 s |
+| Decode | 1.533 s | 1.534 s |
+| Sampling | 1.64 ms | 1.65 ms |
 
-Aggregate throughput was 0.557 requests/s and 8.91 output tokens/s over a
-14.371 s wall interval. Per-request decode time is unchanged from the
-single-request run. The scheduler interleaves request plans on one stream, so
-concurrency improves admission fairness and TTFT under load but does not raise
-aggregate token throughput; mixed-shape batched kernels are the missing
+Aggregate throughput was 0.557 requests/s and 8.915 output tokens/s over a
+14.358 s wall interval. Per-request decode time is unchanged from the
+single-request run. TTFT is higher than in the single-user run because it
+includes queue wait and waits for decode/prefill opportunities on the shared
+stream. The scheduler interleaves request plans on one stream, so concurrency
+improves admission fairness and exposes queue wait, but does not raise aggregate
+token throughput; fused mixed-shape batched kernels are the missing
 optimization.
 
 ### Prefix cache
 
 Three identical 64-token prompts at concurrency 1 with the prefix cache enabled
 and no warmup: one miss and two full-prompt hits. The first request's TTFT was
-0.255 s; the two hits had TTFT P50 of 0.247 ms and zero prefill time because the
-cached recurrent state and prompt logits were restored. Decode time remained
-1.532 s. Aggregate throughput was 9.83 output tokens/s.
+0.265 s; the two hits had TTFT P50 of 4.78 ms and zero prefill time because the
+cached recurrent state and prompt logits were restored. TTFT includes arrival,
+admission, and sampling overhead, so it is not zero even for a full cache hit.
+Decode time remained 1.533 s. Aggregate throughput was 9.813 output tokens/s.
 
 ### Phase 4 correctness evidence
 
@@ -445,12 +456,13 @@ cached recurrent state and prompt logits were restored. Decode time remained
   `YUUKA_TEST_MODEL` set passes on the Q4_K_M model with the paged kernels and
   graph replay enabled in the GPU serving tests.
 - Concurrent CPU and HIP requests reproduce isolated-run token sequences and
-  text at concurrency 2.
+  text at the configured concurrency (3 in the checked-in serving tests).
 - Full and partial prefix hits reproduce a fresh run's tokens and text on both
   backends.
-- Cancellation leaves zero used KV blocks and balanced allocator counters.
-- Twelve sequential request cycles leave zero used blocks and no active
-  requests.
+- Cancellation leaves zero used KV blocks, no active requests, and balanced
+  allocator counters on both backends.
+- Twelve sequential request cycles with the prefix cache disabled leave zero
+  used blocks and no active requests.
 - Native `hip_paged_graph_correctness` covers paged KV writes, paged decode and
   prefill attention against a float reference, device copies, dynamic graph
   replay at several positions, and rejection of non-dynamic plans.

@@ -52,7 +52,7 @@ HTTP / CLI / Streaming / OpenAI-compatible API
                    |
 Tokenizer / Chat Template / Sampling / Model Manager (Go)
                    |
-Request Scheduler / Admission / Continuous Batching (Go)
+Request Scheduler / Admission / Iteration-level Continuous Scheduling (Go)
                    |
 Model Executor / Prefill / Decode / Paged KV (Go)
                    |
