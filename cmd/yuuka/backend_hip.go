@@ -10,7 +10,10 @@ import (
 )
 
 func newHIPRuntime(l *loadedModel, capacity int) (engine.Runtime, error) {
-	runtime, err := gpu.New(l.reader, l.model, capacity)
+	if l.qwen == nil {
+		return nil, fmt.Errorf("HIP backend does not implement %q yet; use --backend cpu", l.arch)
+	}
+	runtime, err := gpu.New(l.reader, l.qwen, capacity)
 	if err != nil {
 		return nil, fmt.Errorf("HIP runtime: %w", err)
 	}

@@ -186,9 +186,13 @@ The current implementation target is **Qwen3.5-4B with a Q4_K_M GGUF**
 gated delta-net linear attention in the remaining layers. The CPU reference path
 and the native HIP execution path are both implemented and tested for this
 architecture. The HIP path keeps GGUF weights packed and executes the full
-decoder. Other architectures in the table are planned, not implemented. See
-[roadmap.md](roadmap.md), [kernels.md](kernels.md), and
-[benchmarks.md](benchmarks.md).
+decoder.
+
+Dense Llama and Qwen3 CPU reference paths are implemented with generated
+fixtures. The Llama fixture is cross-checked against llama.cpp greedy tokens;
+Qwen3 fixture coverage is structural and determinism-based because no real
+Qwen3 dense weight file is part of the test matrix. HIP execution for dense
+architectures is not implemented. Other architectures in the table are planned.
 
 ## 9. Quantization support by phase
 

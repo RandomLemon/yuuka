@@ -180,7 +180,7 @@ func uintValue(value uint64) metadataValue {
 }
 
 func floatValue(value float64) metadataValue {
-	return metadataValue{typ: 12, float: value}
+	return metadataValue{typ: 6, float: value}
 }
 
 func boolValue(value bool) metadataValue {

@@ -64,7 +64,7 @@ func byteToken(value int) string {
 func floatArrayValue(values []float64) metadataValue {
 	items := make([]metadataValue, len(values))
 	for i, value := range values {
-		items[i] = metadataValue{typ: 12, float: value}
+		items[i] = metadataValue{typ: 6, float: value}
 	}
-	return metadataValue{typ: 9, elem: 12, array: items}
+	return metadataValue{typ: 9, elem: 6, array: items}
 }

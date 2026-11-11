@@ -88,12 +88,14 @@ Implemented and tested:
 
 - Pure Go GGUF reader with header, metadata, tensor directory, split shards,
   alignment, overlap, and byte-range validation.
-- Qwen3.5 byte-level BPE tokenizer and Qwen chat rendering, with golden token
+- Qwen3.5 byte-level BPE and Llama SentencePiece tokenizers, with golden token
   ID tests against llama.cpp for English, Chinese, whitespace, punctuation,
   emoji, special tokens, and chat prompts.
 - CPU reference decoder for the `qwen35` hybrid architecture: full GQA
   attention, gated delta-net linear attention, convolution state, RMSNorm,
   RoPE, SwiGLU, tied LM head, and KV/recurrent caches.
+- CPU reference decoders for dense Llama and Qwen3 layouts, including optional
+  Q/K norm, tied or untied output heads, and generated tiny fixtures.
 - Deterministic greedy, top-k, and nucleus sampling.
 - `yuuka inspect`, `yuuka run`, and `yuuka bench`.
 - `yuuka-server` with `/v1/chat/completions`, SSE streaming, stop sequences,
@@ -116,7 +118,8 @@ Not yet implemented:
 
 - WMMA or rocBLAS prefill integration.
 - Paged KV, continuous batching, prefix cache, or HIP Graph.
-- Multiple architectures and quantization presets beyond the tested model.
+- HIP execution for dense Llama/Qwen3 models.
+- Multiple architectures and quantization presets beyond the tested models.
 - NPU paths.
 
 Verification gaps: real-model tests are opt-in through `YUUKA_TEST_MODEL`; GPU

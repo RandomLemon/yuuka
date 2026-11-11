@@ -19,6 +19,7 @@ import (
 
 	"github.com/yuuka-ai/yuuka/engine"
 	"github.com/yuuka-ai/yuuka/gguf"
+	"github.com/yuuka-ai/yuuka/model/dense"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
 	"github.com/yuuka-ai/yuuka/tensor"
 	"github.com/yuuka-ai/yuuka/tokenizer"
@@ -62,7 +63,9 @@ commands:
 type loadedModel struct {
 	reader    *gguf.Reader
 	tokenizer *tokenizer.Tokenizer
-	model     *qwen35.Model
+	qwen      *qwen35.Model
+	dense     *dense.Model
+	arch      string
 }
 
 func load(path string) (*loadedModel, error) {
@@ -78,15 +81,58 @@ func load(path string) (*loadedModel, error) {
 		_ = r.Close()
 		return nil, err
 	}
-	model, err := qwen35.Load(r)
+	arch, err := r.String("general.architecture")
 	if err != nil {
 		_ = r.Close()
 		return nil, err
 	}
-	return &loadedModel{reader: r, tokenizer: tok, model: model}, nil
+	loaded := &loadedModel{reader: r, tokenizer: tok, arch: arch}
+	switch arch {
+	case qwen35.Architecture:
+		loaded.qwen, err = qwen35.Load(r)
+	case dense.Llama, dense.Qwen3:
+		loaded.dense, err = dense.Load(r)
+	default:
+		err = fmt.Errorf("model architecture %q is not supported", arch)
+	}
+	if err != nil {
+		_ = r.Close()
+		return nil, err
+	}
+	return loaded, nil
 }
 
 func (l *loadedModel) Close() error { return l.reader.Close() }
+
+func (l *loadedModel) contextLength() int {
+	if l.qwen != nil {
+		return l.qwen.Config.ContextLength
+	}
+	return l.dense.Config.Context
+}
+
+func (l *loadedModel) vocabSize() int {
+	if l.qwen != nil {
+		return l.qwen.Config.VocabSize
+	}
+	return l.dense.Config.VocabSize
+}
+
+func (l *loadedModel) cpuEngine(capacity int, sampler *engine.Sampler) (*engine.Engine, error) {
+	if l.qwen != nil {
+		return engine.New(l.qwen, l.tokenizer, capacity, sampler)
+	}
+	runtime, err := dense.NewRuntime(l.dense, capacity)
+	if err != nil {
+		return nil, err
+	}
+	runner, err := engine.NewWithRuntime(runtime, l.tokenizer, sampler)
+	if err != nil {
+		_ = runtime.Close()
+		return nil, err
+	}
+	return runner, nil
+}
 
 func runInspect(args []string) error {
 	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
@@ -101,21 +147,31 @@ func runInspect(args []string) error {
 		return err
 	}
 	defer l.Close()
-	cfg := l.model.Config
 	fmt.Printf("model: %s\n", l.reader.Path())
 	fmt.Printf("gguf_version: %d\n", l.reader.Version())
 	fmt.Printf("alignment: %d\n", l.reader.Alignment())
-	fmt.Printf("architecture: %s\n", cfg.Architecture)
+	fmt.Printf("architecture: %s\n", l.arch)
 	fmt.Printf("tensors: %d\n", len(l.reader.Tensors()))
-	fmt.Printf("layers: %d (full_attention=%d, recurrent=%d)\n",
-		cfg.BlockCount, len(cfg.FullAttentionLayers()), cfg.BlockCount-len(cfg.FullAttentionLayers()))
-	fmt.Printf("hidden: %d  ffn: %d  vocab: %d\n", cfg.HiddenSize, cfg.FFNSize, cfg.VocabSize)
-	fmt.Printf("attention: heads=%d kv_heads=%d head_dim=%d rope_dim=%d\n",
-		cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim)
-	fmt.Printf("ssm: conv=%d state=%d groups=%d time_step_rank=%d inner=%d\n",
-		cfg.SSMConvKernel, cfg.SSMStateSize, cfg.SSMGroupCount, cfg.SSMTimeStepRank, cfg.SSMInnerSize)
-	fmt.Printf("context: %d  rms_eps: %g  rope_base: %g\n",
-		cfg.ContextLength, cfg.RMSNormEps, cfg.RoPEFreqBase)
+	if l.qwen != nil {
+		cfg := l.qwen.Config
+		fmt.Printf("layers: %d (full_attention=%d, recurrent=%d)\n",
+			cfg.BlockCount, len(cfg.FullAttentionLayers()), cfg.BlockCount-len(cfg.FullAttentionLayers()))
+		fmt.Printf("hidden: %d  ffn: %d  vocab: %d\n", cfg.HiddenSize, cfg.FFNSize, cfg.VocabSize)
+		fmt.Printf("attention: heads=%d kv_heads=%d head_dim=%d rope_dim=%d\n",
+			cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim)
+		fmt.Printf("ssm: conv=%d state=%d groups=%d time_step_rank=%d inner=%d\n",
+			cfg.SSMConvKernel, cfg.SSMStateSize, cfg.SSMGroupCount, cfg.SSMTimeStepRank, cfg.SSMInnerSize)
+		fmt.Printf("context: %d  rms_eps: %g  rope_base: %g\n",
+			cfg.ContextLength, cfg.RMSNormEps, cfg.RoPEFreqBase)
+	} else {
+		cfg := l.dense.Config
+		fmt.Printf("layers: %d (dense full attention)\n", cfg.BlockCount)
+		fmt.Printf("hidden: %d  ffn: %d  vocab: %d\n", cfg.HiddenSize, cfg.FFNSize, cfg.VocabSize)
+		fmt.Printf("attention: heads=%d kv_heads=%d head_dim=%d rope_dim=%d qk_norm=%t\n",
+			cfg.HeadCount, cfg.KVHeadCount, cfg.HeadDim, cfg.RoPEDim, cfg.HasQKNorm)
+		fmt.Printf("context: %d  rms_eps: %g  rope_base: %g tied_output=%t\n",
+			cfg.Context, cfg.RMSNormEps, cfg.RoPEFreqBase, l.dense.OutputTied())
+	}
 	fmt.Printf("tokenizer: model=%s pre=%s vocab=%d eos=%d\n",
 		l.tokenizerModel(), l.tokenizerPre(), l.tokenizer.VocabSize(), l.tokenizer.EOSToken())
 	summary := l.reader.DTypeSummary()
@@ -216,15 +272,15 @@ func runGenerate(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *contextSize > l.model.Config.ContextLength {
-		return fmt.Errorf("--ctx %d exceeds model context %d", *contextSize, l.model.Config.ContextLength)
+	if *contextSize > l.contextLength() {
+		return fmt.Errorf("--ctx %d exceeds model context %d", *contextSize, l.contextLength())
 	}
 	sampler, err := engine.NewSampler(engine.SamplerConfig{
 		Temperature: float32(*temperature),
 		TopK:        *topK,
 		TopP:        float32(*topP),
 		Seed:        *seed,
-	}, l.model.Config.VocabSize)
+	}, l.vocabSize())
 	if err != nil {
 		return err
 	}
@@ -292,10 +348,10 @@ func runBench(args []string) error {
 	if capacity == 0 {
 		capacity = *promptTokens + *decodeTokens + 64
 	}
-	if capacity > l.model.Config.ContextLength {
-		return fmt.Errorf("--ctx %d exceeds model context %d", capacity, l.model.Config.ContextLength)
+	if capacity > l.contextLength() {
+		return fmt.Errorf("--ctx %d exceeds model context %d", capacity, l.contextLength())
 	}
-	sampler, err := engine.NewSampler(engine.SamplerConfig{}, l.model.Config.VocabSize)
+	sampler, err := engine.NewSampler(engine.SamplerConfig{}, l.vocabSize())
 	if err != nil {
 		return err
 	}
@@ -329,7 +385,7 @@ func runBench(args []string) error {
 	}
 	fmt.Printf("model: %s\n", l.reader.Path())
 	fmt.Printf("architecture: %s  quantization: %s  backend: %s\n",
-		l.model.Config.Architecture, l.quantizationLabel(), *backend)
+		l.arch, l.quantizationLabel(), *backend)
 	if *hash {
 		sum, err := fileSHA256(l.reader.Path())
 		if err != nil {
@@ -368,7 +424,7 @@ func percentile(values []float64, p float64) float64 {
 func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string) (*engine.Engine, error) {
 	switch backend {
 	case "cpu":
-		return engine.New(l.model, l.tokenizer, capacity, sampler)
+		return l.cpuEngine(capacity, sampler)
 	case "hip":
 		runtime, err := newHIPRuntime(l, capacity)
 		if err != nil {
