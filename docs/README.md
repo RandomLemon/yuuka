@@ -107,6 +107,8 @@ Implemented and tested:
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   The CLI and server select it with `--backend hip` when built with
   `-tags hip`.
+- Batched quantized GEMV with measured dispatch thresholds, a per-operation HIP
+  event profile path, and per-quantization/per-batch decode baselines.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
   match and the recorded first-step maximum absolute logit difference is
   `4.58e-5`. The checked-in tests enforce the token sequence, a loose logit

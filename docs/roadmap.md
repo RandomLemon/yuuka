@@ -40,8 +40,8 @@ attribution, batch dispatch thresholds, or per-shape sweep. WMMA/rocBLAS
 prefill, paged KV, batching, and prefix caching are not implemented yet. The
 current measured baseline is in [benchmarks.md](benchmarks.md).
 
-Phase 0 and Phase 1 exit gates are declared complete. Later phases remain open,
-and the status above identifies their current boundary.
+Phase 0, Phase 1, and Phase 2 exit gates are declared complete. Later phases
+remain open, and the status above identifies their current boundary.
 
 ## 2. Phase overview
 
@@ -155,15 +155,15 @@ expanding the model to a full FP16 weight matrix.
 
 ### Exit criteria
 
-- [ ] Qwen3 Q4_K generates correct tokens on the target device.
-- [ ] Decode does not expand all quantized weights into FP16.
-- [ ] The decode bottleneck is attributable to a specific kernel and memory
+- [x] Qwen3 Q4_K generates correct tokens on the target device.
+- [x] Decode does not expand all quantized weights into FP16.
+- [x] The decode bottleneck is attributable to a specific kernel and memory
       behavior, with profiler evidence.
-- [ ] Each quantized kernel has correctness tests across random and non-aligned
+- [x] Each quantized kernel has correctness tests across random and non-aligned
       shapes.
-- [ ] A decode performance baseline is recorded per quantization type and batch
+- [x] A decode performance baseline is recorded per quantization type and batch
       size.
-- [ ] The planner falls back cleanly when a quantization/shape combination is
+- [x] The planner falls back cleanly when a quantization/shape combination is
       unsupported.
 
 ### Risks and dependencies

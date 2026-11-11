@@ -54,6 +54,72 @@ channel and performs a block-wide reduction per quantization block. Reducing
 launch and reduction overhead, increasing per-workgroup output reuse, and
 vectorizing packed loads are the obvious next optimizations.
 
+## Per-quantization decode baseline
+
+The Q4_K_M source model was requantized with llama.cpp to Q8_0, Q6_K, and a
+Q5_K/Q6_K mix. These files are test variants, not independently quality-tuned
+models. Conditions: `gfx1151`, HIP backend, prompt 16 tokens, decode 16 tokens,
+greedy sampling, context 128, warmup 1, repetitions 2.
+
+| Model variant | File type | File size | Prefill p50 | Prefill tok/s | Decode p50 | Decode tok/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K_M | `15` | 2,740,937,888 | 1.878 s | 8.52 | 1.731 s | 8.67 |
+| Q8_0 | `7` | 4,482,403,488 | 0.807 s | 19.82 | 1.053 s | 14.24 |
+| Q6_K | `18` | 3,464,055,968 | 1.528 s | 10.47 | 1.311 s | 11.44 |
+| Q5_K/Q6_K mixed | `18` | 3,074,987,168 | 1.572 s | 10.18 | 1.651 s | 9.09 |
+
+SHA-256 values: Q4_K_M `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`,
+Q8_0 `dc3021458088a6fb0e8629c096ea7e95f743e434d96dc4351d2107c669be1fa9`,
+Q6_K `438c752e79f8cfdf80483b7017ebc672f16eaf717f198c298740eb6caec097e4`,
+Q5_K `68060caab98d455ed40683ab44181599d9ac528ec2378f1c10683b8b8c790637`.
+The CPU/GPU agreement test passes for all four variants.
+
+Effective weight-read bandwidth, estimated as model bytes times decode tok/s:
+Q4_K_M 23.8 GB/s, Q8_0 63.8 GB/s, Q6_K 39.6 GB/s, and the Q5_K mix 28.0 GB/s.
+These remain below the measured memset range of about 190-230 GB/s.
+
+## Decode kernel attribution
+
+`TestGPUProfileDecode` runs one ordinary decode step after a fixed prompt with
+HIP events around every submitted plan operation. This is event-instrumented
+attribution, not a hardware-counter profile; total time includes event overhead.
+
+| Operation | Time | Share |
+| --- | ---: | ---: |
+| GEMV | 92.859 ms | 90.5% |
+| GDN | 7.308 ms | 7.1% |
+| RMSNorm | 0.807 ms | 0.8% |
+| residual add | 0.374 ms | 0.4% |
+| L2Norm | 0.258 ms | 0.3% |
+| gated RMSNorm | 0.237 ms | 0.2% |
+| conv1d | 0.174 ms | 0.2% |
+| SwiGLU | 0.161 ms | 0.2% |
+| attention | 0.139 ms | 0.1% |
+| head RMSNorm | 0.096 ms | 0.1% |
+
+The profiled step submitted 579 operations and took 102.580 ms. The GEMV path is
+the clear decode bottleneck, consistent with the effective bandwidth remaining
+far below device copy rates.
+
+## Batched GEMV dispatch
+
+`build/yuuka_gemv_sweep` compares one GEMV per batch row against the batched
+GEMV kernel for `n_in = n_out = 2560`, two warmups, ten repetitions, on gfx1151.
+Values are the batched speedup over per-row submission; host timing includes the
+completion wait for both paths.
+
+| Dtype | batch 1 | batch 2 | batch 4 | batch 8 | batch 16 | Batched path from |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Q4_K | 0.98 | 1.58 | 2.34 | 3.20 | 3.88 | batch 2 |
+| Q5_K | 1.02 | 1.71 | 2.57 | 3.55 | 4.22 | batch 2 |
+| Q6_K | 1.02 | 1.25 | 1.90 | 2.49 | 3.16 | batch 2 |
+| Q8_0 | 0.61 | 0.86 | 1.26 | 1.59 | 1.71 | batch 4 |
+| F16 | 0.81 | 0.94 | 1.22 | 1.37 | 1.51 | batch 4 |
+
+`backend/hip.SelectGemvPath` encodes these thresholds; batches above 16 fall
+back to per-row submission. The current single-token decode path always uses
+batch 1, so the batched path is a prefill/batching building block.
+
 ## Correctness evidence
 
 For the prompt `The capital of France is`:

@@ -319,6 +319,7 @@ explicitly:
 
 ```bash
 ./build/yuuka_hardware_probe
+./build/yuuka_gemv_sweep
 scripts/thermal_probe.sh 15 ./build/yuuka_hardware_probe
 /tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 16 --decode-tokens 16
 ```
