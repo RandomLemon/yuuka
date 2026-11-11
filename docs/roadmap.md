@@ -31,13 +31,16 @@ absolute logit difference is `4.58e-5`.
 
 Phase 0 exit criteria are met: the hardware report records the toolchain,
 firmware, power-management profile, short sustained-load telemetry, and a clean
-checkout is verified by `scripts/check_clean_build.sh` plus CI. Phase 1 has CPU
-reference paths for `qwen35`, dense Llama, and dense Qwen3, plus a validated
-F32/F16 GEMM ABI baseline; HIP execution for the dense models is not
-implemented.
-Phase 2 has quantized GEMV and end-to-end Q4_K_M generation, but no profiler
-attribution, batch dispatch thresholds, or per-shape sweep. WMMA/rocBLAS
-prefill, paged KV, batching, and prefix caching are not implemented yet. The
+checkout is verified by `scripts/check_clean_build.sh` plus CI. Phase 1 exit criteria are met for the validated
+models: CPU reference paths exist for `qwen35`, dense Llama, and dense Qwen3,
+the Qwen and Llama tokenizers match reference token IDs, CPU/GPU logits and
+layer traces agree, and a validated F32/F16 GEMM ABI baseline is checked in.
+HIP execution for the dense models is not implemented.
+
+Phase 2 exit criteria are met: quantized GEMV is correct across randomized
+shapes, GEMV accounts for about 90.6% of profiled decode time, and
+per-quantization and per-batch baselines are recorded. WMMA/rocBLAS prefill,
+paged KV, continuous batching, and prefix caching are not implemented yet. The
 current measured baseline is in [benchmarks.md](benchmarks.md).
 
 Phase 0, Phase 1, and Phase 2 exit gates are declared complete. Later phases
