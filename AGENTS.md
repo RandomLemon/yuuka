@@ -25,7 +25,7 @@ implementation code without license review and attribution.
 
 First target:
 
-> Linux + ROCm + gfx1151 + Qwen3 Dense + Q4_K GGUF + single-request,
+> Linux + ROCm + gfx1151 + Qwen3.5 hybrid + Q4_K GGUF + single-request,
 > GPU-only inference.
 
 ## 3. Current repository state
@@ -108,7 +108,7 @@ These are requirements, not suggestions:
 | Go | Current stable release supported by the project |
 | HIP | ROCm-supported HIP toolchain; pin and document the version |
 | Build | Go Modules for Go; CMake for the HIP shared library |
-| First model | Qwen3 Dense, Q4_K GGUF |
+| First model | Qwen3.5-4B hybrid (`qwen35`), Q4_K_M GGUF |
 | First execution mode | Single request, GPU-only |
 
 Hardware and toolchain facts must be verified on the actual machine. Do not
@@ -446,7 +446,7 @@ For a new implementation agent starting from the current empty state:
    propagate an error.
 4. Add the CPU reference backend skeleton and GGUF parser fixtures.
 5. Implement the GGUF reader and tokenizer with golden tests.
-6. Implement the CPU reference operators needed by Qwen3 Dense.
+6. Implement the CPU reference operators needed by Qwen3.5 hybrid attention and gated delta-net layers.
 7. Add the HIP FP16 baseline and the single-request execution plan.
 8. Validate logits and greedy tokens against the reference before starting
    quantized kernels.

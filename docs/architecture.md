@@ -361,7 +361,7 @@ package.
 | rocBLAS/rocWMMA? | Initial baseline and fallback; replace hot paths with purpose-built kernels incrementally. |
 | General graph compiler? | No in the first release. A lightweight `ExecutionPlan` is sufficient. |
 | Develop CPU, GPU, and NPU simultaneously? | GPU first, CPU reference for correctness, NPU later. |
-| First model? | Qwen3 Dense, Q4_K GGUF. |
+| First model? | Qwen3.5-4B hybrid (`qwen35`), Q4_K_M GGUF. |
 | Optimization order | End-to-end loop → quantized GEMV → WMMA quantized GEMM → attention → scheduler. |
 | NPU scheduling in the first release? | No. Reserve backend and event abstractions only. |
 | When to add HIP Graph? | After the plain stream path is stable and profiling shows launch overhead is significant. |

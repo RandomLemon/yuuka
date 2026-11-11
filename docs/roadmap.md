@@ -4,7 +4,7 @@
 
 The first executable vertical slice is:
 
-> **Linux + ROCm + gfx1151 + Qwen3 Dense + Q4_K GGUF + single-request,
+> **Linux + ROCm + gfx1151 + Qwen3.5 hybrid + Q4_K GGUF + single-request,
 > GPU-only inference.**
 
 The sequence is deliberate:
@@ -19,6 +19,17 @@ Each phase has an evidence-based exit gate. A phase is not complete because code
 has merged; it is complete when its acceptance results are reproducible under
 the protocol in [testing.md](testing.md). No calendar dates are assigned here;
 duration depends on hardware availability and measured progress.
+
+## 1.1 Current implementation status
+
+The Phase 0 toolchain is proven and recorded in [hardware.md](hardware.md).
+The CPU reference vertical slice for `qwen35` is implemented with a CLI and
+single-request server. HIP allocation, transfers, streams, events, and
+quantized GEMV kernels are implemented and tested. The HIP model executor,
+prefill GEMM, and serving features from later phases are not implemented yet.
+
+This status does not declare any phase exit gate complete. It identifies the
+current boundary for contributors.
 
 ## 2. Phase overview
 
@@ -84,7 +95,7 @@ request, with a GPU path and a CPU reference path.
 - Pure Go GGUF reader with metadata, tensor directory, shard, alignment, and
   validation support.
 - Tokenizer and chat-template implementation with token-exact comparison tests.
-- Qwen3 Dense and Llama Dense model builders.
+- Qwen3.5 hybrid, Qwen3 Dense, and Llama Dense model builders.
 - CPU reference implementations for the required operators.
 - HIP baseline kernels: FP16 GEMM, RMSNorm, RoPE, basic attention, and sampling.
 - `ExecutionPlan` construction and a single-request executor.
@@ -128,7 +139,7 @@ expanding the model to a full FP16 weight matrix.
 - Workgroup mapping and vectorization tuned for Wave32 and the target CU count.
 - Dispatch thresholds for batch sizes 1, 2, 4, 8, and 16.
 - Per-kernel correctness and bandwidth analysis.
-- Qwen3 Dense Q4_K end-to-end generation.
+- Qwen3.5-4B Q4_K_M end-to-end generation.
 
 ### Exit criteria
 
@@ -349,7 +360,7 @@ not declare completion or depend on unverified results from an open gate.
 
 The first release is successful when:
 
-- [ ] Qwen3 Dense Q4_K GGUF loads and validates on the target gfx1151 system.
+- [ ] Qwen3.5-4B Q4_K_M GGUF loads and validates on the target gfx1151 system.
 - [ ] A single request generates tokens end-to-end on the GPU.
 - [ ] Tokenizer, chat template, and greedy token sequences match the reference
       implementation.

@@ -167,6 +167,7 @@ same string while producing different model behavior.
 
 | Priority | Architecture | Key features |
 | --- | --- | --- |
+| P0 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, MRoPE, GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU |
 | P0 | Qwen3 Dense | RMSNorm, RoPE, GQA, Q/K norm, SwiGLU |
 | P0 | Llama Dense | RMSNorm, RoPE, GQA, SwiGLU |
 | P1 | Gemma | Architecture-specific norm, attention, and logit details |
@@ -174,9 +175,11 @@ same string while producing different model behavior.
 | P2 | DeepSeek-like | MLA, MoE, specialized KV representation |
 | P2 | Hybrid attention/SSM | Separate state cache and state-space operators |
 
-The first production model is **Qwen3 Dense with a Q4_K GGUF**. Phase 1 may use
-a small dense fixture of the same architecture to establish the numerical loop;
-native Q4_K execution is completed in Phase 2. See [roadmap.md](roadmap.md).
+The current implementation target is **Qwen3.5-4B with a Q4_K_M GGUF**
+(`general.architecture = qwen35`). It uses full attention every fourth layer and
+gated delta-net linear attention in the remaining layers. The CPU reference path
+is implemented and tested; native HIP execution is not integrated yet. See
+[roadmap.md](roadmap.md) and [hardware.md](hardware.md).
 
 ## 9. Quantization support by phase
 

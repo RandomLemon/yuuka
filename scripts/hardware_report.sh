@@ -12,7 +12,7 @@ fi
 echo
 
 echo "== cpu / memory =="
-lscpu | sed -n 's/^\(Model name\|Socket(s)\|Core(s) per socket\|Thread(s) per core\|CPU(s)\)[[:space:]]*: /\\1: /p'
+lscpu | sed -En 's/^(Model name|Socket\(s\)|Core\(s\) per socket|Thread\(s\) per core|CPU\(s\))[[:space:]]*: /\1: /p'
 free -h
 echo
 

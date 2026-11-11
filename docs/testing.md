@@ -148,7 +148,7 @@ model output. A text-only comparison is insufficient.
 
 | Dimension | Values |
 | --- | --- |
-| Model | Qwen3 Dense (primary), Llama Dense, small fixtures |
+| Model | Qwen3.5-4B hybrid (primary), Qwen3 Dense, Llama Dense, small fixtures |
 | Quantization | F16, Q8_0, Q6_K, Q4_K |
 | Context | short, medium, maximum supported |
 | Prompt language | English, Chinese, mixed |
@@ -280,6 +280,36 @@ run-to-run variance. A change is blocked if it causes a statistically
 significant regression on a tracked shape outside the accepted noise band.
 Thresholds must be recorded with the baseline; do not invent a universal
 percentage before measurement.
+
+## 9.4 Current test commands
+
+The repository uses these commands:
+
+```bash
+go build ./...
+go test ./...
+go test -race ./...
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+ctest --test-dir build --output-on-failure
+```
+
+Real-model tests are opt-in and skip when the variable is absent:
+
+```bash
+YUUKA_TEST_MODEL=/path/to/model.gguf go test ./...
+```
+
+The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
+token sequences, determinism, logits tolerance against a llama.cpp CPU
+reference, and server request/stream behavior. GPU tests return the CTest skip
+code when no HIP device is available.
+
+The Phase 0 hardware probe is run explicitly:
+
+```bash
+./build/yuuka_hardware_probe
+```
 
 ## 10. CI and test execution
 

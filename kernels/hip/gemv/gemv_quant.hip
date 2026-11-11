@@ -90,19 +90,23 @@ __global__ void gemv_q8_0_kernel(float * out, const float * x, const void * w,
     }
 }
 
-__global__ void gemv_q5_k_kernel(float * out, const float * x, const void * w,
-                                 int64_t n_in, int64_t n_out) {
+template <bool Q5>
+__global__ void gemv_k_kernel(float * out, const float * x, const void * w,
+                              int64_t n_in, int64_t n_out) {
     const int64_t row = blockIdx.x;
     if (row >= n_out) {
         return;
     }
-    const uint8_t * row_ptr = static_cast<const uint8_t *>(w) + row * (n_in / 256) * 176;
+    constexpr int kBlockBytes = Q5 ? 176 : 144;
+    const uint8_t * row_ptr = static_cast<const uint8_t *>(w) + row * (n_in / 256) * kBlockBytes;
     const int tid = threadIdx.x;
     float sum = 0.0f;
     const int64_t blocks = n_in / 256;
     for (int64_t b = 0; b < blocks; ++b) {
-        const uint8_t * blk = row_ptr + b * 176;
+        const uint8_t * blk = row_ptr + b * kBlockBytes;
         const uint8_t * scales = blk + 4;
+        const uint8_t * qh = Q5 ? blk + 16 : nullptr;
+        const uint8_t * ql = Q5 ? blk + 48 : blk + 16;
         __shared__ float d_scale[8];
         __shared__ float d_min[8];
         if (tid < 8) {
@@ -115,22 +119,19 @@ __global__ void gemv_q5_k_kernel(float * out, const float * x, const void * w,
         __syncthreads();
         const int group = tid / 64;
         const int within = tid % 64;
-        const uint8_t * ql = blk + 16;
-        const uint8_t * qh = ql + 128;
-        int sub = 0;
+        const int lane = within < 32 ? within : within - 32;
+        const int sub = within < 32 ? group * 2 : group * 2 + 1;
         uint8_t q = 0;
         if (within < 32) {
-            q = ql[group * 32 + within] & 0xF;
-            if (qh[within] & (1u << (2 * group))) {
-                q = static_cast<uint8_t>(q | 16);
-            }
-            sub = group * 2;
+            q = ql[group * 32 + lane] & 0xF;
         } else {
-            q = ql[group * 32 + (within - 32)] >> 4;
-            if (qh[within - 32] & (1u << (2 * group + 1))) {
+            q = ql[group * 32 + lane] >> 4;
+        }
+        if (Q5) {
+            const uint8_t mask = static_cast<uint8_t>(1u << (2 * group + (within < 32 ? 0 : 1)));
+            if (qh[lane] & mask) {
                 q = static_cast<uint8_t>(q | 16);
             }
-            sub = group * 2 + 1;
         }
         const float value = d_scale[sub] * static_cast<float>(q) - d_min[sub];
         sum += x[b * 256 + tid] * value;
@@ -211,13 +212,13 @@ void launch_gemv_q8_0(float * out, const float * x, const void * w,
 
 void launch_gemv_q4_k(float * out, const float * x, const void * w,
                       uint64_t n_in, uint64_t n_out, hipStream_t stream) {
-    gemv_q5_k_kernel<<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
+    gemv_k_kernel<false><<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
         out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out));
 }
 
 void launch_gemv_q5_k(float * out, const float * x, const void * w,
                       uint64_t n_in, uint64_t n_out, hipStream_t stream) {
-    gemv_q5_k_kernel<<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
+    gemv_k_kernel<true><<<static_cast<unsigned>(n_out), kThreads, 0, stream>>>(
         out, x, w, static_cast<int64_t>(n_in), static_cast<int64_t>(n_out));
 }
 

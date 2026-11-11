@@ -6,10 +6,13 @@ written in **HIP/C++**. It loads GGUF models directly and does not use
 llama.cpp, GGML, or Ollama as an inference execution kernel. Those projects are
 treated as format and correctness references only.
 
-> **Status: design.** The repository does not yet contain an implementation.
-> This documentation defines the intended architecture, interfaces, and
-> delivery plan. Details marked as open are expected to change as hardware
-> characterization and implementation proceed.
+> **Status: CPU reference vertical slice implemented.** The repository now
+> contains a validated GGUF reader, a Qwen3.5 tokenizer, a CPU reference
+> forward pass for the hybrid attention/gated-delta-net decoder, a CLI, an
+> OpenAI-compatible single-request server, and a HIP runtime plus quantized
+> GEMV kernel library. The full HIP model execution path, WMMA prefill,
+> paged KV, and batching remain future work. See the implementation status
+> below and [hardware.md](hardware.md).
 
 ## Target configuration
 
@@ -20,7 +23,7 @@ treated as format and correctness references only.
 | Memory | LPDDR5x system memory shared between CPU and GPU (UMA APU) |
 | OS / stack | Linux with ROCm/HIP; rocBLAS and rocWMMA allowed |
 | Model format | GGUF |
-| First model | Qwen3 Dense, Q4_K GGUF |
+| First model | Qwen3.5-4B hybrid (`qwen35`), Q4_K_M GGUF |
 | First milestone | Single-request, GPU-only inference from prompt to generated tokens |
 
 Hardware capabilities must be verified on the actual device, kernel, and
@@ -76,11 +79,45 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, reporting, regression gates | All contributors |
 | [npu.md](npu.md) | Deferred XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
+| [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
+
+## Implementation status
+
+Implemented and tested:
+
+- Pure Go GGUF reader with header, metadata, tensor directory, split shards,
+  alignment, overlap, and byte-range validation.
+- Qwen3.5 byte-level BPE tokenizer and Qwen chat rendering, with golden token
+  ID tests against llama.cpp for English, Chinese, whitespace, punctuation,
+  emoji, special tokens, and chat prompts.
+- CPU reference decoder for the `qwen35` hybrid architecture: full GQA
+  attention, gated delta-net linear attention, convolution state, RMSNorm,
+  RoPE, SwiGLU, tied LM head, and KV/recurrent caches.
+- Deterministic greedy, top-k, and nucleus sampling.
+- `yuuka inspect`, `yuuka run`, and `yuuka bench`.
+- `yuuka-server` with `/v1/chat/completions`, SSE streaming, stop sequences,
+  health, metrics, cancellation, and explicit busy rejection.
+- HIP C ABI for devices, buffers, streams, events, transfers, and quantized
+  GEMV; validated `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` kernels.
+- Phase 0 hardware probe covering allocation, copy, memset, mapped memory,
+  rocBLAS SGEMM, and a rocWMMA FP16 tile.
+
+Not yet implemented:
+
+- A HIP execution path for the model forward pass.
+- WMMA or rocBLAS prefill integration.
+- Paged KV, continuous batching, prefix cache, or HIP Graph.
+- Multiple architectures and quantization presets beyond the tested model.
+- NPU paths.
+
+The current end-to-end path is CPU-only. `general.architecture = qwen35` is the
+supported model family.
 
 ## Reading paths
 
 - **New contributor:** [README](README.md) → [architecture](architecture.md) →
   the document for your area → [roadmap](roadmap.md).
+- **Hardware bring-up:** [hardware](hardware.md) → [roadmap Phase 0](roadmap.md#3-phase-0--bootstrap-and-hardware-validation).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
   [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode).
 - **Runtime/service work:** [architecture](architecture.md) →
