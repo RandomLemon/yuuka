@@ -29,16 +29,17 @@ planned operators, and the full decoder execution path are implemented and
 tested; CPU and HIP greedy tokens match, and the recorded first-step maximum
 absolute logit difference is `4.58e-5`.
 
-Current gaps: Phase 0 has checked-in CI tiers and a generated tiny GGUF fixture,
-but the firmware/power/thermal record is incomplete. Phase 1 covers only
-`qwen35`; Qwen3 Dense, Llama Dense, and FP16 GEMM are not implemented. Phase 2
-has quantized GEMV and end-to-end Q4_K_M generation, but no profiler
+Phase 0 exit criteria are met: the hardware report records the toolchain,
+firmware, power-management profile, short sustained-load telemetry, and a clean
+checkout is verified by `scripts/check_clean_build.sh` plus CI. Phase 1 covers
+only `qwen35`; Qwen3 Dense, Llama Dense, and FP16 GEMM are not implemented.
+Phase 2 has quantized GEMV and end-to-end Q4_K_M generation, but no profiler
 attribution, batch dispatch thresholds, or per-shape sweep. WMMA/rocBLAS
 prefill, paged KV, batching, and prefix caching are not implemented yet. The
 current measured baseline is in [benchmarks.md](benchmarks.md).
 
-This status does not declare any phase exit gate complete. It identifies the
-current boundary for contributors.
+Phase 0 is the only phase whose exit gate is declared complete. Later phases
+remain open, and the status above identifies their current boundary.
 
 ## 2. Phase overview
 
@@ -75,15 +76,15 @@ kernel designs or performance assumptions.
 
 ### Exit criteria
 
-- [ ] A HIP kernel and a rocBLAS GEMM run successfully on the target device.
-- [ ] rocWMMA (or the chosen WMMA path) compiles and executes a correctness
+- [x] A HIP kernel and a rocBLAS GEMM run successfully on the target device.
+- [x] rocWMMA (or the chosen WMMA path) compiles and executes a correctness
       check.
-- [ ] Allocation classes are benchmarked; the weight, activation, and staging
+- [x] Allocation classes are benchmarked; the weight, activation, and staging
       policies have measured justification.
-- [ ] The Go/C ABI round trip works for allocation, submission, event wait, and
+- [x] The Go/C ABI round trip works for allocation, submission, event wait, and
       error propagation.
-- [ ] The build is reproducible from a clean checkout.
-- [ ] The hardware report records ROCm, driver, firmware, and power profile.
+- [x] The build is reproducible from a clean checkout.
+- [x] The hardware report records ROCm, driver, firmware, and power profile.
 
 ### Risks and dependencies
 

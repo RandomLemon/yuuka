@@ -368,22 +368,35 @@ package.
 
 ## 11. Open design questions
 
-These require implementation experiments or explicit decisions:
+These require implementation experiments or explicit decisions. The current
+decision and the phase that may reopen it are recorded below.
 
-1. **Buffer and event ownership syntax.** Should buffers be RAII-style handles,
-   explicit release calls, or arena-scoped? How is double-free prevented?
-2. **UMA allocation policy.** Which buffer classes benefit from mapped memory,
-   and which must be device-local for bandwidth?
-3. **Graph replay mutation.** Which parameters can be updated in place versus
-   requiring graph re-capture?
-4. **Dispatch tables.** What is the format and source of offline tuning data,
-   and how is it validated against a new ROCm version?
-5. **Fallback semantics.** When a custom kernel is slower than rocBLAS for a
-   shape, does the planner select the library path dynamically or by table?
-6. **Prefix-cache eviction.** Which policy balances hit rate, KV pressure, and
-   fairness across requests?
-7. **NPU integration boundary.** Which phase-level split (prefill, decode, or
-   subgraph) is feasible on the available Linux runtime?
+1. **Buffer and event ownership syntax.** Buffers are caller-owned opaque C
+   handles with explicit release; the Go wrapper makes `Close` idempotent.
+   Events are single-use completion signals and `Wait` is valid after the
+   signal. Plans do not own bound buffers. Revisit an arena for scheduled
+   batching in Phase 4.
+2. **UMA allocation policy.** Weights, activations, KV, and recurrent state use
+   device allocations; transfers stage through pinned host memory. Mapped host
+   memory is measured but is not a default path. Revisit only with a measured
+   prefetch or migration win.
+3. **Graph replay mutation.** Deferred to Phase 4. Capture is per stable decode
+   shape; replay validates buffer addresses, shapes, and block tables and falls
+   back to stream submission when a parameter cannot be updated.
+4. **Dispatch tables.** Tables are versioned Go data keyed by operator, dtype,
+   shape class, batch class, and measured device. They are generated from the
+   checked-in benchmark harness and gated by correctness tests. Values from
+   other RDNA parts are not accepted.
+5. **Fallback semantics.** Unsupported dtype/shape combinations fail during
+   planning with a capability error; silent numerical substitution is forbidden.
+   rocBLAS may be selected for prefill only through a measured dispatch table.
+   Decode stays on fused quantized GEMV.
+6. **Prefix-cache eviction.** Deferred to Phase 4. The policy must preserve
+   reference-counted blocks and per-request isolation; no policy is selected
+   before concurrent-serving measurements exist.
+7. **NPU integration boundary.** Deferred. NPU execution remains opt-in and must
+   fall back to the GPU path; the split is not selected before the Phase 5
+   criteria in [npu.md](npu.md) are met.
 
 ## 12. Extensibility rules
 
