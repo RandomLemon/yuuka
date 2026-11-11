@@ -19,7 +19,7 @@ Radeon 8060S as the reference configuration.
 | Hardware feature | Architectural consequence |
 | --- | --- |
 | 40 CUs in the reference configuration | Keep enough tiles and waves in flight to occupy the GPU; avoid designs that only fill a fraction of CUs. |
-| Wave32-friendly execution | Optimize for Wave32 first; treat other wave configurations as experiments. |
+| Wave32-friendly execution | Optimize for Wave32 first. |
 | RDNA WMMA | Use matrix instructions for prefill GEMM. Do not port CDNA MFMA kernels unchanged. |
 | LDS / VGPR / occupancy limits | Control tile size and fusion depth; avoid register spills and occupancy collapse. |
 | Shared CPU/GPU physical memory (UMA APU) | Measure HIP and host allocation strategies per workload; do not assume zero-copy is always fastest. |
