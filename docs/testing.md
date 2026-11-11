@@ -316,8 +316,21 @@ explicitly:
 
 ```bash
 ./build/yuuka_hardware_probe
+scripts/thermal_probe.sh 15 ./build/yuuka_hardware_probe
 /tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 16 --decode-tokens 16
 ```
+
+A clean export of the tracked tree can be validated without relying on local
+build artifacts:
+
+```bash
+scripts/check_clean_build.sh
+scripts/check_clean_build.sh --hip
+```
+
+The first command checks formatting, vet, build, and race tests. The `--hip`
+form also configures and builds the native library, runs CTest, and runs the
+HIP-tagged Go tests in the exported tree.
 
 ## 10. CI and test execution
 
