@@ -123,6 +123,24 @@ undersized buffers must be rejected when the operation is added, not ignored at
 execution time. Every dtype supported by the batched GEMV kernel is checked at
 batch sizes 1, 2, 3, 4, 8, and 16.
 
+Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
+
+- WMMA GEMM for `F32`, `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` at `M` values
+  1, 7, 16, and 33 and non-tile-aligned `N`;
+- the rocBLAS FP16 baseline against a float reference;
+- row-batched and head-batched RMSNorm, batched RoPE, batch embedding, and
+  batch KV writes;
+- causal GQA Flash Attention with a non-zero chunk start position;
+- the fused convolution, L2 normalization, gated delta-net recurrence, and
+  gated RMSNorm chunk kernel at the model dimensions (128 rows, 16 groups,
+  32 heads, state 128), including updated convolution and matrix state. The
+  same operation is run twice from restored state and must be bitwise
+  identical; this catches the shared-scratch and state-ordering races that a
+  single execution can miss.
+
+Each compares against an independent float implementation and records its
+tolerance in the test.
+
 ### 3.4 End-to-end tests
 
 - Fixed prompt, greedy sampling, fixed seed where applicable.
@@ -133,6 +151,12 @@ batch sizes 1, 2, 3, 4, 8, and 16.
 - Verify cancellation stops generation and releases resources.
 - Verify concurrent requests do not affect each other's output.
 - Verify prefix-cache reuse produces identical logits and tokens.
+- Verify chunked prefill at chunk sizes that select batched GEMV and WMMA,
+  including partial final chunks, matches unchunked CPU logits and the greedy
+  top-1 token.
+- Verify one decode step after chunked prefill matches the CPU state produced by
+  a single unchunked prefill.
+- Verify invalid and oversized chunk sizes are rejected or clamped explicitly.
 
 ## 4. Cross-framework comparison
 
@@ -297,6 +321,8 @@ go test ./...
 go test -race ./...
 go build -tags hip ./...
 go test -tags hip ./backend/hip ./engine/gpu
+ctest --test-dir build --output-on-failure
+scripts/kernel_resources.sh
 YUUKA_TEST_SPM_VOCAB=/path/to/ggml-vocab-llama-spm.gguf go test ./tokenizer
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"

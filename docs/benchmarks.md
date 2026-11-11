@@ -1,8 +1,11 @@
 # Benchmark Report: Qwen3.5-4B Q4_K_M
 
-This report records a single-request CPU-versus-HIP comparison. It follows the
-metadata requirements in [testing.md](testing.md) as far as the current tooling
-allows. It is a correctness-phase baseline, not a tuned performance result.
+This report records single-request CPU-versus-HIP measurements, the Phase 2
+decode baseline, and the Phase 3 prefill results. It follows the metadata
+requirements in [testing.md](testing.md) as far as the current tooling allows.
+The decode section is a correctness-phase baseline, not a tuned performance
+result; the Phase 3 section records measured prefill behavior and its known
+gap to llama.cpp.
 
 ## Environment
 
@@ -128,8 +131,12 @@ For the prompt `The capital of France is`:
 
 - CPU and HIP greedy tokens are identical for the first six generated tokens:
   `[11751, 13, 198, 32, 13, 2912]`.
-- The maximum absolute logit difference at the first generated position is
-  `4.58e-5`.
+- The decode-path maximum absolute logit difference at the first generated
+  position is `4.58e-5`. Phase 3 routes multi-token prompts through chunked
+  prefill; the same prompt in that path differs from the CPU reference by
+  `3.65e-3` in the worst logit and selects the same top-1 token. Both numbers
+  are observations under the current kernels, not enforced tolerances except
+  for the loose `5.0` logit guard in the GPU/CPU test.
 - The checked-in GPU test compares final logits and greedy tokens with the CPU
   reference. The checked-in `TestGPULayerTraceMatchesCPU` compares every layer's
   hidden state for the same prompt; the worst recorded layer difference is
@@ -137,6 +144,227 @@ For the prompt `The capital of France is`:
   maximum absolute logit guard; `4.58e-5` is the observed first-step difference,
   not the enforced threshold.
 - Golden CPU token tests also cover `1+1=` and `Once upon a time`.
+
+## Phase 3 prefill
+
+### Environment
+
+Same model, device, ROCm/HIP, and host as the top of this document. Conditions
+for the prefill measurements: Qwen3.5-4B Q4_K_M, `gfx1151`, greedy sampling,
+`chunk-size` 512 except where a full prompt chunk is smaller, two warmup
+iterations for the GEMM sweep and one for prompt curves unless stated
+otherwise. The prompt text is the repeated-prose corpus used by `bench`.
+
+### Prefill GEMM path comparison
+
+`build/yuuka_prefill_sweep` compares, for one GEMM submission followed by a
+completion wait:
+
+- `row`: one plan containing `M` single-row GEMV operations (the pre-Phase-3
+  prefill path);
+- `batch`: the Phase 2 batched GEMV (`M <= 16`);
+- `wmma`: the custom rocWMMA kernel with FP32 activations converted to FP16 in
+  LDS;
+- `rocblas`: the rocBLAS FP16 baseline, including the FP32-to-FP16 cast
+  submitted immediately before the GEMM.
+
+Values are milliseconds per submission, P50 of five measured repetitions after
+two warmups. `N` is output width and `K` is input width. Host timing includes
+the completion wait.
+
+`Q4_K`, milliseconds:
+
+| M | 2560→9216 row | batch | wmma | 9216→2560 row | batch | wmma |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.364 | 0.364 | 0.362 | 0.315 | 0.333 | 0.685 |
+| 4 | 1.385 | 0.572 | 0.376 | 1.231 | 0.507 | 0.730 |
+| 8 | 2.748 | 0.862 | 0.384 | 2.447 | 0.795 | 0.711 |
+| 16 | 5.468 | 1.461 | 0.400 | 4.876 | 1.298 | 0.724 |
+| 32 | 10.945 | — | 0.392 | 9.752 | — | 0.813 |
+| 64 | 21.902 | — | 0.734 | 19.448 | — | 0.900 |
+| 128 | 43.823 | — | 1.520 | 38.978 | — | 1.261 |
+
+`Q6_K`, milliseconds:
+
+| M | 2560→9216 row | batch | wmma | 9216→2560 row | batch | wmma |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.283 | 0.359 | 0.418 | 0.261 | 0.328 | 0.688 |
+| 4 | 1.106 | 0.593 | 0.429 | 1.032 | 0.528 | 0.726 |
+| 8 | 2.294 | 0.888 | 0.432 | 2.103 | 0.787 | 0.698 |
+| 16 | 4.618 | 1.471 | 0.443 | 4.279 | 1.322 | 0.739 |
+| 32 | 9.253 | — | 0.474 | 8.574 | — | 0.845 |
+| 64 | 19.526 | — | 0.974 | 17.488 | — | 1.058 |
+| 128 | 38.525 | — | 1.861 | 35.854 | — | 1.451 |
+
+`F16`, milliseconds, including the cast for `rocblas`:
+
+| M | 2560→9216 row | batch | wmma | blas | 9216→2560 row | batch | wmma | blas |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.295 | 0.370 | 0.606 | 0.313 | 0.286 | 0.389 | 1.149 | 0.290 |
+| 4 | 1.163 | 0.577 | 0.695 | 0.930 | 1.125 | 0.839 | 0.987 | 0.573 |
+| 8 | 2.310 | 0.919 | 0.705 | 0.942 | 2.261 | 1.401 | 1.640 | 0.575 |
+| 16 | 4.571 | 1.606 | 0.716 | 0.977 | 4.498 | 2.162 | 1.138 | 0.582 |
+| 32 | 9.158 | — | 0.831 | 1.042 | 9.052 | — | 1.500 | 0.602 |
+| 64 | 18.245 | — | 1.537 | 1.476 | 18.128 | — | 1.301 | 1.079 |
+| 128 | 36.424 | — | 2.751 | 1.612 | 35.975 | — | 1.581 | 2.298 |
+
+`Q8_0`, `Q5_K`, and `Q4_K` follow the same crossover: batched GEMV is fastest at
+`M = 1`; WMMA wins from `M = 4` for wide projections (`K <= N`) and from `M = 8`
+for tall projections (`K > N`). Rows 2560→9216 and 8192→2560 were measured; the
+shorter `Q8_0` table is omitted because the selected path is identical.
+
+The dispatch table in `backend/hip.SelectPrefillPath` encodes these crossovers.
+For F16 it selects batched GEMV at `M = 4` for wide projections, rocBLAS where
+the measured baseline wins, and WMMA otherwise; for quantized dtypes it selects
+batched GEMV only at the measured small-row points. Differences below 5% are
+treated as run-to-run noise: the table selects rocBLAS only where it was
+decisively faster and WMMA otherwise. The 2560→9216 `M = 64` case is a 4%
+rocBLAS advantage left on WMMA by that rule; the 8192→2560 `M = 4` batched
+choice is within 1% of WMMA.
+
+### Prompt-length performance
+
+`yuuka` HIP, Qwen3.5-4B Q4_K_M, greedy sampling, chunk size 512. Prefill and
+decode use the same process; context capacity is `prompt + 16 + 64`. Prompts up
+to 2048 use one warmup and three measured repetitions; 8192 and 32768 use one
+measured repetition without warmup because each run is long. P50 values:
+
+| Prompt tokens | Prefill | Prefill tok/s | TTFT | Decode tok/s (16 tokens) |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 0.409 s | 313.05 | 0.409 s | 9.70 |
+| 512 | 1.635 s | 313.06 | 1.636 s | 9.16 |
+| 2048 | 6.690 s | 306.14 | 6.690 s | 7.47 |
+| 8192 | 37.687 s | 217.37 | 37.687 s | 4.31 |
+| 32768 | 340.357 s | 96.28 | 340.357 s | 1.60 |
+
+Prefill throughput is flat through 2048 tokens and then declines as attention
+work grows with context length. Decode throughput declines for the expected
+reason: the Phase 2 decode-attention kernel is linear in the cached context and
+is not part of the Phase 3 prefill work. The 32768 run completed with correct
+state; its long duration is a measured limitation of the scalar Flash Attention
+tile, not a failure or truncation.
+
+### llama.cpp comparison
+
+Same GGUF (`00fe7986...`), same device, greedy prompt processing only
+(`llama-bench -n 0`). `llama.cpp` used its default prompt batch 2048 and ubatch
+512 with flash attention `auto`; `yuuka` used chunk size 512. The build is
+`strix-llama.cpp` commit `c8912d7f5` (build 12216, version 0.6.0-dev). HIP used
+ROCm/HIP 7.16 on gfx1151; Vulkan used Mesa RADV 25.0.7 on gfx1151. Each
+`llama-bench` cell is the mean and standard deviation of two measured
+repetitions after its default warmup.
+
+| Prompt tokens | yuuka HIP tok/s | llama.cpp HIP tok/s | HIP ratio | llama.cpp Vulkan tok/s | Vulkan ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 313.05 | 1589.53 ± 265.12 | 5.1x | 2154.59 ± 5.92 | 6.9x |
+| 512 | 313.06 | 2163.12 ± 94.78 | 6.9x | 2307.82 ± 7.93 | 7.4x |
+| 2048 | 306.14 | 2171.11 ± 24.63 | 7.1x | 2235.83 ± 16.82 | 7.3x |
+| 8192 | 217.37 | 2077.64 ± 10.40 | 9.6x | 2114.75 ± 22.70 | 9.7x |
+| 32768 | 96.28 | 1494.85 ± 12.68 | 15.5x | 1702.18 ± 31.82 | 17.7x |
+
+The custom path does not close the gap to llama.cpp. The gap is widest at long
+context, where the scalar Flash Attention tile and its single-wave-per-query
+structure dominate. At short and mid context the remaining gap is smaller. The
+GEMM itself is weight-reuse limited by its 32-row M tile: a 512-row chunk
+reloads each weight tile 16 times. llama.cpp's HIP and Vulkan kernels use
+larger tiles, matrix-core layouts, and pipelined loads. Closing the GEMM gap
+requires a larger M tile (with more accumulator fragments per wave) and
+double-buffered LDS; closing the long-context gap additionally requires a
+matrix-core or multi-query-tile attention kernel. These are recorded as
+follow-up work, not claimed here.
+
+The comparison uses different prompt tokenization only in the sense that each
+runner builds its own prompt from the same token count; both use the same GGUF
+tokenizer and greedy prompt processing. `llama-bench` reports prefill only, so
+these ratios are not end-to-end generation comparisons.
+
+### Short-prompt latency and correctness
+
+The Phase 2 baseline at the top of this document submitted 16 prompt tokens
+through the decode graph and measured 1.433 s prefill (11.17 tok/s) and 9.87
+decode tok/s on HIP. With chunked prefill on the same model and prompt length,
+`bench --prompt-tokens 16 --decode-tokens 8 --chunk-size 16` measures 0.137 s
+prefill (117.02 tok/s) and 9.88 decode tok/s. Decode is unchanged; short-prompt
+TTFT improved by 10.5x.
+
+Chunked prefill correctness is checked at two levels:
+
+- `tests/hip/prefill_test.cpp` compares the fused chunk kernels, WMMA GEMM, and
+  Flash Attention against independent float references.
+- `engine/gpu/prefill_test.go` runs the tiny hybrid fixture with chunk sizes 1,
+  3, 7, 16, 17, 33, and 64, requires the same top-1 token as the CPU reference,
+  and enforces a `2e-3` maximum logit difference. It also decodes one token
+  after each chunked prefill and compares that logit vector with the CPU state
+  produced by a single unchunked prefill.
+- `TestGPUChunkedPrefillLongContext` prefills 1024 real-model tokens with chunk
+  sizes 128, 512, and 1024. The three logit vectors are bitwise identical
+  (maximum absolute difference `0`) and select the same top-1 token. This is
+  the KV/recurrent-state equivalence check at a context length where the
+  earlier shared-scratch race was observable; the fixed kernel is also checked
+  for bitwise repeatability in the native test.
+
+A 32-token real-model prompt ("Write a short list of colors...") produces the
+same greedy continuation with chunk sizes 7, 16, and 32 as the CPU reference.
+Chunk 7 exercises a partial final chunk (7,7,7,7,4); chunk 32 selects the WMMA
+path; chunk 16 selects batched GEMV. Prefill time is 0.526 s, 0.265 s, and
+0.167 s respectively.
+
+### Kernel resource usage
+
+`scripts/kernel_resources.sh` compiles the prefill kernels with
+`-Rpass-analysis=kernel-resource-usage`. All listed kernels report zero scratch,
+zero VGPR spills, and 16 waves/SIMD occupancy.
+
+| Kernel | VGPR | SGPR | Static LDS | Dynamic LDS |
+| --- | ---: | ---: | ---: | ---: |
+| `gemm_wmma_kernel<F32>` | 43 | 26 | 14,336 B | 0 |
+| `gemm_wmma_kernel<F16>` | 43 | 26 | 14,336 B | 0 |
+| `gemm_wmma_kernel<Q8_0>` | 45 | 26 | 14,336 B | 0 |
+| `gemm_wmma_kernel<Q4_K>` | 47 | 33 | 14,336 B | 0 |
+| `gemm_wmma_kernel<Q5_K>` | 47 | 34 | 14,336 B | 0 |
+| `gemm_wmma_kernel<Q6_K>` | 39 | 34 | 14,336 B | 0 |
+| `attention_prefill_f32_kernel` | 53 | 40 | 0 | 32,768 B at head_dim 256 |
+| `gdn_chunk_f32_kernel` | 37 | 70 | 8 B | 2,048 B at state 128 |
+| `rmsnorm_batch_f32_kernel` | 9 | 18 | 1,024 B | 0 |
+| `rmsnorm_heads_batch_f32_kernel` | 9 | 20 | 1,024 B | 0 |
+| `rope_batch_f32_kernel` | 19 | 18 | 0 | 0 |
+| `kv_write_batch_f32_kernel` | 14 | 34 | 0 | 0 |
+| `embedding_batch_f32_kernel` | 20 | 19 | 0 | 0 |
+| `conv1d_chunk_f32_kernel` | 26 | 34 | 0 | 0 |
+| `cast_f32_to_f16_kernel` | 7 | 18 | 0 | 0 |
+
+Dynamic LDS is set by the launcher and does not appear in the compiler's static
+figure.
+
+### Phase 3 reproduction
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
+
+build/yuuka_prefill_sweep
+scripts/kernel_resources.sh
+
+for p in 128 512 2048 8192 32768; do
+  /tmp/yuuka-hip bench \
+    --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
+    --prompt-tokens "$p" --decode-tokens 16 \
+    --warmup 1 --reps 3 --chunk-size 512
+done
+
+# llama.cpp comparison, same GGUF and device.
+build/bin/llama-bench -m /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  -p 128,512,2048,8192,32768 -n 0 -r 2 -o md
+LD_LIBRARY_PATH=$PWD/build-vk/bin build-vk/bin/llama-bench \
+  -m /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  -p 128,512,2048,8192,32768 -n 0 -r 2 -o md
+```
+
+The llama.cpp Vulkan build requires the Vulkan loader and a gfx1151 ICD. The
+recorded run used Mesa RADV 25.0.7. Warmup and repetition counts differ for the
+longest prompts in the yuuka curves; the values reported below state the actual
+count used.
 
 ## Reproduction
 

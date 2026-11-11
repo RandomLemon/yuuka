@@ -10,12 +10,19 @@ the Go scheduler or API; those are in [serving.md](serving.md).
 Implementation status: decode-oriented kernels for `F16`, `Q8_0`, `Q4_K`,
 `Q5_K`, and `Q6_K` GEMV, RMSNorm, L2Norm, gated RMSNorm, RoPE, decode attention,
 convolution state, gated delta-net recurrence, embedding, SwiGLU, residual add,
-and copy are implemented and validated against CPU references. A correctness
-baseline `F32`/`F16` batched GEMM and batched GEMV kernels exist for prefill and
-batching experiments. Batched GEMV reuses each packed weight element across up
-to 16 rows; measured dispatch thresholds are encoded in
-`backend/hip.SelectGemvPath`. Quantized WMMA GEMM, Flash Attention, chunked
-prefill, and tuning tables are not yet implemented.
+and copy are implemented and validated against CPU references. Batched GEMV
+reuses each packed weight element across up to 16 rows; its measured thresholds
+are encoded in `backend/hip.SelectGemvPath`.
+
+Phase 3 adds the prefill family: rocWMMA FP16 and quantized GEMM for `F16`,
+`F32`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K`; a rocBLAS FP16 baseline with an
+explicit FP32-to-FP16 cast; causal GQA Flash Attention over prompt chunks;
+chunked prefill with per-chunk KV writes; row-batched RMSNorm, head RMSNorm,
+RoPE, embedding, and KV-write kernels; and a fused gated delta-net chunk kernel
+that performs convolution, L2 normalization, state update, and gated RMSNorm in
+two launches per layer. `backend/hip.SelectPrefillPath` is the measured dispatch
+table described in section 9. Paged KV, continuous batching, prefix caching,
+HIP Graph, and WMMA-based attention are not implemented.
 
 The guiding rule is that **prefill and decode are separate operator families**.
 They may share data layouts and helper primitives, but they are not the same
@@ -159,43 +166,105 @@ kernel default.
 
 ## 6. Prefill: WMMA and quantized GEMM
 
-### 6.1 Baseline
+### 6.1 Implementations
 
-The initial prefill path uses rocBLAS or rocWMMA FP16/BF16 matrix multiplication
-as the performance and correctness baseline. This provides a stable reference
-while custom kernels are developed.
+Prefill uses a separate operator family from decode. The runtime selects one of:
 
-### 6.2 Quantized GEMM
+- **Batched GEMV**: the Phase 2 kernel, limited to 16 rows. It is retained as
+  the baseline for very small prompt chunks.
+- **rocWMMA GEMM**: the custom kernel in `kernels/hip/gemm/wmma_gemm.hip`. It
+  accepts FP32 activations and every supported weight dtype.
+- **rocBLAS FP16**: the external baseline in `kernels/hip/gemm/gemm_blas.hip`.
+  It requires an FP16 activation buffer; the planner inserts an explicit cast.
 
-A custom quantized WMMA kernel follows this structure:
+All three are validated against a float reference built from the exact packed
+weights. The rocBLAS baseline is a comparison point and a dispatch choice for
+the measured F16 shape classes, not a fallback for unsupported quantization.
 
-1. Load a tile of `X` into LDS.
-2. Stream the corresponding GGUF-quantized tile of `W` and unpack it.
-3. Convert the unpacked values into the register or LDS layout expected by WMMA.
-4. Execute WMMA operations and accumulate.
-5. Write only the final output tile; never materialize a full dequantized weight
-   matrix.
+### 6.2 Custom WMMA GEMM
 
-The kernel must handle the quantization metadata layout without scattering
-scales across workgroups inefficiently. Tile shape, K-step, and LDS buffering
-are chosen per quantization type.
+`gemm_wmma_kernel` computes a 32x64 output tile with eight waves. Each wave owns
+one 16x16 fragment and accumulates in FP32 across the K dimension.
+
+1. Load a 32x32 FP32 `X` tile and convert it to FP16 in shared memory.
+2. Stream the corresponding 64x32 weight tile and decode one 32-value
+   quantization sub-block per wave lane directly into the FP16 shared tile.
+3. Run two 16x16x16 WMMA operations per wave per K step.
+4. Stage the FP32 accumulator tile in shared memory and write only the valid
+   output elements, so non-aligned `M` and `N` edges are safe.
+
+The K step is 32 because every K-quant superblock splits into 32-value
+sub-blocks. A segment therefore uses exactly one scale/min pair (or two 16-value
+Q6_K scales) and never crosses a superblock. No dequantized weight matrix is
+materialized. `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `F16`, and `F32` share the same
+tile path; only the packed-load helper differs.
+
+Static shared memory is 14 KiB per workgroup: 2 KiB A tile, 4 KiB B tile, and
+8 KiB output staging. Compiler-reported usage is 39-47 VGPRs, 26-34 SGPRs, no
+spills, and a 16 waves/SIMD resource maximum. The kernel is not pipelined; LDS
+double-buffering and a larger M tile for weight reuse across workgroups are
+later optimizations.
 
 ### 6.3 Dispatch
 
-Dispatch is based on `M`, `N`, `K`, quantization type, and available scratch.
-A custom quantized GEMM is not assumed to beat the library path for every shape.
-The planner uses an offline, measured dispatch table and falls back to the
-baseline when the custom kernel is unsupported or slower.
+Dispatch is based on `M`, `N`, `K`, quantization type, and the measured row
+class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
+[benchmarks.md](benchmarks.md).
+
+| Condition | Selected path |
+| --- | --- |
+| `M < 4` | Batched GEMV |
+| Quantized, `M < 8`, and `K > N` | Batched GEMV |
+| Quantized, other `M >= 4` | Custom rocWMMA |
+| F16, `4 <= M <= 64`, `K > N` | rocBLAS + cast |
+| F16, `M < 8`, `K <= N` | Batched GEMV |
+| F16, `M >= 128`, `K <= N` | rocBLAS + cast |
+| F16, other `M >= 8` | Custom rocWMMA |
+
+The custom kernel is selected only where the sweep showed it faster than the
+compared baseline. F16 baselines include the cast cost. A dispatch table entry
+is valid only for the recorded gfx1151 environment; the kernel is not selected
+from assumptions about other RDNA parts.
+
+The isolated GEMM is weight-reuse limited: with a 32-row M tile, each
+workgroup reloads the weight tile, so a 512-row chunk reads every weight tile
+16 times. The end-to-end prompt path measured about 313 tok/s at 512 tokens
+after the recurrent-kernel fix, versus llama.cpp HIP at about 2163 tok/s on the
+same GGUF and device. That remaining gap is not fully attributed in this phase;
+the 32-row M tile, scalar prefill attention, and launch structure are
+candidates. A larger M tile with more accumulator fragments per wave and
+double-buffered LDS is the next GEMM optimization; it is not implemented and is
+not claimed in the benchmark results.
 
 ## 7. Attention
 
 ### 7.1 Prefill: Flash Attention
 
-- Tile Q, K, and V; use online softmax.
-- Support causal masking and GQA.
-- Do not materialize the full attention matrix.
-- Support chunked prefill so long prompts do not block decode indefinitely.
-- Tune tile sizes by context length and head dimension.
+`attention_prefill_f32_kernel` processes a prompt chunk with one wave per query
+row. A workgroup owns eight query rows for one head.
+
+- Q is read into registers, with each lane holding `ceil(head_dim/32)` values.
+- K is staged one 32-key block at a time in dynamic shared memory
+  (`32 * head_dim * 4` bytes; 32 KiB for head_dim 256). V is read from global
+  memory with coalesced per-lane vectors.
+- Scores are reduced within the wave; online softmax keeps per-row max, sum,
+  and FP32 value accumulators, so the full attention matrix is never
+  materialized.
+- Causality uses the chunk position: query row `r` may attend to keys
+  `0..position+r`. Waves in a workgroup share the K-block loop to keep
+  `__syncthreads` convergent and mask keys beyond their own position.
+- GQA maps query head `h` to KV head `h / (heads/kv_heads)`.
+- The Qwen3.5 attention gate (the second half of each query vector) is applied
+  as `sigmoid(gate)` before the output write.
+
+Supported prefill head dimensions are 1-256; the plane-stage kernel reports an
+unsupported capability error above 256. Decode attention remains the
+per-head kernel described in section 5. Flash Attention is not used for decode.
+
+Chunked prefill splits a prompt into at most `chunk-size` rows (default 512,
+maximum 4096). KV writes for a chunk happen before its attention, so later
+chunks see the full causal prefix. The runtime builds and caches one plan per
+chunk length; only the final chunk executes the output tail.
 
 ### 7.2 Decode: Paged Attention
 
@@ -219,15 +288,24 @@ Kernel-specific block layouts are backend-internal.
 
 ## 8. Fusion
 
-Implement fusion in order of benefit and correctness risk:
+Implemented fusions, chosen because they remove launches or intermediate
+traffic without reducing occupancy:
 
-1. Dequantization + GEMV/GEMM.
-2. RMSNorm and necessary elementwise operations.
-3. RoPE and Q/K writes.
-4. SwiGLU activation and multiply.
-5. Decode attention softmax + value reduction.
+- Dequantization + GEMV and dequantization + WMMA GEMM.
+- RMSNorm row batching, head batching, and fused RoPE over a chunk.
+- KV-write batching for a prompt chunk.
+- Prefill attention online softmax, value reduction, and attention gate.
+- Gated delta-net chunk: convolution state update, q/k L2 normalization, the
+  128x128 recurrent update, and gated RMSNorm per head. It replaces five
+  launches and one normalized intermediate per token with two launches per
+  layer. Each thread owns one 128x128 state column, and a barrier separates the
+  q and k block reductions because both reuse the same shared reduction
+  scratch. Both choices are required for deterministic multi-row execution;
+  the row-major state layout is unchanged and shared with the decode kernel.
 
-Every fusion must be evaluated on all of:
+SwiGLU remains an elementwise pass over the chunk; fusing it into the GEMM
+epilogue was not attempted because the measured prefill bottleneck is the
+weight-streaming GEMM. Every fusion must be evaluated on all of:
 
 - kernel launch count;
 - VGPR usage and occupancy;
@@ -278,6 +356,17 @@ benchmarks.
 
 ## 10. Numerical requirements
 
+- Prefill converts FP32 activations and dequantized weights to FP16 for WMMA
+  input and accumulates products in FP32. This is a documented prefill policy,
+  not an implicit fallback. Tensor tests compare against a float reference and
+  use `2e-2 * (1 + |expected|)` for GEMM outputs; the observed worst case for
+  the checked-in shapes is under `1.2e-2`.
+- The prefill attention reference comparison uses
+  `2e-4 * (1 + |expected|)`; observed worst case is `2.3e-8` for the checked-in
+  shape because both sides use FP32.
+- Chunked prefill must produce the same greedy token as unchunked CPU prefill.
+  The GPU tests compare final logits within `2e-3` and require an identical
+  top-1 token for chunk sizes 1, 3, 7, 16, 17, 33, and 64 on the tiny fixture.
 - Define a tolerance per stage: tensor-level outputs, logits, and final token
   selection.
 - Use stable softmax (max subtraction) and stable normalization.
@@ -294,10 +383,12 @@ benchmarks.
 
 A kernel is not complete until:
 
-- [ ] It matches the CPU reference on random shapes, non-aligned sizes, and
+- [x] It matches the CPU reference on random shapes, non-aligned sizes, and
       boundary cases.
-- [ ] Its numerical tolerance is documented and tested.
-- [ ] It has a benchmark across the relevant shape classes.
+- [x] Its numerical tolerance is documented and tested.
+- [x] It has a benchmark across the relevant shape classes.
+- [x] Its VGPR, LDS, scratch, and occupancy figures are recorded
+      (`scripts/kernel_resources.sh`, results in [benchmarks.md](benchmarks.md)).
 - [ ] Its VGPR, LDS, and occupancy characteristics are recorded.
 - [ ] The planner can select it and fall back from it.
 - [ ] It is integrated into an end-to-end model run.

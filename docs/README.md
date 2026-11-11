@@ -6,13 +6,14 @@ written in **HIP/C++**. It loads GGUF models directly and does not use
 llama.cpp, GGML, or Ollama as an inference execution kernel. Those projects are
 treated as format and correctness references only.
 
-> **Status: CPU and HIP single-request vertical slice implemented.** The
-> repository contains a validated GGUF reader, a Qwen3.5 tokenizer, a CPU
-> reference forward pass, a HIP device executor for the same decoder, a CLI,
-> an OpenAI-compatible single-request server, and a validated kernel library.
-> WMMA/rocBLAS prefill, paged KV, and batching remain future work. See the
-> implementation status below, [hardware.md](hardware.md), and
-> [benchmarks.md](benchmarks.md).
+> **Status: CPU and HIP single-request vertical slice with chunked prefill
+> implemented.** The repository contains a validated GGUF reader, a Qwen3.5
+> tokenizer, a CPU reference forward pass, a HIP device executor for the same
+> decoder, rocWMMA/rocBLAS prefill GEMM, Flash Attention, chunked prefill, a
+> CLI, an OpenAI-compatible single-request server, and a validated kernel
+> library. Paged KV, continuous batching, prefix caching, and HIP Graph remain
+> future work. See the implementation status below, [hardware.md](hardware.md),
+> and [benchmarks.md](benchmarks.md).
 
 ## Target configuration
 
@@ -38,7 +39,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 3. Design separate prefill and decode kernel families, dispatched by shape,
    quantization type, and batch size.
 4. Start with low-latency single-request inference, then add continuous
-   batching, paged KV cache, and chunked prefill.
+   batching and paged KV cache.
 5. Keep Go responsible for model parsing, execution planning, request
    scheduling, memory lifetime, APIs, and observability.
 6. Retain a CPU reference backend for correctness. Add an NPU backend later
@@ -101,8 +102,12 @@ Implemented and tested:
 - `yuuka-server` with `/v1/chat/completions`, SSE streaming, stop sequences,
   health, metrics, cancellation, and explicit busy rejection.
 - HIP C ABI for devices, buffers, streams, events, transfers, planned
-  operations, quantized GEMV, and a batched F32/F16 GEMM baseline; validated
-  `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` GEMV kernels.
+  operations, quantized GEMV, a batched F32/F16 GEMM baseline, and the chunked
+  prefill operator family; validated `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K`
+  GEMV kernels.
+- rocWMMA FP16 and quantized prefill GEMM, a rocBLAS FP16 baseline, causal GQA
+  Flash Attention, chunked prefill with per-chunk KV writes, and the measured
+  `SelectPrefillPath` dispatch table.
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   The CLI and server select it with `--backend hip` when built with
@@ -110,16 +115,20 @@ Implemented and tested:
 - Batched quantized GEMV with measured dispatch thresholds, a per-operation HIP
   event profile path, and per-quantization/per-batch decode baselines.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
-  match and the recorded first-step maximum absolute logit difference is
-  `4.58e-5`. The checked-in tests enforce the token sequence, a loose logit
-  bound, and a layer-by-layer hidden-state comparison; the worst recorded
-  first-prompt layer difference is `5.53e-5`.
+  match. The decode path's recorded first-step maximum absolute logit
+  difference is `4.58e-5`; the chunked prefill path reports `3.65e-3` on the
+  same prompt with the same top-1 token. The checked-in tests enforce the token
+  sequence, a loose logit bound, and a layer-by-layer hidden-state comparison;
+  the worst recorded first-prompt layer difference is `5.53e-5`. Chunked
+  prefill at 1024 tokens produces bitwise identical logits across chunk sizes
+  128, 512, and 1024.
 - Phase 0 hardware probe covering allocation, copy, memset, mapped memory,
   rocBLAS SGEMM, and a rocWMMA FP16 tile.
+- Prefill performance curves at 128-32768 prompt tokens, resource usage, and a
+  same-GGUF comparison with llama.cpp HIP and Vulkan.
 
 Not yet implemented:
 
-- WMMA or rocBLAS prefill integration.
 - Paged KV, continuous batching, prefix cache, or HIP Graph.
 - HIP execution for dense Llama/Qwen3 models.
 - Quantization presets and architectures beyond the tested models.

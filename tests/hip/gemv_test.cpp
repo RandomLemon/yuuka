@@ -410,6 +410,7 @@ int main() {
 
     // The batched GEMV path reuses each packed weight element across rows and
     // must match the reference for every dtype and every measured batch class.
+    // Large-K shapes cover the prompt prefill down projection.
     const int64_t batches[] = {1, 2, 3, 4, 8, 16};
     for (int64_t batch : batches) {
         ok = ok && run_batch_case(device, stream, event,
@@ -425,6 +426,12 @@ int main() {
         ok = ok && run_batch_case(device, stream, event,
                                   YUUKA_DTYPE_Q6_K, "Q6_K", 768, 17, batch, rng);
     }
+    ok = ok && run_batch_case(device, stream, event, YUUKA_DTYPE_Q4_K,
+                              "Q4_K large-K", 9216, 2560, 2, rng);
+    ok = ok && run_batch_case(device, stream, event, YUUKA_DTYPE_Q4_K,
+                              "Q4_K large-K", 9216, 2560, 8, rng);
+    ok = ok && run_batch_case(device, stream, event, YUUKA_DTYPE_Q6_K,
+                              "Q6_K large-K", 9216, 2560, 2, rng);
 
     yuuka_buffer * dummy = nullptr;
     if (ok && check(yuuka_buffer_alloc(device, 4, &dummy), "alloc dummy")) {

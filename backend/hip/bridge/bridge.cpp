@@ -153,7 +153,9 @@ yuuka_status validate_gemv_plan_op(const yuuka_op & op, bool batched) {
     return YUUKA_OK;
 }
 
-// validate_gemm_plan_op applies the same contract to the F32/F16 GEMM plan op.
+// validate_gemm_plan_op checks a prefill GEMM operation. Path AUTO and WMMA
+// read FP32 activations and accept every supported weight dtype. Path BLAS is
+// the rocBLAS FP16 baseline and therefore requires FP16 activations.
 yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     for (int i = 0; i < 3; ++i) {
         if (op.buf[i] == nullptr) {
@@ -164,9 +166,24 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     const uint64_t n_out = op.n[1];
     const uint64_t batch = op.n[2];
     const uint32_t dtype = op.u[0];
-    if (dtype != YUUKA_DTYPE_F32 && dtype != YUUKA_DTYPE_F16) {
+    const uint32_t path = op.u[1];
+    if (!check_gemv_shapes(n_in, dtype)) {
         return fail(YUUKA_ERR_UNSUPPORTED,
-                    "unsupported gemm dtype %u", dtype);
+                    "unsupported gemm dtype %u or input width %llu",
+                    dtype, static_cast<unsigned long long>(n_in));
+    }
+    if (path != YUUKA_GEMM_PATH_AUTO && path != YUUKA_GEMM_PATH_BLAS &&
+        path != YUUKA_GEMM_PATH_WMMA) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unknown gemm path %u", path);
+    }
+    if (path == YUUKA_GEMM_PATH_BLAS) {
+        if (dtype != YUUKA_DTYPE_F16) {
+            return fail(YUUKA_ERR_UNSUPPORTED,
+                        "rocBLAS baseline requires F16 weights, got %u", dtype);
+        }
+        if (n_in > 0x7fffffffULL || n_out > 0x7fffffffULL || batch > 0x7fffffffULL) {
+            return fail(YUUKA_ERR_UNSUPPORTED, "rocBLAS dimensions exceed int32");
+        }
     }
     if (n_in == 0 || n_out == 0 || batch == 0) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm dimensions must be positive");
@@ -183,7 +200,9 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     }
     uint64_t input_bytes = 0;
     uint64_t output_bytes = 0;
-    if (__builtin_mul_overflow(input_elements, uint64_t(sizeof(float)), &input_bytes) ||
+    const uint64_t input_element_bytes =
+        path == YUUKA_GEMM_PATH_BLAS ? uint64_t(2) : uint64_t(sizeof(float));
+    if (__builtin_mul_overflow(input_elements, input_element_bytes, &input_bytes) ||
         __builtin_mul_overflow(output_elements, uint64_t(sizeof(float)), &output_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm dimensions overflow");
     }
@@ -195,6 +214,260 @@ yuuka_status validate_gemm_plan_op(const yuuka_op & op) {
     }
     if (!buffer_range_ok(op.buf[2], op.off[2], output_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm output buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// range_elements checks a [rows, width] region with an explicit row stride.
+bool range_elements(const yuuka_buffer * buf, uint64_t offset, uint64_t rows,
+                    uint64_t stride, uint64_t width) {
+    if (buf == nullptr || rows == 0 || stride < width) {
+        return false;
+    }
+    uint64_t elems = 0;
+    if (__builtin_mul_overflow(rows - 1, stride, &elems) ||
+        __builtin_add_overflow(elems, width, &elems)) {
+        return false;
+    }
+    uint64_t bytes = 0;
+    if (__builtin_mul_overflow(elems, uint64_t(sizeof(float)), &bytes)) {
+        return false;
+    }
+    return buffer_range_ok(buf, offset, bytes);
+}
+
+yuuka_status validate_batch_norm_plan_op(const yuuka_op & op) {
+    const uint64_t cols = op.n[0];
+    const uint64_t rows = op.n[1];
+    const uint64_t src_stride = op.n[2];
+    const uint64_t dst_stride = op.n[3];
+    if (cols == 0 || rows == 0 || src_stride < cols || dst_stride < cols) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid batch norm dimensions");
+    }
+    if (op.buf[0] == nullptr || op.buf[1] == nullptr || op.buf[2] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch norm buffer is null");
+    }
+    if (!range_elements(op.buf[0], op.off[0], rows, src_stride, cols) ||
+        !range_elements(op.buf[2], op.off[2], rows, dst_stride, cols)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch norm buffer is too small");
+    }
+    uint64_t weight_bytes = 0;
+    if (__builtin_mul_overflow(cols, uint64_t(sizeof(float)), &weight_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch norm weight is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_batch_heads_plan_op(const yuuka_op & op) {
+    const uint64_t size = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t stride = op.n[2];
+    const uint64_t rows = op.n[3];
+    if (size == 0 || heads == 0 || rows == 0 || stride < size) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid head norm dimensions");
+    }
+    if (op.buf[0] == nullptr || op.buf[1] == nullptr || op.buf[2] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "head norm buffer is null");
+    }
+    if (!range_elements(op.buf[0], op.off[0], rows, heads * stride, heads * stride) ||
+        !range_elements(op.buf[2], op.off[2], rows, heads * stride, heads * stride)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "head norm buffer is too small");
+    }
+    uint64_t weight_bytes = 0;
+    if (__builtin_mul_overflow(size, uint64_t(sizeof(float)), &weight_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "head norm weight is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_rope_batch_plan_op(const yuuka_op & op) {
+    const uint64_t heads = op.n[0];
+    const uint64_t stride = op.n[1];
+    const uint64_t head_dim = op.n[2];
+    const uint64_t rot_dim = op.n[3];
+    const uint64_t rows = op.n[4];
+    const uint64_t row_stride = op.n[5];
+    if (heads == 0 || rows == 0 || rot_dim == 0 || rot_dim % 2 != 0 ||
+        rot_dim > head_dim || stride < head_dim || row_stride < heads * stride) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid batch RoPE dimensions");
+    }
+    if (rot_dim / 2 > 1024) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "batch RoPE rotation dimension is too large");
+    }
+    if (op.buf[0] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch RoPE buffer is null");
+    }
+    if (!range_elements(op.buf[0], op.off[0], rows, row_stride, heads * stride)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch RoPE buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_kv_write_batch_plan_op(const yuuka_op & op) {
+    const uint64_t kv_dim = op.n[0];
+    const uint64_t rows = op.n[1];
+    const uint64_t capacity = op.u[0];
+    if (kv_dim == 0 || rows == 0 || capacity < rows) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid batch KV write dimensions");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch KV write buffer %d is null", i);
+        }
+    }
+    if (!range_elements(op.buf[0], op.off[0], rows, kv_dim, kv_dim) ||
+        !range_elements(op.buf[1], op.off[1], rows, kv_dim, kv_dim) ||
+        !range_elements(op.buf[2], op.off[2], capacity, kv_dim, kv_dim) ||
+        !range_elements(op.buf[3], op.off[3], capacity, kv_dim, kv_dim)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch KV write buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_attention_prefill_plan_op(const yuuka_op & op) {
+    const uint64_t kv_heads = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t head_dim = op.n[2];
+    const uint64_t kv_dim = op.n[3];
+    const uint64_t rows = op.n[4];
+    const uint64_t capacity = op.u[0];
+    if (kv_heads == 0 || heads == 0 || head_dim == 0 || rows == 0 ||
+        capacity < rows || heads % kv_heads != 0 || kv_dim != kv_heads * head_dim) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid prefill attention dimensions");
+    }
+    if (head_dim > 256) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "prefill attention head dimension exceeds 256");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "prefill attention buffer %d is null", i);
+        }
+    }
+    const uint64_t q_stride = heads * 2 * head_dim;
+    const uint64_t o_stride = heads * head_dim;
+    if (!range_elements(op.buf[0], op.off[0], rows, q_stride, q_stride) ||
+        !range_elements(op.buf[3], op.off[3], rows, o_stride, o_stride) ||
+        !range_elements(op.buf[1], 0, capacity, kv_dim, kv_dim) ||
+        !range_elements(op.buf[2], 0, capacity, kv_dim, kv_dim)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "prefill attention buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_recurrent_chunk_plan_op(const yuuka_op & op) {
+    const uint64_t rows = op.n[0];
+    const uint64_t groups = op.n[1];
+    const uint64_t heads = op.n[2];
+    const uint64_t state = op.n[3];
+    const uint64_t conv_dim = op.n[4];
+    const uint64_t inner = op.n[5];
+    const uint64_t kernel = op.u[0];
+    const uint64_t expected_inner = heads * state;
+    const uint64_t expected_conv = 2 * groups * state + expected_inner;
+    if (rows == 0 || groups == 0 || heads == 0 || state == 0 || kernel < 2 ||
+        inner != expected_inner || conv_dim != expected_conv ||
+        (state & (state - 1)) != 0 || state > 1024) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid recurrent chunk dimensions");
+    }
+    for (int i = 0; i < 12; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "recurrent chunk buffer %d is null", i);
+        }
+    }
+    uint64_t need[12] = {};
+    uint64_t elems = 0;
+    if (__builtin_mul_overflow(conv_dim, kernel - 1, &elems)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent chunk dimensions overflow");
+    }
+    need[0] = elems;
+    if (__builtin_mul_overflow(heads, state * state, &elems)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent chunk dimensions overflow");
+    }
+    need[1] = elems;
+    if (__builtin_mul_overflow(rows, conv_dim, &elems)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent chunk dimensions overflow");
+    }
+    need[2] = elems;
+    need[11] = elems;
+    if (__builtin_mul_overflow(rows, inner, &elems)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent chunk dimensions overflow");
+    }
+    need[3] = elems;
+    need[10] = elems;
+    if (__builtin_mul_overflow(rows, heads, &elems)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent chunk dimensions overflow");
+    }
+    need[4] = elems;
+    need[5] = elems;
+    if (__builtin_mul_overflow(conv_dim, kernel, &elems)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "recurrent chunk dimensions overflow");
+    }
+    need[6] = elems;
+    need[7] = heads;
+    need[8] = heads;
+    need[9] = state;
+    for (int i = 0; i < 12; ++i) {
+        uint64_t bytes = 0;
+        if (__builtin_mul_overflow(need[i], uint64_t(sizeof(float)), &bytes) ||
+            !buffer_range_ok(op.buf[i], op.off[i], bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "recurrent chunk buffer %d is too small", i);
+        }
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_embedding_batch_plan_op(const yuuka_op & op) {
+    const uint64_t cols = op.n[0];
+    const uint64_t rows = op.n[1];
+    const uint64_t row_bytes = op.n[2];
+    const uint64_t vocab = op.n[3];
+    const uint32_t dtype = op.u[0];
+    if (cols == 0 || rows == 0 || vocab == 0 || op.buf[0] == nullptr ||
+        op.buf[1] == nullptr || op.buf[2] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid batch embedding arguments");
+    }
+    uint64_t expected_row = 0;
+    if (!checked_row_bytes(cols, dtype, &expected_row) || expected_row != row_bytes) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "batch embedding dtype %u does not match row layout", dtype);
+    }
+    uint64_t token_bytes = 0;
+    uint64_t out_bytes = 0;
+    if (__builtin_mul_overflow(rows, uint64_t(4), &token_bytes) ||
+        __builtin_mul_overflow(rows, cols, &out_bytes) ||
+        __builtin_mul_overflow(out_bytes, uint64_t(sizeof(float)), &out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch embedding dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[1], op.off[1], out_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], token_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "batch embedding buffer is too small");
+    }
+    uint64_t weight_bytes = 0;
+    if (__builtin_mul_overflow(row_bytes, vocab, &weight_bytes) ||
+        !buffer_range_ok(op.buf[0], 0, weight_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "batch embedding weight buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_cast_plan_op(const yuuka_op & op) {
+    if (op.buf[0] == nullptr || op.buf[1] == nullptr || op.n[0] == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid cast arguments");
+    }
+    uint64_t src_bytes = 0;
+    uint64_t dst_bytes = 0;
+    if (__builtin_mul_overflow(op.n[0], uint64_t(4), &src_bytes) ||
+        __builtin_mul_overflow(op.n[0], uint64_t(2), &dst_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "cast dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], src_bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], dst_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "cast buffer is too small");
     }
     return YUUKA_OK;
 }
@@ -251,22 +524,32 @@ yuuka_status launch_gemv_batch_dispatch(yuuka_op const & op, hipStream_t stream)
 
 yuuka_status launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
     auto * out = op_ptr<float>(op, 2);
-    const auto * x = op_ptr<const float>(op, 1);
     const void * w = op_ptr<const void>(op, 0);
     const uint64_t n_in = op.n[0];
     const uint64_t n_out = op.n[1];
     const uint64_t batch = op.n[2];
-    switch (op.u[0]) {
-        case YUUKA_DTYPE_F32:
-            yuuka::launch_gemm_f32(out, x, static_cast<const float *>(w),
-                                   n_in, n_out, batch, stream);
-            break;
-        case YUUKA_DTYPE_F16:
-            yuuka::launch_gemm_f16(out, x, w, n_in, n_out, batch, stream);
-            break;
-        default:
-            return fail(YUUKA_ERR_UNSUPPORTED, "unsupported gemm dtype %u", op.u[0]);
+    const uint32_t dtype = op.u[0];
+    const uint32_t path = op.u[1];
+    if (path == YUUKA_GEMM_PATH_BLAS) {
+        const void * x16 = op_ptr<const void>(op, 1);
+        const int status = yuuka::launch_gemm_blas_f16(out, x16, w, n_in, n_out,
+                                                       batch, stream);
+        if (status != 0) {
+            return fail(YUUKA_ERR_DEVICE, "rocBLAS gemm failed with status %d", status);
+        }
+        return YUUKA_OK;
     }
+    if (path == YUUKA_GEMM_PATH_WMMA ||
+        (path == YUUKA_GEMM_PATH_AUTO && dtype != YUUKA_DTYPE_F32)) {
+        yuuka::launch_gemm_wmma_f32out(out, op_ptr<const float>(op, 1), w,
+                                       n_in, n_out, batch, dtype, stream);
+        return YUUKA_OK;
+    }
+    if (dtype != YUUKA_DTYPE_F32) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported gemm dtype %u", dtype);
+    }
+    yuuka::launch_gemm_f32(out, op_ptr<const float>(op, 1),
+                           static_cast<const float *>(w), n_in, n_out, batch, stream);
     return YUUKA_OK;
 }
 
@@ -323,6 +606,83 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             if (status != YUUKA_OK) {
                 return status;
             }
+            break;
+        }
+        case YUUKA_OP_RMSNORM_BATCH: {
+            yuuka::launch_rmsnorm_batch_f32(
+                op_ptr<float>(op, 2), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), int(op.n[1]), int(op.n[0]),
+                int(op.n[2]), int(op.n[3]), op.f[0], stream);
+            break;
+        }
+        case YUUKA_OP_RMSNORM_HEADS_BATCH: {
+            yuuka::launch_rmsnorm_heads_batch_f32(
+                op_ptr<float>(op, 2), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), int(op.n[3]), int(op.n[1]),
+                int(op.n[0]), int(op.n[2]), op.f[0], stream);
+            break;
+        }
+        case YUUKA_OP_ROPE_BATCH: {
+            yuuka::launch_rope_batch_f32(
+                op_ptr<float>(op, 0), int(op.n[4]), int(op.n[0]), int(op.n[1]),
+                int(op.n[2]), int(op.n[3]), int(position), op.f[0], int(op.n[5]),
+                stream);
+            break;
+        }
+        case YUUKA_OP_KV_WRITE_BATCH: {
+            const uint64_t rows = op.n[1];
+            const uint64_t capacity = op.u[0];
+            if (uint64_t(position) + rows > capacity) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "batch KV write at %u with %llu rows exceeds capacity %llu",
+                            position, static_cast<unsigned long long>(rows),
+                            static_cast<unsigned long long>(capacity));
+            }
+            yuuka::launch_kv_write_batch_f32(
+                op_ptr<float>(op, 2), op_ptr<float>(op, 3),
+                op_ptr<const float>(op, 0), op_ptr<const float>(op, 1),
+                int(rows), int(op.n[0]), position, stream);
+            break;
+        }
+        case YUUKA_OP_ATTENTION_PREFILL: {
+            const uint64_t rows = op.n[4];
+            const uint64_t capacity = op.u[0];
+            if (uint64_t(position) + rows > capacity) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "prefill attention at %u with %llu rows exceeds capacity %llu",
+                            position, static_cast<unsigned long long>(rows),
+                            static_cast<unsigned long long>(capacity));
+            }
+            yuuka::launch_attention_prefill_f32(
+                op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
+                int(rows), int(position), int(capacity), op.f[0], stream);
+            break;
+        }
+        case YUUKA_OP_RECURRENT_CHUNK: {
+            yuuka::launch_recurrent_chunk_f32(
+                op_ptr<float>(op, 0), op_ptr<float>(op, 1),
+                op_ptr<const float>(op, 2), op_ptr<const float>(op, 3),
+                op_ptr<const float>(op, 4), op_ptr<const float>(op, 5),
+                op_ptr<const float>(op, 6), op_ptr<const float>(op, 7),
+                op_ptr<const float>(op, 8), op_ptr<const float>(op, 9),
+                op_ptr<float>(op, 11), op_ptr<float>(op, 10),
+                int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
+                int(op.n[4]), int(op.n[5]), int(op.u[0]), op.f[0], op.f[1],
+                stream);
+            break;
+        }
+        case YUUKA_OP_EMBEDDING_BATCH: {
+            yuuka::launch_embedding_batch_f32(
+                op_ptr<float>(op, 1), op_ptr<const void>(op, 0),
+                op_ptr<const int32_t>(op, 2), int(op.n[1]), op.n[2],
+                int64_t(op.n[0]), op.u[0], stream);
+            break;
+        }
+        case YUUKA_OP_CAST_F16: {
+            yuuka::launch_cast_f32_to_f16(
+                op_ptr<void>(op, 1), op_ptr<const float>(op, 0), op.n[0], stream);
             break;
         }
         case YUUKA_OP_RMSNORM: {
@@ -946,6 +1306,119 @@ YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
     });
 }
 
+YUUKA_API yuuka_status yuuka_gemm_wmma(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * x, const yuuka_buffer * w,
+                        uint64_t n_in, uint64_t n_out, uint64_t batch,
+                        uint32_t dtype, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || out == nullptr || x == nullptr || w == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        yuuka_op op{};
+        op.code = YUUKA_OP_GEMM;
+        op.buf[0] = const_cast<yuuka_buffer *>(w);
+        op.buf[1] = const_cast<yuuka_buffer *>(x);
+        op.buf[2] = out;
+        op.n[0] = n_in;
+        op.n[1] = n_out;
+        op.n[2] = batch;
+        op.u[0] = dtype;
+        op.u[1] = YUUKA_GEMM_PATH_WMMA;
+        yuuka_status status = validate_gemm_plan_op(op);
+        if (status != YUUKA_OK) {
+            return status;
+        }
+        yuuka::launch_gemm_wmma_f32out(static_cast<float *>(out->ptr),
+                                       static_cast<const float *>(x->ptr),
+                                       w->ptr, n_in, n_out, batch, dtype,
+                                       stream->stream);
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "wmma gemm launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_gemm_blas(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * x, const yuuka_buffer * w,
+                        uint64_t n_in, uint64_t n_out, uint64_t batch,
+                        yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || out == nullptr || x == nullptr || w == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        yuuka_op op{};
+        op.code = YUUKA_OP_GEMM;
+        op.buf[0] = const_cast<yuuka_buffer *>(w);
+        op.buf[1] = const_cast<yuuka_buffer *>(x);
+        op.buf[2] = out;
+        op.n[0] = n_in;
+        op.n[1] = n_out;
+        op.n[2] = batch;
+        op.u[0] = YUUKA_DTYPE_F16;
+        op.u[1] = YUUKA_GEMM_PATH_BLAS;
+        yuuka_status status = validate_gemm_plan_op(op);
+        if (status != YUUKA_OK) {
+            return status;
+        }
+        const int blas = yuuka::launch_gemm_blas_f16(static_cast<float *>(out->ptr),
+                                                     x->ptr, w->ptr, n_in, n_out,
+                                                     batch, stream->stream);
+        if (blas != 0) {
+            return fail(YUUKA_ERR_DEVICE, "rocBLAS gemm failed with status %d", blas);
+        }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "rocBLAS gemm launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_cast_f32_to_f16(yuuka_stream * stream, yuuka_buffer * dst,
+                        const yuuka_buffer * src, uint64_t n, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || dst == nullptr || src == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        yuuka_op op{};
+        op.code = YUUKA_OP_CAST_F16;
+        op.buf[0] = const_cast<yuuka_buffer *>(src);
+        op.buf[1] = dst;
+        op.n[0] = n;
+        yuuka_status status = validate_cast_plan_op(op);
+        if (status != YUUKA_OK) {
+            return status;
+        }
+        yuuka::launch_cast_f32_to_f16(dst->ptr, static_cast<const float *>(src->ptr),
+                                       n, stream->stream);
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "cast launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
 YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out) {
     return guard([&]() -> yuuka_status {
         if (dev == nullptr || out == nullptr) {
@@ -965,7 +1438,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMV_BATCH) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_CAST_F16) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -978,6 +1451,30 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_GEMM:
                 status = validate_gemm_plan_op(*op);
+                break;
+            case YUUKA_OP_RMSNORM_BATCH:
+                status = validate_batch_norm_plan_op(*op);
+                break;
+            case YUUKA_OP_RMSNORM_HEADS_BATCH:
+                status = validate_batch_heads_plan_op(*op);
+                break;
+            case YUUKA_OP_ROPE_BATCH:
+                status = validate_rope_batch_plan_op(*op);
+                break;
+            case YUUKA_OP_KV_WRITE_BATCH:
+                status = validate_kv_write_batch_plan_op(*op);
+                break;
+            case YUUKA_OP_ATTENTION_PREFILL:
+                status = validate_attention_prefill_plan_op(*op);
+                break;
+            case YUUKA_OP_RECURRENT_CHUNK:
+                status = validate_recurrent_chunk_plan_op(*op);
+                break;
+            case YUUKA_OP_EMBEDDING_BATCH:
+                status = validate_embedding_batch_plan_op(*op);
+                break;
+            case YUUKA_OP_CAST_F16:
+                status = validate_cast_plan_op(*op);
                 break;
             default:
                 break;
@@ -1030,7 +1527,7 @@ YUUKA_API yuuka_status yuuka_plan_execute_profiled(
             if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
                 continue;
             }
-            for (int i = 0; i < 10; ++i) {
+            for (int i = 0; i < 12; ++i) {
                 if (op.buf[i] != nullptr && op.buf[i]->ptr == nullptr) {
                     cleanup();
                     return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan op %u has a null buffer", op.code);
@@ -1105,7 +1602,7 @@ YUUKA_API yuuka_status yuuka_plan_execute(yuuka_plan * plan, yuuka_stream * stre
             if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
                 continue;
             }
-            for (int i = 0; i < 10; ++i) {
+            for (int i = 0; i < 12; ++i) {
                 if (op.buf[i] != nullptr && op.buf[i]->ptr == nullptr) {
                     return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan op %u has a null buffer", op.code);
                 }

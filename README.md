@@ -13,17 +13,21 @@ Llama and Qwen3 layouts. It provides:
 - Qwen byte-level BPE and Llama SentencePiece tokenizers with Qwen chat rendering;
 - CPU reference decoders used as the correctness oracle and default backend;
 - a HIP decoder that executes the full Qwen3.5 model on the GPU;
-- a validated F32/F16 batched GEMM ABI baseline for prefill experiments;
+- a validated prefill family: rocWMMA FP16 and quantized GEMM, a rocBLAS FP16
+  baseline, Flash Attention, and chunked prefill;
 - a CLI (`inspect`, `run`, `bench`);
 - an OpenAI-compatible server for single-request chat completions.
 
-CPU and GPU greedy tokens match, layer-by-layer hidden states agree, and the
-recorded first-step maximum absolute logit difference is `4.58e-5`.
-WMMA/rocBLAS prefill, Flash Attention, chunked prefill, paged KV, continuous
-batching, prefix caching, and HIP Graph are not implemented yet. A short-context
-greedy baseline for Qwen3.5-4B Q4_K_M measured 1.93 decode tok/s on the CPU
-reference and 9.87 decode tok/s on HIP; see
-[`docs/benchmarks.md`](docs/benchmarks.md) for the exact conditions.
+CPU and GPU greedy tokens match, layer-by-layer hidden states agree on the
+decode path, and the recorded decode-path first-step maximum absolute logit
+difference is `4.58e-5`. The chunked prefill path on the same 5-token prompt
+differs from the CPU reference by `3.65e-3` in the worst logit and selects the
+same top-1 token; chunk-size equivalence at 1024 tokens is exact.
+Paged KV, continuous batching, prefix caching, and HIP Graph are not
+implemented yet. A short-context greedy baseline for Qwen3.5-4B Q4_K_M measured
+1.93 decode tok/s on the CPU reference and 9.87 decode tok/s on HIP; prefill
+throughput and prompt-length curves are in
+[`docs/benchmarks.md`](docs/benchmarks.md) with the exact conditions.
 
 ## Supported models
 
@@ -173,6 +177,7 @@ When `--prompt` is empty, the prompt is read from standard input.
 | `--chat` | `false` | Render the model chat template |
 | `--system` | empty | System message used with `--chat` |
 | `--thinking` | `false` | Leave an open reasoning block in chat mode |
+| `--chunk-size` | `512` | HIP prompt chunk size (max 4096) |
 
 Generation stops on EOS, on the token limit, or on interrupt/SIGTERM. Prefill,
 TTFT, decode throughput, and the finish reason are written to standard error so
@@ -188,11 +193,13 @@ that generated text stays clean on standard output.
   --decode-tokens 32 \
   --warmup 1 \
   --reps 3 \
+  --chunk-size 512 \
   --hash
 ```
 
 `bench` reports p50/p95 prefill, TTFT, and decode timings. It uses a synthetic
-English prompt and greedy sampling.
+English prompt and greedy sampling. `--chunk-size` bounds each prefill
+submission; larger chunks amortize weight reads but raise activation memory.
 
 ### OpenAI-compatible server
 
@@ -283,8 +290,10 @@ skip with exit code 77 when the requested HIP device is unavailable.
   and Go packages.
 - The tokenizer implementation covers Qwen byte-level BPE and Llama-family
   SentencePiece vocabularies. Non-Qwen chat templates are not implemented.
-- Prefill executes one token at a time. There is no batched prefill, WMMA or
-  rocBLAS GEMM path, or Flash Attention.
+- Prefill uses chunked batched plans with rocWMMA/rocBLAS GEMM and Flash
+  Attention. The Flash Attention kernel supports head dimensions up to 256.
+  Chunks are bounded at 4096 rows; paged attention and continuous batching are
+  not implemented.
 - KV cache is contiguous `F32`. Paged KV, quantized KV, prefix caching, and
   continuous batching are not implemented.
 - The server is single-request. It rejects concurrent work instead of queueing

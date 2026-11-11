@@ -235,6 +235,7 @@ func runGenerate(args []string) error {
 	thinking := fs.Bool("thinking", false, "enable an open reasoning block in chat mode")
 	contextSize := fs.Int("ctx", 4096, "context capacity")
 	backend := fs.String("backend", "cpu", "execution backend: cpu or hip")
+	chunkSize := fs.Int("chunk-size", 512, "HIP prompt chunk size")
 	maxTokens := fs.Int("max-tokens", 128, "maximum generated tokens")
 	temperature := fs.Float64("temperature", 0, "sampling temperature (0 = greedy)")
 	topK := fs.Int("top-k", 40, "top-k sampling cutoff")
@@ -284,7 +285,7 @@ func runGenerate(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := buildEngine(l, *contextSize, sampler, *backend)
+	runner, err := buildEngine(l, *contextSize, sampler, *backend, *chunkSize)
 	if err != nil {
 		return err
 	}
@@ -321,6 +322,7 @@ func runBench(args []string) error {
 	decodeTokens := fs.Int("decode-tokens", 32, "generated tokens per repetition")
 	contextSize := fs.Int("ctx", 0, "context capacity (default: prompt + decode + 64)")
 	backend := fs.String("backend", "cpu", "execution backend: cpu or hip")
+	chunkSize := fs.Int("chunk-size", 512, "HIP prompt chunk size")
 	warmup := fs.Int("warmup", 1, "warmup repetitions")
 	reps := fs.Int("reps", 3, "measured repetitions")
 	hash := fs.Bool("hash", false, "print the model SHA-256")
@@ -355,7 +357,7 @@ func runBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := buildEngine(l, capacity, sampler, *backend)
+	runner, err := buildEngine(l, capacity, sampler, *backend, *chunkSize)
 	if err != nil {
 		return err
 	}
@@ -421,7 +423,7 @@ func percentile(values []float64, p float64) float64 {
 	return sorted[index]
 }
 
-func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string) (*engine.Engine, error) {
+func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string, chunkSize int) (*engine.Engine, error) {
 	switch backend {
 	case "cpu":
 		return l.cpuEngine(capacity, sampler)
@@ -429,6 +431,16 @@ func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend 
 		runtime, err := newHIPRuntime(l, capacity)
 		if err != nil {
 			return nil, err
+		}
+		if chunkSize <= 0 {
+			_ = runtime.Close()
+			return nil, fmt.Errorf("chunk size must be positive")
+		}
+		if configurer, ok := runtime.(interface{ SetPrefillChunk(int) error }); ok {
+			if err := configurer.SetPrefillChunk(chunkSize); err != nil {
+				_ = runtime.Close()
+				return nil, err
+			}
 		}
 		runner, err := engine.NewWithRuntime(runtime, l.tokenizer, sampler)
 		if err != nil {

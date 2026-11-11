@@ -160,7 +160,9 @@ expected batch shapes. It produces an `ExecutionPlan` containing:
 - fallback choices for unsupported operations.
 
 Planning happens at load time and whenever a new shape class requires a new
-kernel configuration. It must not perform a cgo call per tensor per token.
+kernel configuration. It must not perform a cgo call per tensor per token. The
+HIP runtime caches one prefill plan per distinct chunk length; the final partial
+chunk has its own plan.
 
 ## 5. Execution model
 
@@ -180,17 +182,19 @@ Decode loop: quantized GEMV + paged attention + sampling
 Stream tokens / finish / release request resources
 ```
 
-Current status: the single-request `qwen35` path processes prompt tokens one at
-a time through the same planned decode graph. Batched prefill, paged attention,
-and graph replay in this diagram are target behavior.
+Current status: the single-request `qwen35` path processes prompts through
+cached chunked prefill plans (batched WMMA or rocBLAS GEMM, Flash Attention, and
+chunked KV writes) and then decodes through the single-token graph. Paged
+attention and graph replay in this diagram remain target behavior.
 
 Key rules:
 
 1. GGUF data is validated before any device allocation.
 2. Weights are loaded into a device-resident pool for the model lifetime.
-3. In the target design, prefill and decode share the KV cache but use different
-   operator paths. The current single-request path uses the decode graph for
-   both.
+3. Prefill and decode share the KV cache but use different operator paths.
+   Prefill uses chunked batched plans; decode uses the single-token GEMV and
+   per-head attention graph. Dense models still use the decode graph for
+   prompts because their HIP execution path is not implemented.
 4. Sampling may run on the GPU or on the host through a low-overhead path; the
    choice is a plan decision, not a per-token branch in model code.
 5. In the target design, request cancellation releases KV blocks and scratch

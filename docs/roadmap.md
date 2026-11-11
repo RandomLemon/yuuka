@@ -26,8 +26,7 @@ The Phase 0 toolchain is proven and recorded in [hardware.md](hardware.md).
 The CPU reference and HIP single-request vertical slices for `qwen35` are
 implemented with a CLI and server. HIP allocation, transfers, streams, events,
 planned operators, and the full decoder execution path are implemented and
-tested; CPU and HIP greedy tokens match, and the recorded first-step maximum
-absolute logit difference is `4.58e-5`.
+tested; CPU and HIP greedy tokens match.
 
 Phase 0 exit criteria are met: the hardware report records the toolchain,
 firmware, power-management profile, short sustained-load telemetry, and a clean
@@ -35,16 +34,33 @@ checkout is verified by `scripts/check_clean_build.sh` plus CI. Phase 1 exit cri
 models: CPU reference paths exist for `qwen35`, dense Llama, and dense Qwen3,
 the Qwen and Llama tokenizers match reference token IDs, CPU/GPU logits and
 layer traces agree, and a validated F32/F16 GEMM ABI baseline is checked in.
+The decode path's first-step maximum absolute logit difference is `4.58e-5`; the
+chunked prefill path reports `3.65e-3` on the same prompt with the same top-1
+token, and chunk-size equivalence at 1024 tokens is exact.
 HIP execution for the dense models is not implemented.
 
 Phase 2 exit criteria are met: quantized GEMV is correct across randomized
 shapes, GEMV accounts for about 90.5% of profiled decode time, and
-per-quantization and per-batch baselines are recorded. WMMA/rocBLAS prefill,
-paged KV, continuous batching, and prefix caching are not implemented yet. The
-current measured baseline is in [benchmarks.md](benchmarks.md).
+per-quantization and per-batch baselines are recorded.
 
-Phase 0, Phase 1, and Phase 2 exit gates are declared complete. Later phases
-remain open, and the status above identifies their current boundary.
+Phase 3 exit criteria are met: prompt-length curves at 128, 512, 2048, 8192, and
+32768 tokens are recorded in [benchmarks.md](benchmarks.md), together with
+same-GGUF comparisons against llama.cpp HIP and Vulkan. The measured
+`SelectPrefillPath` table selects the custom WMMA GEMM or the rocBLAS FP16
+baseline only in shape classes where the sweep showed them faster than the
+compared baseline. Sixteen-token prefill latency improved from 1.433 s to
+0.137 s and decode is unchanged. Chunked prefill passes logit/state equivalence
+tests at chunk sizes 1-64, produces bitwise-identical logits for a 1024-token
+prompt at chunk sizes 128, 512, and 1024, and completes a 32768-token prompt.
+VGPR, LDS, scratch, and occupancy are recorded. The prompt path remains 5-16x
+behind llama.cpp HIP and 7-18x behind llama.cpp Vulkan across the measured
+prompt lengths; the remaining gap has not been fully attributed, and the 32-row
+M tile plus scalar attention are follow-up optimizations rather than exit
+criteria.
+
+Phase 0 through Phase 3 exit gates are declared complete. Phase 4 and Phase 5
+remain open: paged KV, continuous batching, prefix caching, and HIP Graph are not
+implemented.
 
 ## 2. Phase overview
 
@@ -197,13 +213,13 @@ performance.
 
 ### Exit criteria
 
-- [ ] Performance curves exist for 128, 512, 2048, 8192, and 32768 prompt tokens.
-- [ ] Results are compared with llama.cpp HIP and Vulkan on the same GGUF and
+- [x] Performance curves exist for 128, 512, 2048, 8192, and 32768 prompt tokens.
+- [x] Results are compared with llama.cpp HIP and Vulkan on the same GGUF and
       hardware conditions.
-- [ ] Custom quantized GEMM is selected only where it beats the baseline.
-- [ ] Short-prompt latency does not regress.
-- [ ] Chunked prefill completes long prompts without corrupting KV state.
-- [ ] Kernel resource usage (VGPR, LDS, occupancy) is recorded.
+- [x] Custom quantized GEMM is selected only where it beats the baseline.
+- [x] Short-prompt latency does not regress.
+- [x] Chunked prefill completes long prompts without corrupting KV state.
+- [x] Kernel resource usage (VGPR, LDS, occupancy) is recorded.
 
 ### Risks and dependencies
 

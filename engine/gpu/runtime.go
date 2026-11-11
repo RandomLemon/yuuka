@@ -48,6 +48,26 @@ type activations struct {
 	scores  *hip.Buffer
 }
 
+type prefillActivations struct {
+	x       *hip.Buffer
+	norm    *hip.Buffer
+	q       *hip.Buffer
+	k       *hip.Buffer
+	v       *hip.Buffer
+	attn    *hip.Buffer
+	tmp     *hip.Buffer
+	qkv     *hip.Buffer
+	z       *hip.Buffer
+	beta    *hip.Buffer
+	alpha   *hip.Buffer
+	conv    *hip.Buffer
+	gdnNorm *hip.Buffer
+	ffnGate *hip.Buffer
+	ffnUp   *hip.Buffer
+	xF16    *hip.Buffer
+	tokens  *hip.Buffer
+}
+
 // Runtime is a HIP execution backend implementing engine.Runtime.
 type Runtime struct {
 	device    *hip.Device
@@ -65,6 +85,10 @@ type Runtime struct {
 	logits    []float32
 	all       []*hip.Buffer
 	closed    bool
+
+	prefill      prefillActivations
+	prefillRows  int
+	prefillPlans map[int]*hip.Plan
 }
 
 // New uploads model weights and builds the device plan.
@@ -105,8 +129,18 @@ func New(reader *gguf.Reader, model *qwen35.Model, capacity int) (*Runtime, erro
 		r.Close()
 		return nil, err
 	}
+	chunk := defaultPrefillChunk
+	if chunk > capacity {
+		chunk = capacity
+	}
+	if err := r.configurePrefill(chunk); err != nil {
+		r.Close()
+		return nil, err
+	}
 	return r, nil
 }
+
+const defaultPrefillChunk = 512
 
 func (r *Runtime) setup(reader *gguf.Reader, model *qwen35.Model) error {
 	cfg := r.config
@@ -196,6 +230,394 @@ func (r *Runtime) allocActivations() error {
 		*entry.dst = buf
 	}
 	return nil
+}
+
+const maxPrefillChunk = 4096
+
+// SetPrefillChunk selects the prompt chunk size. It clamps the request to the
+// context capacity and to maxPrefillChunk. The call reallocates chunk buffers
+// and rebuilds cached plans; call Reset before reusing the runtime.
+func (r *Runtime) SetPrefillChunk(rows int) error {
+	if r == nil || r.closed {
+		return fmt.Errorf("runtime is closed")
+	}
+	if rows <= 0 {
+		return fmt.Errorf("prefill chunk %d must be positive", rows)
+	}
+	if rows > maxPrefillChunk {
+		rows = maxPrefillChunk
+	}
+	if rows > r.capacity {
+		rows = r.capacity
+	}
+	return r.configurePrefill(rows)
+}
+
+// configurePrefill allocates the chunk activations and resets the plan cache.
+func (r *Runtime) configurePrefill(rows int) error {
+	if rows <= 0 {
+		return fmt.Errorf("prefill chunk %d must be positive", rows)
+	}
+	if rows == r.prefillRows && r.prefill.x != nil {
+		return nil
+	}
+	for _, plan := range r.prefillPlans {
+		_ = plan.Close()
+	}
+	r.prefillPlans = make(map[int]*hip.Plan)
+	cfg := r.config
+	p := &r.prefill
+	maxWidth := cfg.HiddenSize
+	for _, width := range []int{cfg.FFNSize, cfg.HeadCount * cfg.HeadDim, cfg.SSMInnerSize} {
+		if width > maxWidth {
+			maxWidth = width
+		}
+	}
+	rowElems := func(width int) uint64 { return uint64(rows) * uint64(width) * 4 }
+	entries := []struct {
+		dst   **hip.Buffer
+		bytes uint64
+	}{
+		{&p.x, rowElems(cfg.HiddenSize)},
+		{&p.norm, rowElems(cfg.HiddenSize)},
+		{&p.q, rowElems(cfg.HeadCount * cfg.HeadDim * 2)},
+		{&p.k, rowElems(cfg.KVHeadCount * cfg.HeadDim)},
+		{&p.v, rowElems(cfg.KVHeadCount * cfg.HeadDim)},
+		{&p.attn, rowElems(cfg.HeadCount * cfg.HeadDim)},
+		{&p.tmp, rowElems(cfg.HiddenSize)},
+		{&p.qkv, rowElems(2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize)},
+		{&p.z, rowElems(cfg.SSMInnerSize)},
+		{&p.beta, rowElems(cfg.SSMTimeStepRank)},
+		{&p.alpha, rowElems(cfg.SSMTimeStepRank)},
+		{&p.conv, rowElems(2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize)},
+		{&p.gdnNorm, rowElems(cfg.SSMInnerSize)},
+		{&p.ffnGate, rowElems(cfg.FFNSize)},
+		{&p.ffnUp, rowElems(cfg.FFNSize)},
+		{&p.xF16, uint64(rows) * uint64(maxWidth) * 2},
+		{&p.tokens, uint64(rows) * 4},
+	}
+	for _, entry := range entries {
+		buf, err := r.alloc(entry.bytes)
+		if err != nil {
+			return fmt.Errorf("allocate prefill chunk buffer: %w", err)
+		}
+		*entry.dst = buf
+	}
+	r.prefillRows = rows
+	return nil
+}
+
+// prefillMatmul appends the measured implementation for one prefill matmul.
+func (r *Runtime) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint64,
+	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64) error {
+	switch hip.SelectPrefillPath(w.dtype, rows, nIn, nOut) {
+	case hip.PrefillBatchedGemv:
+		return plan.AddGemvBatchAt(w.buf, 0, x, xOff, out, outOff, nIn, nOut, rows, w.dtype)
+	case hip.PrefillBLAS:
+		if err := plan.AddCastF16At(x, xOff, r.prefill.xF16, 0, rows*nIn); err != nil {
+			return err
+		}
+		return plan.AddGemmPathAt(w.buf, 0, r.prefill.xF16, 0, out, outOff,
+			nIn, nOut, rows, w.dtype, hip.GemmBLAS)
+	default:
+		return plan.AddGemmPathAt(w.buf, 0, x, xOff, out, outOff,
+			nIn, nOut, rows, w.dtype, hip.GemmWMMA)
+	}
+}
+
+// prefillPlan returns a cached plan for exactly rows prompt rows.
+func (r *Runtime) prefillPlan(rows int) (*hip.Plan, error) {
+	if plan, ok := r.prefillPlans[rows]; ok {
+		return plan, nil
+	}
+	plan, err := r.buildPrefillPlan(rows)
+	if err != nil {
+		return nil, err
+	}
+	r.prefillPlans[rows] = plan
+	return plan, nil
+}
+
+// buildPrefillPlan constructs the chunked prompt graph. Every row-parallel
+// operator keeps the full chunk; only the output tail selects the last row.
+func (r *Runtime) buildPrefillPlan(rows int) (*hip.Plan, error) {
+	plan, err := r.device.NewPlan()
+	if err != nil {
+		return nil, err
+	}
+	cfg := r.config
+	p := &r.prefill
+	rows64 := int64(rows)
+	embedding, err := r.weight("token_embd.weight")
+	if err != nil {
+		return nil, err
+	}
+	rowBytes, err := embedding.dtype.RowBytes(int64(cfg.HiddenSize))
+	if err != nil {
+		return nil, err
+	}
+	if err := plan.AddEmbeddingBatchAt(embedding.buf, p.x, p.tokens, 0, rows64,
+		int64(cfg.HiddenSize), int64(rowBytes), int64(cfg.VocabSize), embedding.dtype); err != nil {
+		return nil, err
+	}
+	for i := 0; i < cfg.BlockCount; i++ {
+		prefix := fmt.Sprintf("blk.%d.", i)
+		attnNorm, err := r.weight(prefix + "attn_norm.weight")
+		if err != nil {
+			return nil, err
+		}
+		postNorm, err := r.weight(prefix + "post_attention_norm.weight")
+		if err != nil {
+			return nil, err
+		}
+		if cfg.IsRecurrent(i) {
+			if err := r.addPrefillRecurrent(plan, i, attnNorm, rows64); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := r.addPrefillFullAttention(plan, i, attnNorm, rows64); err != nil {
+				return nil, err
+			}
+		}
+		if err := r.addPrefillFFN(plan, prefix, postNorm, rows64); err != nil {
+			return nil, err
+		}
+	}
+	plan.MarkTail()
+	outputNorm, err := r.weight("output_norm.weight")
+	if err != nil {
+		return nil, err
+	}
+	lastOff := uint64(rows-1) * uint64(cfg.HiddenSize) * 4
+	if err := plan.AddRMSNormAt(p.x, lastOff, outputNorm.buf, p.norm, 0,
+		int64(cfg.HiddenSize), cfg.RMSNormEps); err != nil {
+		return nil, err
+	}
+	outputName := "output.weight"
+	if _, ok := r.weights[outputName]; !ok {
+		outputName = "token_embd.weight"
+	}
+	output, err := r.weight(outputName)
+	if err != nil {
+		return nil, err
+	}
+	if err := plan.AddGemv(output.buf, p.norm, r.act.logits,
+		int64(cfg.HiddenSize), int64(cfg.VocabSize), output.dtype); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// addPrefillFullAttention appends one full GQA layer over a prompt chunk.
+func (r *Runtime) addPrefillFullAttention(plan *hip.Plan, layerIndex int, attnNorm weight, rows int64) error {
+	cfg := r.config
+	p := &r.prefill
+	prefix := fmt.Sprintf("blk.%d.", layerIndex)
+	q, err := r.weight(prefix + "attn_q.weight")
+	if err != nil {
+		return err
+	}
+	k, err := r.weight(prefix + "attn_k.weight")
+	if err != nil {
+		return err
+	}
+	v, err := r.weight(prefix + "attn_v.weight")
+	if err != nil {
+		return err
+	}
+	o, err := r.weight(prefix + "attn_output.weight")
+	if err != nil {
+		return err
+	}
+	qNorm, err := r.weight(prefix + "attn_q_norm.weight")
+	if err != nil {
+		return err
+	}
+	kNorm, err := r.weight(prefix + "attn_k_norm.weight")
+	if err != nil {
+		return err
+	}
+	state := &r.layers[layerIndex]
+	hidden := int64(cfg.HiddenSize)
+	headDim := int64(cfg.HeadDim)
+	qDim := int64(cfg.HeadCount * cfg.HeadDim * 2)
+	kvDim := int64(cfg.KVHeadCount * cfg.HeadDim)
+	oDim := int64(cfg.HeadCount * cfg.HeadDim)
+	if err := plan.AddRMSNormBatchAt(p.x, 0, attnNorm.buf, p.norm, 0,
+		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, q, p.norm, 0, p.q, 0, hidden, qDim, rows); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, k, p.norm, 0, p.k, 0, hidden, kvDim, rows); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, v, p.norm, 0, p.v, 0, hidden, kvDim, rows); err != nil {
+		return err
+	}
+	if err := plan.AddRMSNormHeadsBatchAt(p.q, 0, qNorm.buf, p.q, 0,
+		rows, int64(cfg.HeadCount), headDim, 2*headDim, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := plan.AddRMSNormHeadsBatchAt(p.k, 0, kNorm.buf, p.k, 0,
+		rows, int64(cfg.KVHeadCount), headDim, headDim, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := plan.AddRoPEBatchAt(p.q, 0, int(rows), cfg.HeadCount, int(2*headDim),
+		int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase), int64(cfg.HeadCount*2*cfg.HeadDim)); err != nil {
+		return err
+	}
+	if err := plan.AddRoPEBatchAt(p.k, 0, int(rows), cfg.KVHeadCount, int(headDim),
+		int(headDim), cfg.RoPEDim, float32(cfg.RoPEFreqBase), int64(cfg.KVHeadCount*cfg.HeadDim)); err != nil {
+		return err
+	}
+	if err := plan.AddKVWriteBatchAt(p.k, 0, p.v, 0, state.kvK, state.kvV,
+		kvDim, rows, int64(r.capacity)); err != nil {
+		return err
+	}
+	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+	if err := plan.AddAttentionPrefillAt(p.q, 0, state.kvK, state.kvV, p.attn, 0,
+		cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(rows),
+		r.capacity, scale); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, o, p.attn, 0, p.tmp, 0, oDim, hidden, rows); err != nil {
+		return err
+	}
+	return plan.Add(p.x, p.tmp, rows*hidden)
+}
+
+// addPrefillRecurrent appends one gated delta-net layer over a prompt chunk.
+func (r *Runtime) addPrefillRecurrent(plan *hip.Plan, layerIndex int, attnNorm weight, rows int64) error {
+	cfg := r.config
+	p := &r.prefill
+	prefix := fmt.Sprintf("blk.%d.", layerIndex)
+	qkv, err := r.weight(prefix + "attn_qkv.weight")
+	if err != nil {
+		return err
+	}
+	gate, err := r.weight(prefix + "attn_gate.weight")
+	if err != nil {
+		return err
+	}
+	out, err := r.weight(prefix + "ssm_out.weight")
+	if err != nil {
+		return err
+	}
+	beta, err := r.weight(prefix + "ssm_beta.weight")
+	if err != nil {
+		return err
+	}
+	alpha, err := r.weight(prefix + "ssm_alpha.weight")
+	if err != nil {
+		return err
+	}
+	conv, err := r.weight(prefix + "ssm_conv1d.weight")
+	if err != nil {
+		return err
+	}
+	dt, err := r.weight(prefix + "ssm_dt.bias")
+	if err != nil {
+		return err
+	}
+	a, err := r.weight(prefix + "ssm_a")
+	if err != nil {
+		return err
+	}
+	norm, err := r.weight(prefix + "ssm_norm.weight")
+	if err != nil {
+		return err
+	}
+	state := &r.layers[layerIndex]
+	hidden := int64(cfg.HiddenSize)
+	inner := int64(cfg.SSMInnerSize)
+	rank := int64(cfg.SSMTimeStepRank)
+	stateSize := int64(cfg.SSMStateSize)
+	convDim := int64(2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize)
+	if err := plan.AddRMSNormBatchAt(p.x, 0, attnNorm.buf, p.norm, 0,
+		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, qkv, p.norm, 0, p.qkv, 0, hidden, convDim, rows); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, gate, p.norm, 0, p.z, 0, hidden, inner, rows); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, beta, p.norm, 0, p.beta, 0, hidden, rank, rows); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, alpha, p.norm, 0, p.alpha, 0, hidden, rank, rows); err != nil {
+		return err
+	}
+	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
+	if err := plan.AddRecurrentChunkAt(hip.RecurrentChunkArgs{
+		ConvState:   state.conv,
+		State:       state.rec,
+		QKV:         p.qkv,
+		Z:           p.z,
+		Alpha:       p.alpha,
+		Beta:        p.beta,
+		ConvWeights: conv.buf,
+		DT:          dt.buf,
+		A:           a.buf,
+		Norm:        norm.buf,
+		Conv:        p.conv,
+		Out:         p.gdnNorm,
+		Rows:        rows,
+		Groups:      int64(cfg.SSMGroupCount),
+		Heads:       rank,
+		StateSize:   stateSize,
+		ConvDim:     convDim,
+		Inner:       inner,
+		Kernel:      int64(cfg.SSMConvKernel),
+		Eps:         cfg.RMSNormEps,
+		QScale:      qScale,
+	}); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, out, p.gdnNorm, 0, p.tmp, 0, inner, hidden, rows); err != nil {
+		return err
+	}
+	return plan.Add(p.x, p.tmp, rows*hidden)
+}
+
+// addPrefillFFN appends one SwiGLU feed-forward block over a prompt chunk.
+func (r *Runtime) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows int64) error {
+	cfg := r.config
+	p := &r.prefill
+	gate, err := r.weight(prefix + "ffn_gate.weight")
+	if err != nil {
+		return err
+	}
+	up, err := r.weight(prefix + "ffn_up.weight")
+	if err != nil {
+		return err
+	}
+	down, err := r.weight(prefix + "ffn_down.weight")
+	if err != nil {
+		return err
+	}
+	hidden := int64(cfg.HiddenSize)
+	ffn := int64(cfg.FFNSize)
+	if err := plan.AddRMSNormBatchAt(p.x, 0, postNorm.buf, p.norm, 0,
+		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows); err != nil {
+		return err
+	}
+	if err := plan.AddSiluMul(p.ffnGate, p.ffnUp, p.ffnGate, rows*ffn); err != nil {
+		return err
+	}
+	if err := r.prefillMatmul(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows); err != nil {
+		return err
+	}
+	return plan.Add(p.x, p.tmp, rows*hidden)
 }
 
 func (r *Runtime) allocLayers() error {
@@ -545,18 +967,53 @@ func (r *Runtime) Forward(tokens []int32) ([]float32, error) {
 	if r.pos+len(tokens) > r.capacity {
 		return nil, fmt.Errorf("token sequence exceeds remaining context")
 	}
-	for i, token := range tokens {
+	for _, token := range tokens {
 		if token < 0 || int(token) >= r.config.VocabSize {
 			return nil, fmt.Errorf("token id %d is out of range", token)
 		}
-		if err := r.plan.Execute(r.stream, token, uint32(r.pos), i == len(tokens)-1, r.event); err != nil {
+	}
+	if len(tokens) == 1 {
+		if err := r.plan.Execute(r.stream, tokens[0], uint32(r.pos), true, r.event); err != nil {
 			return nil, err
 		}
 		if err := r.event.Wait(); err != nil {
 			return nil, err
 		}
 		r.pos++
+		return r.downloadLogits()
 	}
+	return r.forwardPrefill(tokens)
+}
+
+// forwardPrefill processes a prompt in measured chunks. Each chunk submits one
+// batched plan; only the final chunk runs the output tail.
+func (r *Runtime) forwardPrefill(tokens []int32) ([]float32, error) {
+	for start := 0; start < len(tokens); {
+		n := r.prefillRows
+		if remaining := len(tokens) - start; remaining < n {
+			n = remaining
+		}
+		plan, err := r.prefillPlan(n)
+		if err != nil {
+			return nil, fmt.Errorf("build prefill plan for %d rows: %w", n, err)
+		}
+		if err := r.device.UploadInt32(r.prefill.tokens, tokens[start:start+n]); err != nil {
+			return nil, err
+		}
+		last := start+n == len(tokens)
+		if err := plan.Execute(r.stream, 0, uint32(r.pos), last, r.event); err != nil {
+			return nil, err
+		}
+		if err := r.event.Wait(); err != nil {
+			return nil, err
+		}
+		r.pos += n
+		start += n
+	}
+	return r.downloadLogits()
+}
+
+func (r *Runtime) downloadLogits() ([]float32, error) {
 	if err := r.device.DownloadFloats(r.logits, r.act.logits); err != nil {
 		return nil, err
 	}
@@ -640,6 +1097,10 @@ func (r *Runtime) Close() error {
 	if r.tracePlan != nil {
 		_ = r.tracePlan.Close()
 	}
+	for _, plan := range r.prefillPlans {
+		_ = plan.Close()
+	}
+	r.prefillPlans = nil
 	for i := len(r.all) - 1; i >= 0; i-- {
 		_ = r.all[i].Close()
 	}

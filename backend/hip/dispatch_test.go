@@ -178,3 +178,31 @@ func TestAddGemvRejectsUndersizedBuffer(t *testing.T) {
 		t.Fatalf("rejected operation was added: %d", plan.Ops())
 	}
 }
+
+func TestSelectPrefillPath(t *testing.T) {
+	cases := []struct {
+		name      string
+		dtype     tensor.DType
+		rows      int64
+		nIn, nOut int64
+		want      PrefillPath
+	}{
+		{"tiny batch", tensor.Q4_K, 1, 2560, 9216, PrefillBatchedGemv},
+		{"q4 wide short", tensor.Q4_K, 4, 2560, 9216, PrefillWMMA},
+		{"q4 tall short", tensor.Q4_K, 4, 9216, 2560, PrefillBatchedGemv},
+		{"q4 tall batch8", tensor.Q4_K, 8, 9216, 2560, PrefillWMMA},
+		{"q6 wide batch32", tensor.Q6_K, 32, 2560, 8192, PrefillWMMA},
+		{"f16 small", tensor.F16, 2, 2560, 9216, PrefillBatchedGemv},
+		{"f16 tall rocblas", tensor.F16, 4, 9216, 2560, PrefillBLAS},
+		{"f16 wide batch4", tensor.F16, 4, 2560, 9216, PrefillBatchedGemv},
+		{"f16 wide wmma", tensor.F16, 8, 2560, 9216, PrefillWMMA},
+		{"f16 tall large wmma", tensor.F16, 128, 9216, 2560, PrefillWMMA},
+		{"f16 wide large rocblas", tensor.F16, 128, 2560, 9216, PrefillBLAS},
+		{"f32 wide", tensor.F32, 8, 2560, 9216, PrefillWMMA},
+	}
+	for _, c := range cases {
+		if got := SelectPrefillPath(c.dtype, c.rows, c.nIn, c.nOut); got != c.want {
+			t.Errorf("%s: got path %d, want %d", c.name, got, c.want)
+		}
+	}
+}
