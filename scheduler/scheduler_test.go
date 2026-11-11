@@ -117,12 +117,17 @@ type rejectingBudget struct{ err error }
 
 func (b rejectingBudget) CheckAdmission(int, int) error { return b.err }
 
-func runScheduler(t *testing.T, cfg Config) *Scheduler {
+func newScheduler(t *testing.T, cfg Config) *Scheduler {
 	t.Helper()
 	sched, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return sched
+}
+
+func startScheduler(t *testing.T, sched *Scheduler) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -134,6 +139,12 @@ func runScheduler(t *testing.T, cfg Config) *Scheduler {
 		_ = sched.Close()
 		<-done
 	})
+}
+
+func runScheduler(t *testing.T, cfg Config) *Scheduler {
+	t.Helper()
+	sched := newScheduler(t, cfg)
+	startScheduler(t, sched)
 	return sched
 }
 
@@ -237,7 +248,7 @@ func TestQueueLimitCancellationAndCleanup(t *testing.T) {
 func TestContinuousBatchingInterleaving(t *testing.T) {
 	var mu sync.Mutex
 	var steps []Step
-	sched := runScheduler(t, Config{
+	sched := newScheduler(t, Config{
 		MaxActive:       2,
 		MaxQueue:        4,
 		MaxBatch:        2,
@@ -265,6 +276,9 @@ func TestContinuousBatchingInterleaving(t *testing.T) {
 		}
 		handles[id] = h
 	}
+	// Start only after both submissions are queued so the batching assertion
+	// does not depend on goroutine startup timing.
+	startScheduler(t, sched)
 	for _, id := range []string{"a", "b"} {
 		waitHandle(t, handles[id], 3*time.Second)
 		if handles[id].FinishReason() != "length" {
