@@ -1,0 +1,117 @@
+# yuuka Documentation
+
+`yuuka` is a from-scratch LLM inference framework for AMD **gfx1151** (RDNA 3.5)
+APUs. The runtime is written in **Go**; performance-critical device code is
+written in **HIP/C++**. It loads GGUF models directly and does not use
+llama.cpp, GGML, or Ollama as an inference execution kernel. Those projects are
+treated as format and correctness references only.
+
+> **Status: design.** The repository does not yet contain an implementation.
+> This documentation defines the intended architecture, interfaces, and
+> delivery plan. Details marked as open are expected to change as hardware
+> characterization and implementation proceed.
+
+## Target configuration
+
+| Item | Target |
+| --- | --- |
+| Hardware | AMD Ryzen AI Max+ 395 / Radeon 8060S (gfx1151, RDNA 3.5) |
+| Compute | 40 CUs in the reference configuration; Wave32-first |
+| Memory | LPDDR5x system memory shared between CPU and GPU (UMA APU) |
+| OS / stack | Linux with ROCm/HIP; rocBLAS and rocWMMA allowed |
+| Model format | GGUF |
+| First model | Qwen3 Dense, Q4_K GGUF |
+| First milestone | Single-request, GPU-only inference from prompt to generated tokens |
+
+Hardware capabilities must be verified on the actual device, kernel, and
+driver stack. GPU-visible memory, mappable host memory, rocWMMA availability,
+and NPU Linux runtime support are not assumed from marketing specifications.
+
+## Goals
+
+1. Load mainstream GGUF models, starting with dense decoder Transformers.
+2. Execute the full Transformer on the GPU: quantized weight matrix
+   multiplication, attention, normalization, activations, and sampling.
+3. Design separate prefill and decode kernel families, dispatched by shape,
+   quantization type, and batch size.
+4. Start with low-latency single-request inference, then add continuous
+   batching, paged KV cache, and chunked prefill.
+5. Keep Go responsible for model parsing, execution planning, request
+   scheduling, memory lifetime, APIs, and observability.
+6. Retain a CPU reference backend for correctness. Add an NPU backend later
+   without making the GPU-only path depend on it.
+
+## Non-goals for the first release
+
+- Training or automatic differentiation.
+- Covering every GGUF model architecture and quantization type.
+- Automatic fine-grained operator partitioning across multiple devices.
+- Distributed inference or multi-GPU tensor parallelism.
+- A heavy general-purpose graph compiler.
+
+## Design principles
+
+- **Correctness before speed.** Establish a reproducible numerical baseline
+  before optimizing kernels.
+- **Keep quantized weights quantized.** Do not expand an entire quantized model
+  into FP16 weights for decode.
+- **Prefill and decode are different problems.** They use different operator
+  families, tiling, and dispatch policies, not merely different parameters to
+  the same GEMM.
+- **Measure, do not assume.** Validate bandwidth, allocation behavior,
+  occupancy, and kernel wins on gfx1151 with recorded configurations.
+- **Stable seams.** GGUF parsing, model semantics, operator interfaces, device
+  implementations, and request scheduling are independent layers.
+- **Boring runtime.** Prefer an explicit, inspectable `ExecutionPlan` and
+  replaceable backends over a general graph compiler.
+
+## Document map
+
+| Document | Contents | Primary audience |
+| --- | --- | --- |
+| [architecture.md](architecture.md) | Layered design, core interfaces, Go/HIP boundary, memory model, repository layout, key decisions | All contributors |
+| [gguf.md](gguf.md) | GGUF reader, metadata mapping, tokenizer, quantization handling, model support matrix | Runtime and model contributors |
+| [kernels.md](kernels.md) | Prefill/decode kernel design, quantized GEMV/GEMM, attention, fusion, dispatch and tuning | Kernel contributors |
+| [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |
+| [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, reporting, regression gates | All contributors |
+| [npu.md](npu.md) | Deferred XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
+| [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
+
+## Reading paths
+
+- **New contributor:** [README](README.md) → [architecture](architecture.md) →
+  the document for your area → [roadmap](roadmap.md).
+- **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
+  [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode).
+- **Runtime/service work:** [architecture](architecture.md) →
+  [serving](serving.md) → [roadmap Phase 4](roadmap.md#7-phase-4--multi-request-serving).
+- **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →
+  [roadmap Phase 1](roadmap.md#4-phase-1--minimal-inference-loop).
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| **Prefill** | Processing the prompt in one or more large matrix multiplications; typically compute-throughput limited. |
+| **Decode** | Generating one token (or a small batch) at a time; typically limited by weight-read bandwidth and kernel launch overhead. |
+| **GEMV / GEMM** | Matrix-vector and matrix-matrix multiplication. Decode maps to GEMV; prefill maps to GEMM. |
+| **WMMA** | RDNA matrix instructions used for the prefill GEMM path. CDNA MFMA kernels are not portable to this target. |
+| **GQA** | Grouped-query attention; multiple query heads share a KV head. |
+| **KV cache** | Cached key/value tensors for previously processed tokens. |
+| **Paged KV** | KV cache managed as fixed-size blocks referenced through a per-request block table. |
+| **TTFT** | Time to first token. |
+| **TPOT** | Time per output token during decode. |
+| **UMA** | Unified memory architecture; CPU and GPU share physical memory, but allocation paths can still differ in performance. |
+| **ExecutionPlan** | The Go-side, model-shaped plan that binds weights, kernels, scratch buffers, and streams before execution. |
+
+## Documentation conventions
+
+- `MUST`, `SHOULD`, and `MAY` describe design requirements, not current
+  implementation behavior.
+- Performance numbers in these documents are design estimates or measurement
+  targets. Only results recorded under the protocol in
+  [testing.md](testing.md) count as benchmarks.
+- Diagrams are intentionally textual so they remain readable in terminals,
+  code review, and generated documentation.
+- All measurements must record the model file, quantization, ROCm/driver
+  version, sampling parameters, warmup, and thermal/power conditions.
