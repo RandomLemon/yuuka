@@ -226,3 +226,91 @@ func bytesToFloats(data []byte) []float32 {
 	}
 	return out
 }
+
+func TestPlanGemmF16(t *testing.T) {
+	dev := openTestDevice(t)
+	stream, err := dev.NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	event, err := dev.NewEvent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer event.Close()
+
+	const nIn, nOut, batch = 35, 4, 3
+	weights := make([]byte, nOut*nIn*2)
+	values := make([]float32, nOut*nIn)
+	for i := range values {
+		values[i] = float32((i%13)-6) * 0.25
+		half := tensor.Float32ToFloat16(values[i])
+		binary.LittleEndian.PutUint16(weights[i*2:], half)
+	}
+	// Decode the stored half values so the reference uses the exact weights
+	// uploaded to the device.
+	for i := 0; i < nOut*nIn; i++ {
+		values[i] = tensor.Float16ToFloat32(binary.LittleEndian.Uint16(weights[i*2:]))
+	}
+	x := make([]float32, nIn*batch)
+	for i := range x {
+		x[i] = float32((i%7)-3) * 0.5
+	}
+	want := make([]float32, nOut*batch)
+	for row := 0; row < batch; row++ {
+		for col := 0; col < nOut; col++ {
+			var sum float32
+			for i := 0; i < nIn; i++ {
+				sum += x[row*nIn+i] * values[col*nIn+i]
+			}
+			want[row*nOut+col] = sum
+		}
+	}
+
+	wBuf, err := dev.Alloc(uint64(len(weights)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wBuf.Close()
+	xBuf, err := dev.Alloc(uint64(len(x) * 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer xBuf.Close()
+	outBuf, err := dev.Alloc(uint64(len(want) * 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outBuf.Close()
+	if err := dev.Upload(wBuf, weights); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.Upload(xBuf, floatsToBytes(x)); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := dev.NewPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	if err := plan.AddGemm(wBuf, xBuf, outBuf, nIn, nOut, batch, tensor.F16); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Execute(stream, 0, 0, true, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := event.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	out := make([]byte, len(want)*4)
+	if err := dev.Download(out, outBuf); err != nil {
+		t.Fatal(err)
+	}
+	got := bytesToFloats(out)
+	for i := range want {
+		if math.Abs(float64(got[i]-want[i])) > 2e-3*(1+math.Abs(float64(want[i]))) {
+			t.Fatalf("index %d: got %v want %v", i, got[i], want[i])
+		}
+	}
+}

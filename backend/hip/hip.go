@@ -354,6 +354,37 @@ func (p *Plan) AddGemvAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Bu
 	return p.add(op)
 }
 
+// AddGemm appends out = W * X for a packed weight matrix and a batch of
+// contiguous input rows. x is [batch, nIn] and out is [batch, nOut].
+func (p *Plan) AddGemm(w, x, out *Buffer, nIn, nOut, batch int64, dtype tensor.DType) error {
+	return p.AddGemmAt(w, 0, x, 0, out, 0, nIn, nOut, batch, dtype)
+}
+
+// AddGemmAt appends a GEMM with byte offsets applied to each buffer.
+func (p *Plan) AddGemmAt(w *Buffer, wOff uint64, x *Buffer, xOff uint64, out *Buffer, outOff uint64, nIn, nOut, batch int64, dtype tensor.DType) error {
+	if dtype != tensor.F32 && dtype != tensor.F16 {
+		return fmt.Errorf("hip: GEMM dtype %s is not supported", dtype)
+	}
+	if nIn <= 0 || nOut <= 0 || batch <= 0 {
+		return errors.New("hip: GEMM dimensions must be positive")
+	}
+	if err := p.check(w, x, out); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_GEMM}
+	op.off[0] = C.uint64_t(wOff)
+	op.off[1] = C.uint64_t(xOff)
+	op.off[2] = C.uint64_t(outOff)
+	op.buf[0] = w.ptr
+	op.buf[1] = x.ptr
+	op.buf[2] = out.ptr
+	op.n[0] = C.uint64_t(nIn)
+	op.n[1] = C.uint64_t(nOut)
+	op.n[2] = C.uint64_t(batch)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
 func (p *Plan) AddRMSNorm(src, weight, dst *Buffer, n int64, eps float32) error {
 	return p.AddRMSNormAt(src, 0, weight, dst, 0, n, eps)
 }

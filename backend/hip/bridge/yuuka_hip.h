@@ -102,7 +102,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_SCALE = 12,
     YUUKA_OP_EMBEDDING = 13,
     YUUKA_OP_KV_WRITE = 14,
-    YUUKA_OP_RMSNORM_HEADS = 15
+    YUUKA_OP_RMSNORM_HEADS = 15,
+    YUUKA_OP_GEMM = 16
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -132,6 +133,18 @@ YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
                         const yuuka_buffer * x, const yuuka_buffer * w,
                         uint64_t n_in, uint64_t n_out, uint32_t dtype,
                         yuuka_event * completion);
+
+/* Batched matrix-vector product for prefill:
+ *
+ * out[batch, n_out] = W[n_out, n_in] * x[batch, n_in]
+ *
+ * x and out are contiguous row-major [batch, n_in] and [batch, n_out]. Only
+ * F32 and F16 weights are supported by the Phase 1 baseline.
+ */
+YUUKA_API yuuka_status yuuka_gemm(yuuka_stream * stream, yuuka_buffer * out,
+                        const yuuka_buffer * x, const yuuka_buffer * w,
+                        uint64_t n_in, uint64_t n_out, uint64_t batch,
+                        uint32_t dtype, yuuka_event * completion);
 
 /* Plans batch generic device operations into one submission. */
 YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out);

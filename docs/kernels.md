@@ -10,9 +10,10 @@ the Go scheduler or API; those are in [serving.md](serving.md).
 Implementation status: decode-oriented kernels for `F16`, `Q8_0`, `Q4_K`,
 `Q5_K`, and `Q6_K` GEMV, RMSNorm, L2Norm, gated RMSNorm, RoPE, decode attention,
 convolution state, gated delta-net recurrence, embedding, SwiGLU, residual add,
-and copy are implemented and validated against CPU references. WMMA/rocBLAS
-prefill, Flash Attention, chunked prefill, and tuning tables are not yet
-implemented.
+and copy are implemented and validated against CPU references. A correctness
+baseline `F32`/`F16` batched GEMM exists for prefill experiments, but the
+quantized WMMA GEMM, Flash Attention, chunked prefill, and tuning tables are not
+yet implemented.
 
 The guiding rule is that **prefill and decode are separate operator families**.
 They may share data layouts and helper primitives, but they are not the same

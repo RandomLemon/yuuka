@@ -104,6 +104,26 @@ T * op_ptr(yuuka_op const & op, int index) {
     return reinterpret_cast<T *>(static_cast<uint8_t *>(op.buf[index]->ptr) + op.off[index]);
 }
 
+void launch_gemm_dispatch(yuuka_op const & op, hipStream_t stream) {
+    auto * out = op_ptr<float>(op, 2);
+    const auto * x = op_ptr<const float>(op, 1);
+    const void * w = op_ptr<const void>(op, 0);
+    const uint64_t n_in = op.n[0];
+    const uint64_t n_out = op.n[1];
+    const uint64_t batch = op.n[2];
+    switch (op.u[0]) {
+        case YUUKA_DTYPE_F32:
+            yuuka::launch_gemm_f32(out, x, static_cast<const float *>(w),
+                                   n_in, n_out, batch, stream);
+            break;
+        case YUUKA_DTYPE_F16:
+            yuuka::launch_gemm_f16(out, x, w, n_in, n_out, batch, stream);
+            break;
+        default:
+            break;
+    }
+}
+
 void launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
     auto * out = op_ptr<float>(op, 2);
     const auto * x = op_ptr<const float>(op, 1);
@@ -139,6 +159,9 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
     switch (op.code) {
         case YUUKA_OP_GEMV:
             launch_gemv_dispatch(op, stream);
+            break;
+        case YUUKA_OP_GEMM:
+            launch_gemm_dispatch(op, stream);
             break;
         case YUUKA_OP_RMSNORM: {
             auto * dst = op_ptr<float>(op, 2);
@@ -554,6 +577,56 @@ YUUKA_API yuuka_status yuuka_add_f32(yuuka_stream * stream, yuuka_buffer * dst,
     });
 }
 
+YUUKA_API yuuka_status yuuka_gemm(yuuka_stream * stream, yuuka_buffer * out,
+                                  const yuuka_buffer * x, const yuuka_buffer * w,
+                                  uint64_t n_in, uint64_t n_out, uint64_t batch,
+                                  uint32_t dtype, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || out == nullptr || x == nullptr || w == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "null stream or buffer");
+        }
+        if (!check_gemv_shapes(n_in, dtype) || (dtype != YUUKA_DTYPE_F32 && dtype != YUUKA_DTYPE_F16)) {
+            return fail(YUUKA_ERR_UNSUPPORTED,
+                        "unsupported gemm dtype %u or input width %llu",
+                        dtype, static_cast<unsigned long long>(n_in));
+        }
+        if (n_out == 0 || batch == 0) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "output width or batch is zero");
+        }
+        const uint64_t weight_row_bytes = row_bytes(n_in, dtype);
+        if (w->bytes != weight_row_bytes * n_out) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "weight buffer has %llu bytes, expected %llu",
+                        static_cast<unsigned long long>(w->bytes),
+                        static_cast<unsigned long long>(weight_row_bytes * n_out));
+        }
+        if (x->bytes < n_in * batch * sizeof(float) ||
+            out->bytes < n_out * batch * sizeof(float)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gemm buffer is too small");
+        }
+        const float * x_ptr = static_cast<const float *>(x->ptr);
+        float * out_ptr = static_cast<float *>(out->ptr);
+        if (dtype == YUUKA_DTYPE_F32) {
+            yuuka::launch_gemm_f32(out_ptr, x_ptr, static_cast<const float *>(w->ptr),
+                                   n_in, n_out, batch, stream->stream);
+        } else {
+            yuuka::launch_gemm_f16(out_ptr, x_ptr, w->ptr, n_in, n_out, batch,
+                                   stream->stream);
+        }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "gemm launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
 YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
                                   const yuuka_buffer * x, const yuuka_buffer * w,
                                   uint64_t n_in, uint64_t n_out, uint32_t dtype,
@@ -647,7 +720,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_RMSNORM_HEADS) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_GEMM) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         plan->ops.push_back(*op);

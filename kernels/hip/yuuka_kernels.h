@@ -22,6 +22,13 @@ void launch_gemv_q5_k(float * out, const float * x, const void * w,
 void launch_gemv_q6_k(float * out, const float * x, const void * w,
                       uint64_t n_in, uint64_t n_out, hipStream_t stream);
 
+void launch_gemm_f32(float * out, const float * x, const float * w,
+                     uint64_t n_in, uint64_t n_out, uint64_t batch,
+                     hipStream_t stream);
+void launch_gemm_f16(float * out, const float * x, const void * w,
+                     uint64_t n_in, uint64_t n_out, uint64_t batch,
+                     hipStream_t stream);
+
 void launch_rmsnorm_f32(float * dst, const float * src, const float * weight,
                         int64_t n, float eps, hipStream_t stream);
 void launch_l2norm_f32(float * dst, const float * src, int64_t n, float eps,

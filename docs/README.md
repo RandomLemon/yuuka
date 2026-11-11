@@ -101,8 +101,8 @@ Implemented and tested:
 - `yuuka-server` with `/v1/chat/completions`, SSE streaming, stop sequences,
   health, metrics, cancellation, and explicit busy rejection.
 - HIP C ABI for devices, buffers, streams, events, transfers, planned
-  operations, and quantized GEMV; validated `F16`, `Q8_0`, `Q4_K`, `Q5_K`,
-  and `Q6_K` kernels.
+  operations, quantized GEMV, and a batched F32/F16 GEMM baseline; validated
+  `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` GEMV kernels.
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   The CLI and server select it with `--backend hip` when built with

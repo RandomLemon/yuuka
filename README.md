@@ -13,6 +13,7 @@ Llama and Qwen3 layouts. It provides:
 - Qwen byte-level BPE and Llama SentencePiece tokenizers with Qwen chat rendering;
 - CPU reference decoders used as the correctness oracle and default backend;
 - a HIP decoder that executes the full Qwen3.5 model on the GPU;
+- a validated F32/F16 batched GEMM ABI baseline for prefill experiments;
 - a CLI (`inspect`, `run`, `bench`);
 - an OpenAI-compatible server for single-request chat completions.
 
