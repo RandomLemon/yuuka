@@ -183,8 +183,11 @@ same string while producing different model behavior.
 The current implementation target is **Qwen3.5-4B with a Q4_K_M GGUF**
 (`general.architecture = qwen35`). It uses full attention every fourth layer and
 gated delta-net linear attention in the remaining layers. The CPU reference path
-is implemented and tested; native HIP execution is not integrated yet. See
-[roadmap.md](roadmap.md) and [hardware.md](hardware.md).
+and the native HIP execution path are both implemented and tested for this
+architecture. The HIP path keeps GGUF weights packed and executes the full
+decoder. Other architectures in the table are planned, not implemented. See
+[roadmap.md](roadmap.md), [kernels.md](kernels.md), and
+[benchmarks.md](benchmarks.md).
 
 ## 9. Quantization support by phase
 
@@ -197,6 +200,10 @@ is implemented and tested; native HIP execution is not integrated yet. See
 
 Support for a quantization type is not complete until it has reader validation,
 a correct reference path, a GPU kernel, and a benchmark entry.
+
+Current status: fused GEMV decode for `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and
+`Q6_K` is implemented for `qwen35`. Quantized GEMM for prefill remains Phase 3
+work.
 
 ## 10. Validation checklist
 

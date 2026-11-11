@@ -105,8 +105,10 @@ Implemented and tested:
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   The CLI and server select it with `--backend hip` when built with
   `-tags hip`.
-- Layer-by-layer and end-to-end GPU/CPU comparison; greedy tokens match and
-  first-step logits differ by less than `5e-5`.
+- End-to-end GPU/CPU comparison on the validated model: greedy token sequences
+  match and the recorded first-step maximum absolute logit difference is
+  `4.58e-5`. The checked-in test enforces the token sequence and a loose logit
+  bound; per-layer tracing exists as a diagnostic hook, not a checked-in test.
 - Phase 0 hardware probe covering allocation, copy, memset, mapped memory,
   rocBLAS SGEMM, and a rocWMMA FP16 tile.
 
@@ -116,6 +118,10 @@ Not yet implemented:
 - Paged KV, continuous batching, prefix cache, or HIP Graph.
 - Multiple architectures and quantization presets beyond the tested model.
 - NPU paths.
+
+Verification gaps: no CI configuration or checked-in model fixture is present
+yet. Real-model tests are opt-in through `YUUKA_TEST_MODEL`; GPU tests require
+the reference device.
 
 The CPU reference path is the default. The HIP path requires the native shared
 library and a `-tags hip` Go build. `general.architecture = qwen35` is the

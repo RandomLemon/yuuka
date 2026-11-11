@@ -307,8 +307,9 @@ YUUKA_TEST_MODEL=/path/to/model.gguf go test ./...
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
-reference, and server request/stream behavior. GPU tests return the CTest skip
-code when no HIP device is available.
+reference, and server request/stream behavior. Native GPU tests return CTest
+skip code 77; Go GPU tests skip with a message when no HIP device is available
+or `YUUKA_TEST_MODEL` is unset.
 
 The Phase 0 hardware probe and the current CPU/HIP benchmark are run
 explicitly:
@@ -322,14 +323,20 @@ explicitly:
 
 | Tier | Environment | Contents |
 | --- | --- | --- |
-| **Unit** | Any Linux machine | GGUF parser, tokenizer, metadata mapping, CPU reference, scheduler logic |
+| **Unit** | Any Linux machine | GGUF parser, tokenizer, metadata mapping, CPU reference; scheduler logic once implemented |
 | **GPU correctness** | gfx1151 runner | Kernel tests, end-to-end generation, logits comparison |
 | **GPU performance** | gfx1151 runner, controlled power profile | Tracked benchmark subset, nightly or per-release |
 | **Compatibility** | gfx1151 runner | llama.cpp HIP/Vulkan comparison on the same GGUF |
 
-Large model files are not committed to the repository. Fixtures are downloaded
-by hash or generated synthetically. GPU tests must skip with a clear message
-when no supported device is present; they must not silently pass.
+Current status: no CI configuration is checked in yet. Go unit tests and native
+CTest binaries are run locally; GPU tiers are run manually on the reference
+machine. Real-model tests require `YUUKA_TEST_MODEL`, and no fixture download or
+generation script is checked in yet.
+
+Large model files are not committed to the repository. When the CI tiers are
+implemented, fixtures will be downloaded by hash or generated synthetically.
+GPU tests must skip with a clear message when no supported device is present;
+they must not silently pass.
 
 ## 11. Milestone acceptance
 

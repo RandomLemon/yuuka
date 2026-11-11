@@ -48,11 +48,11 @@ tokens per second:
 | HIP | 27.0 GB/s |
 
 This is an effective estimate, not a hardware counter. The HIP GEMV path is
-still far below the measured `hipMemset` rate of about 230 GB/s. The current
-kernel launches one 256-thread workgroup per output channel and performs a
-block-wide reduction per quantization block. Reducing launch and reduction
-overhead, increasing per-workgroup output reuse, and vectorizing packed loads
-are the obvious next optimizations.
+still far below the measured `hipMemset` rate (about 190-230 GB/s across the
+recorded runs). The current kernel launches one 256-thread workgroup per output
+channel and performs a block-wide reduction per quantization block. Reducing
+launch and reduction overhead, increasing per-workgroup output reuse, and
+vectorizing packed loads are the obvious next optimizations.
 
 ## Correctness evidence
 
@@ -62,8 +62,11 @@ For the prompt `The capital of France is`:
   `[11751, 13, 198, 32, 13, 2912]`.
 - The maximum absolute logit difference at the first generated position is
   `4.58e-5`.
-- The HIP path matches the layer-by-layer CPU reference during diagnosis; the
-  checked-in test enforces the token sequence and a logit-difference bound.
+- The checked-in GPU test compares final logits and greedy tokens with the CPU
+  reference. The `ForwardTrace` hook can expose per-layer hidden states, but no
+  layer-by-layer comparison is checked in. The test enforces the greedy token
+  sequence and a loose `5.0` maximum absolute logit guard; `4.58e-5` is the
+  observed first-step difference, not the enforced threshold.
 - Golden CPU token tests also cover `1+1=` and `Once upon a time`.
 
 ## Reproduction

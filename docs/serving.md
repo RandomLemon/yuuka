@@ -9,8 +9,9 @@ the single-request GPU path is already correct and measurable.
 Current implementation: one model, one request at a time, SSE streaming,
 token and string stop sequences, health, Prometheus-style metrics, request
 cancellation, and explicit `503` rejection while busy. CPU and HIP runtimes are
-selectable. Continuous batching, paged KV, prefix cache, and HIP Graph are not
-implemented yet.
+selectable. Cancellation is checked between decode steps; an in-flight prefill
+completes before cancellation is observed. Continuous batching, paged KV,
+prefix cache, and HIP Graph are not implemented yet.
 
 The first release prioritizes a single model and a single request. Continuous
 batching, prefix caching, and graph replay are introduced only after the

@@ -56,6 +56,12 @@ hardware counters. `D2D` counts both read and write traffic as the buffer size.
 | Mapped host memory written by the GPU (`hipMemcpy` semantics) | 178.6 GB/s |
 | `hipMalloc` 16 MiB, 64 allocations | 46.9 ms total |
 
+Run-to-run variation: a later probe on the same machine measured `hipMemset`
+at 190.5 GB/s, while H2D/D2H, D2D, mapped memory, allocation, and rocBLAS
+results stayed within a few percent of the table. The memset figure is sensitive
+to the run; re-measure under a controlled power profile before using it for a
+bandwidth budget.
+
 The measured host/device copy path is much slower than the device-local write
 rate. The initial memory policy is therefore:
 

@@ -26,9 +26,15 @@ The Phase 0 toolchain is proven and recorded in [hardware.md](hardware.md).
 The CPU reference and HIP single-request vertical slices for `qwen35` are
 implemented with a CLI and server. HIP allocation, transfers, streams, events,
 planned operators, and the full decoder execution path are implemented and
-tested; CPU and HIP greedy tokens match with sub-`5e-5` first-step logits.
-WMMA/rocBLAS prefill, paged KV, batching, and prefix caching are not
-implemented yet. The current measured baseline is in
+tested; CPU and HIP greedy tokens match, and the recorded first-step maximum
+absolute logit difference is `4.58e-5`.
+
+Current gaps: Phase 0 has no checked-in CI, small model fixture, or
+firmware/power/thermal record. Phase 1 covers only `qwen35`; Qwen3 Dense, Llama
+Dense, and FP16 GEMM are not implemented. Phase 2 has quantized GEMV and
+end-to-end Q4_K_M generation, but no profiler attribution, batch dispatch
+thresholds, or per-shape sweep. WMMA/rocBLAS prefill, paged KV, batching, and
+prefix caching are not implemented yet. The current measured baseline is in
 [benchmarks.md](benchmarks.md).
 
 This status does not declare any phase exit gate complete. It identifies the

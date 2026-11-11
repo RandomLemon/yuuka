@@ -122,6 +122,12 @@ type Event interface {
 }
 ```
 
+Implementation status: these interfaces are not wired into the current
+executor. `backend/backend.go` defines `Backend`, `ExecutionPlan`, `Batch`, and
+related types, but the implemented HIP path uses `engine.Runtime` and
+`backend/hip.Plan`. Adopting the interfaces is part of the batching and serving
+work.
+
 ### 4.1 Interface contracts
 
 These contracts must be explicit in the implementation:
@@ -174,15 +180,23 @@ Decode loop: quantized GEMV + paged attention + sampling
 Stream tokens / finish / release request resources
 ```
 
+Current status: the single-request `qwen35` path processes prompt tokens one at
+a time through the same planned decode graph. Batched prefill, paged attention,
+and graph replay in this diagram are target behavior.
+
 Key rules:
 
 1. GGUF data is validated before any device allocation.
 2. Weights are loaded into a device-resident pool for the model lifetime.
-3. Prefill and decode share the KV cache but use different operator paths.
+3. In the target design, prefill and decode share the KV cache but use different
+   operator paths. The current single-request path uses the decode graph for
+   both.
 4. Sampling may run on the GPU or on the host through a low-overhead path; the
    choice is a plan decision, not a per-token branch in model code.
-5. Request cancellation releases KV blocks and scratch through the scheduler and
-   memory manager, not through ad hoc frees in the API layer.
+5. In the target design, request cancellation releases KV blocks and scratch
+   through the scheduler and memory manager, not through ad hoc frees in the
+   API layer. The current single-request path resets its contiguous runtime
+   state.
 
 ## 6. Go and HIP boundary
 
@@ -251,24 +265,26 @@ on the assumption that zero-copy access is optimal.
 | --- | --- | --- | --- |
 | **Weights** | Quantized weights, embedding tables, output head | Model lifetime | Device-resident; stable addresses preferred |
 | **Activation** | Layer scratch, attention workspace, logits | Per step or per batch | Reused across layers; sized from the plan |
-| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Block allocator; see [serving.md](serving.md) |
+| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Target: block allocator; current: contiguous `F32` per request; see [serving.md](serving.md) |
 | **Staging** | Host/device transfer buffers | Transient | Reused; explicit synchronization |
 | **Graph workspace** | Stable-address buffers for replay | Backend/model lifetime | Address stability is a requirement |
 
 ### 7.3 KV cache summary
 
-The initial design supports FP16 KV with a configurable block size (for example
-16 or 32 tokens), and leaves an extension point for quantized KV. The logical KV
-view exposed to model code must not expose the physical block layout. Block
-allocation, reference counting, prefix sharing, cancellation, and eviction are
-specified in [serving.md](serving.md).
+Current implementation: the `qwen35` CPU and HIP runtimes use contiguous `F32`
+KV caches and contiguous recurrent convolution/state buffers, indexed by
+absolute position. The target design is FP16 KV with a configurable block size
+(for example 16 or 32 tokens) and an extension point for quantized KV. The
+logical KV view exposed to model code must not expose the physical block layout.
+Block allocation, reference counting, prefix sharing, cancellation, and
+eviction are specified in [serving.md](serving.md).
 
 ## 8. Backends and fallback
 
 | Backend | Role | Status |
 | --- | --- | --- |
-| HIP GPU | Primary execution path | Target |
-| CPU reference | Correctness baseline, required fallback for unsupported operations | Target |
+| HIP GPU | Primary execution path | Implemented for `qwen35` single request |
+| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`; default backend |
 | XDNA NPU | Optional heterogeneous acceleration | Deferred; see [npu.md](npu.md) |
 
 The planner queries backend capabilities, including supported dtypes,
@@ -288,65 +304,49 @@ depend on NPU toolchain availability.
 
 ## 9. Repository layout
 
+Current implemented layout:
+
 ```text
 yuuka/
 ├── cmd/
 │   ├── yuuka/                 # CLI
 │   └── yuuka-server/          # OpenAI-compatible server
-├── gguf/
-│   ├── reader.go
-│   ├── metadata.go
-│   ├── tensor.go
-│   └── quant.go
-├── tokenizer/
-│   ├── bpe.go
-│   ├── sentencepiece.go
-│   └── template.go
+├── gguf/                      # Pure Go GGUF reader and validation
+├── tokenizer/                 # Qwen byte-level BPE and chat rendering
+├── tensor/                    # Dtypes, block layouts, CPU reference math
 ├── model/
-│   ├── model.go
-│   ├── llama/
-│   └── qwen3/
-├── tensor/
-│   ├── tensor.go
-│   ├── dtype.go
-│   └── layout.go
+│   └── qwen35/                # Config, weights, CPU reference decoder, state
 ├── engine/
-│   ├── engine.go
-│   ├── planner.go
-│   ├── executor.go
-│   └── sampling.go
-├── scheduler/
-│   ├── scheduler.go
-│   ├── batch.go
-│   └── request.go
-├── memory/
-│   ├── allocator.go
-│   ├── kv_cache.go
-│   └── prefix_cache.go
+│   ├── engine.go              # Single-request generation loop
+│   ├── sampling.go            # Greedy, top-k, nucleus sampling
+│   └── gpu/                   # HIP executor implementing engine.Runtime
 ├── backend/
-│   ├── backend.go
-│   ├── cpu/
-│   ├── hip/
-│   │   ├── runtime.go
-│   │   └── bridge/
-│   └── npu/
-├── kernels/
+│   ├── backend.go             # Planned backend interfaces; not wired yet
 │   └── hip/
-│       ├── common/
-│       ├── quant/
-│       ├── gemv/
-│       ├── gemm/
-│       ├── attention/
-│       ├── norm/
-│       ├── rope/
-│       └── sampling/
-├── bench/
-├── tests/
-├── docs/
+│       ├── hip.go             # cgo binding for the C ABI
+│       └── bridge/            # HIP C ABI implementation
+├── kernels/hip/
+│   ├── attention/
+│   ├── embedding/
+│   ├── gemv/
+│   ├── ops/
+│   ├── ssm/
+│   ├── common.cuh
+│   └── yuuka_kernels.h
+├── tests/hip/                 # C ABI, GEMV, and operator tests
+├── bench/hip/                 # Hardware probe
 ├── scripts/
+├── docs/
 ├── CMakeLists.txt
 └── go.mod
 ```
+
+Planned but not present yet: `scheduler/`, `memory/`, a separate `backend/cpu/`
+package, `backend/npu/`, `model/llama/`, `model/qwen3/`, `kernels/hip/gemm/`,
+and `kernels/hip/sampling/`. The CPU reference itself is implemented in
+`engine` and `model/qwen35`. The `backend` interfaces and these packages
+describe the target structure; the current executor uses `engine.Runtime` and
+`backend/hip.Plan`.
 
 Use CMake for the HIP shared library and Go Modules for Go components. The two
 build systems meet at the C ABI. Do not embed the HIP/C++ build inside a Go
