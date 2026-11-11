@@ -9,9 +9,12 @@ the single-request GPU path is already correct and measurable.
 Current implementation: one model, one request at a time, SSE streaming,
 token and string stop sequences, health, Prometheus-style metrics, request
 cancellation, and explicit `503` rejection while busy. CPU and HIP runtimes are
-selectable. Cancellation is checked between decode steps; an in-flight prefill
-completes before cancellation is observed. Continuous batching, paged KV,
-prefix cache, and HIP Graph are not implemented yet.
+selectable. The HIP executor processes prompts in configurable chunks over the
+contiguous KV cache (default 512 rows, maximum 4096). Cancellation is checked
+between decode steps; an in-flight prompt completes all of its prefill chunks
+before cancellation is observed. Continuous batching, paged KV, prefix cache,
+HIP Graph, and scheduler-level prefill/decode interleaving are not implemented
+yet.
 
 The first release prioritizes a single model and a single request. Continuous
 batching, prefix caching, and graph replay are introduced only after the
@@ -102,6 +105,11 @@ The precise policy is expected to be tuned. The policy must be observable and
 must not starve a request indefinitely.
 
 ## 6. Continuous batching and chunked prefill
+
+Current status: the HIP executor supports chunked prefill with causal KV
+semantics across chunk boundaries, but the scheduler still admits one request
+at a time. Paged block tables, per-request batch composition, and prefill/decode
+interleaving described below are target behavior.
 
 Continuous batching admits new requests between decode steps rather than waiting
 for the entire batch to finish. The batch is recomposed as requests arrive,

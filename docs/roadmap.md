@@ -240,7 +240,7 @@ efficient KV reuse.
 
 - Paged KV cache with block allocator, per-request block table, reference
   counting, and cleanup.
-- Continuous batching and chunked prefill scheduling.
+- Continuous batching and scheduler-level chunked prefill interleaving.
 - Prefix cache with a documented key and eviction policy.
 - HIP Graph capture and replay for stable decode shapes, with fallback.
 - SSE streaming and an OpenAI-compatible chat/completions endpoint.
@@ -407,5 +407,6 @@ items remain release gates.
       implemented single-request behavior; later-phase behavior remains
       documented as target design.
 
-Phase 3–5 exit gates remain open; this list does not declare the first release
-complete.
+Phase 4–5 exit gates remain open; Phase 3 is complete. This list does not
+declare the first release complete. Prefill lengths are covered by the Phase 3
+curves; the decode-length performance matrix remains a release gate.

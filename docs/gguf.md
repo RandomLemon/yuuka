@@ -207,8 +207,10 @@ Support for a quantization type is not complete until it has reader validation,
 a correct reference path, a GPU kernel, and a benchmark entry.
 
 Current status: fused GEMV decode for `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and
-`Q6_K` is implemented for `qwen35`. Quantized GEMM for prefill remains Phase 3
-work.
+`Q6_K` and quantized WMMA prefill GEMM for `F16`, `F32`, `Q4_K`, `Q5_K`,
+`Q6_K`, and `Q8_0` are implemented for `qwen35`. The prefill dispatch table and
+benchmark evidence are in [kernels.md](kernels.md) and
+[benchmarks.md](benchmarks.md).
 
 ## 10. Validation checklist
 
