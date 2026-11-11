@@ -32,4 +32,4 @@ jobs:
       - name: Build HIP-tagged Go packages
         run: go build -tags hip ./...
       - name: Run HIP-tagged Go tests
-        run: go test -tags hip -count=1 ./backend/hip ./engine/gpu
+        run: go test -tags hip -count=1 ./backend/hip ./engine/gpu ./serving ./cmd/yuuka-server

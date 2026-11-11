@@ -28,7 +28,7 @@ if [ "${1:-}" = "--hip" ]; then
     cmake --build build -j"$(nproc)"
     ctest --test-dir build --output-on-failure
     go build -tags hip ./...
-    go test -tags hip -count=1 ./backend/hip ./engine/gpu
+    go test -tags hip -count=1 ./backend/hip ./engine/gpu ./serving ./cmd/yuuka-server
 fi
 
 echo "clean build checks passed"
