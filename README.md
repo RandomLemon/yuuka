@@ -17,6 +17,8 @@ Llama and Qwen3 layouts. It provides:
 - a CLI (`inspect`, `run`, `bench`);
 - an OpenAI-compatible server for single-request chat completions.
 
+CPU and GPU greedy tokens match, layer-by-layer hidden states agree, and the
+recorded first-step maximum absolute logit difference is `4.58e-5`.
 WMMA/rocBLAS prefill, Flash Attention, chunked prefill, paged KV, continuous
 batching, prefix caching, and HIP Graph are not implemented yet. A short-context
 greedy baseline for Qwen3.5-4B Q4_K_M measured 1.93 decode tok/s on the CPU

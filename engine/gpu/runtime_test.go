@@ -179,3 +179,47 @@ func TestGPUGoldenPrompts(t *testing.T) {
 		}
 	}
 }
+
+func TestGPULayerTraceMatchesCPU(t *testing.T) {
+	reader, _, model, prompt := goldenPrompt(t)
+	rt, err := New(reader, model, 64)
+	if err != nil {
+		t.Skipf("HIP runtime unavailable: %v", err)
+	}
+	defer rt.Close()
+	cpuState, err := qwen35.NewState(model.Config, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpuTraces := make(map[int][]float32)
+	if _, err := model.ForwardTrace(prompt, cpuState, func(layer int, x []float32) {
+		cpuTraces[layer] = append([]float32(nil), x...)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, gpuTraces, err := rt.ForwardTrace(prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worstLayer := -1
+	worstDiff := 0.0
+	for layer := range model.Config.BlockCount {
+		want := cpuTraces[layer]
+		got := gpuTraces[layer]
+		maxDiff := 0.0
+		for i := range want {
+			diff := math.Abs(float64(want[i] - got[i]))
+			if diff > maxDiff {
+				maxDiff = diff
+			}
+		}
+		if maxDiff > worstDiff {
+			worstDiff = maxDiff
+			worstLayer = layer
+		}
+		if maxDiff > 0.1 {
+			t.Fatalf("layer %d hidden state differs by %.6g", layer, maxDiff)
+		}
+	}
+	t.Logf("worst layer %d max abs hidden diff %.6g", worstLayer, worstDiff)
+}

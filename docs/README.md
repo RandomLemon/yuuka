@@ -109,8 +109,9 @@ Implemented and tested:
   `-tags hip`.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
   match and the recorded first-step maximum absolute logit difference is
-  `4.58e-5`. The checked-in test enforces the token sequence and a loose logit
-  bound; per-layer tracing exists as a diagnostic hook, not a checked-in test.
+  `4.58e-5`. The checked-in tests enforce the token sequence, a loose logit
+  bound, and a layer-by-layer hidden-state comparison; the worst recorded
+  first-prompt layer difference is `5.53e-5`.
 - Phase 0 hardware probe covering allocation, copy, memset, mapped memory,
   rocBLAS SGEMM, and a rocWMMA FP16 tile.
 

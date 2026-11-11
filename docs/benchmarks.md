@@ -63,10 +63,11 @@ For the prompt `The capital of France is`:
 - The maximum absolute logit difference at the first generated position is
   `4.58e-5`.
 - The checked-in GPU test compares final logits and greedy tokens with the CPU
-  reference. The `ForwardTrace` hook can expose per-layer hidden states, but no
-  layer-by-layer comparison is checked in. The test enforces the greedy token
-  sequence and a loose `5.0` maximum absolute logit guard; `4.58e-5` is the
-  observed first-step difference, not the enforced threshold.
+  reference. The checked-in `TestGPULayerTraceMatchesCPU` compares every layer's
+  hidden state for the same prompt; the worst recorded layer difference is
+  `5.53e-5`. The logit test enforces the greedy token sequence and a loose `5.0`
+  maximum absolute logit guard; `4.58e-5` is the observed first-step difference,
+  not the enforced threshold.
 - Golden CPU token tests also cover `1+1=` and `Once upon a time`.
 
 ## Reproduction

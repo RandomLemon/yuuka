@@ -50,19 +50,21 @@ type activations struct {
 
 // Runtime is a HIP execution backend implementing engine.Runtime.
 type Runtime struct {
-	device   *hip.Device
-	stream   *hip.Stream
-	event    *hip.Event
-	plan     *hip.Plan
-	config   *qwen35.Config
-	weights  map[string]weight
-	layers   []layerState
-	act      activations
-	capacity int
-	pos      int
-	logits   []float32
-	all      []*hip.Buffer
-	closed   bool
+	device    *hip.Device
+	stream    *hip.Stream
+	event     *hip.Event
+	plan      *hip.Plan
+	tracePlan *hip.Plan
+	traceBufs []*hip.Buffer
+	config    *qwen35.Config
+	weights   map[string]weight
+	layers    []layerState
+	act       activations
+	capacity  int
+	pos       int
+	logits    []float32
+	all       []*hip.Buffer
+	closed    bool
 }
 
 // New uploads model weights and builds the device plan.
@@ -104,6 +106,7 @@ func New(reader *gguf.Reader, model *qwen35.Model, capacity int) (*Runtime, erro
 }
 
 func (r *Runtime) setup(reader *gguf.Reader, model *qwen35.Model) error {
+	cfg := r.config
 	for _, info := range reader.Tensors() {
 		data, err := info.Data()
 		if err != nil {
@@ -124,7 +127,25 @@ func (r *Runtime) setup(reader *gguf.Reader, model *qwen35.Model) error {
 	if err := r.allocLayers(); err != nil {
 		return err
 	}
-	return r.buildPlan(model)
+	r.traceBufs = make([]*hip.Buffer, cfg.BlockCount)
+	for i := range r.traceBufs {
+		buf, err := r.alloc(uint64(cfg.HiddenSize) * 4)
+		if err != nil {
+			return err
+		}
+		r.traceBufs[i] = buf
+	}
+	plan, err := r.buildPlan(model, false)
+	if err != nil {
+		return err
+	}
+	r.plan = plan
+	tracePlan, err := r.buildPlan(model, true)
+	if err != nil {
+		return err
+	}
+	r.tracePlan = tracePlan
+	return nil
 }
 
 func (r *Runtime) alloc(bytes uint64) (*hip.Buffer, error) {
@@ -223,23 +244,22 @@ func (r *Runtime) weight(name string) (weight, error) {
 	return w, nil
 }
 
-func (r *Runtime) buildPlan(model *qwen35.Model) error {
+func (r *Runtime) buildPlan(model *qwen35.Model, trace bool) (*hip.Plan, error) {
 	plan, err := r.device.NewPlan()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	r.plan = plan
 	cfg := r.config
 	embedding, err := r.weight("token_embd.weight")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rowBytes, err := embedding.dtype.RowBytes(int64(cfg.HiddenSize))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := plan.AddEmbedding(embedding.buf, r.act.x, int64(cfg.HiddenSize), int64(rowBytes), embedding.dtype); err != nil {
-		return err
+		return nil, err
 	}
 	layerBytes := func(layer int) string { return fmt.Sprintf("blk.%d.", layer) }
 	for i := range model.Layers {
@@ -247,32 +267,37 @@ func (r *Runtime) buildPlan(model *qwen35.Model) error {
 		prefix := layerBytes(i)
 		attnNorm, err := r.weight(prefix + "attn_norm.weight")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		postNorm, err := r.weight(prefix + "post_attention_norm.weight")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if layer.Full != nil {
 			if err := r.addFullAttention(plan, i, layer, attnNorm); err != nil {
-				return err
+				return nil, err
 			}
 		} else {
 			if err := r.addRecurrent(plan, i, layer, attnNorm); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if err := r.addFFN(plan, prefix, postNorm); err != nil {
-			return err
+			return nil, err
+		}
+		if trace {
+			if err := plan.AddCopy(r.traceBufs[i], r.act.x, int64(cfg.HiddenSize)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	plan.MarkTail()
 	outputNorm, err := r.weight("output_norm.weight")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := plan.AddRMSNorm(r.act.x, outputNorm.buf, r.act.norm, int64(cfg.HiddenSize), cfg.RMSNormEps); err != nil {
-		return err
+		return nil, err
 	}
 	outputName := "output.weight"
 	if _, ok := r.weights[outputName]; !ok {
@@ -280,10 +305,13 @@ func (r *Runtime) buildPlan(model *qwen35.Model) error {
 	}
 	output, err := r.weight(outputName)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return plan.AddGemv(output.buf, r.act.norm, r.act.logits,
-		int64(cfg.HiddenSize), int64(cfg.VocabSize), output.dtype)
+	if err := plan.AddGemv(output.buf, r.act.norm, r.act.logits,
+		int64(cfg.HiddenSize), int64(cfg.VocabSize), output.dtype); err != nil {
+		return nil, err
+	}
+	return plan, nil
 }
 
 func (r *Runtime) addFullAttention(plan *hip.Plan, layerIndex int, layer *qwen35.Layer, attnNorm weight) error {
@@ -536,6 +564,43 @@ func (r *Runtime) Step(token int32) ([]float32, error) {
 	return r.Forward([]int32{token})
 }
 
+// ForwardTrace processes tokens and returns the last-token logits together
+// with the hidden state after every decoder layer for the last token. It is a
+// diagnostic path for CPU/GPU layer comparison and allocates no new device
+// buffers after construction.
+func (r *Runtime) ForwardTrace(tokens []int32) ([]float32, [][]float32, error) {
+	if len(tokens) == 0 {
+		return nil, nil, fmt.Errorf("empty token sequence")
+	}
+	if r.pos+len(tokens) > r.capacity {
+		return nil, nil, fmt.Errorf("token sequence exceeds remaining context")
+	}
+	for i, token := range tokens {
+		if token < 0 || int(token) >= r.config.VocabSize {
+			return nil, nil, fmt.Errorf("token id %d is out of range", token)
+		}
+		if err := r.tracePlan.Execute(r.stream, token, uint32(r.pos), i == len(tokens)-1, r.event); err != nil {
+			return nil, nil, err
+		}
+		if err := r.event.Wait(); err != nil {
+			return nil, nil, err
+		}
+		r.pos++
+	}
+	if err := r.device.DownloadFloats(r.logits, r.act.logits); err != nil {
+		return nil, nil, err
+	}
+	traces := make([][]float32, len(r.traceBufs))
+	for i, buf := range r.traceBufs {
+		trace := make([]float32, r.config.HiddenSize)
+		if err := r.device.DownloadFloats(trace, buf); err != nil {
+			return nil, nil, err
+		}
+		traces[i] = trace
+	}
+	return r.logits, traces, nil
+}
+
 func (r *Runtime) Capacity() int  { return r.capacity }
 func (r *Runtime) VocabSize() int { return r.config.VocabSize }
 
@@ -547,6 +612,9 @@ func (r *Runtime) Close() error {
 	r.closed = true
 	if r.plan != nil {
 		_ = r.plan.Close()
+	}
+	if r.tracePlan != nil {
+		_ = r.tracePlan.Close()
 	}
 	for i := len(r.all) - 1; i >= 0; i-- {
 		_ = r.all[i].Close()
