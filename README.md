@@ -1,116 +1,303 @@
 # yuuka
 
-`yuuka` is a from-scratch LLM inference framework for AMD **gfx1151** (RDNA 3.5)
-APUs. The runtime is Go; performance-critical device code is HIP/C++. It reads
-GGUF directly and keeps quantized weights packed.
+`yuuka` is a from-scratch LLM inference runtime for AMD **gfx1151** (RDNA 3.5)
+APUs. The runtime is written in Go; performance-critical device code is written
+in HIP/C++. It reads GGUF files directly, keeps quantized weights packed, and
+does not use llama.cpp, GGML, or Ollama as an execution engine.
 
-The current vertical slice runs **Qwen3.5-4B** (`qwen35`) on both a CPU
-reference backend and a HIP device backend. The HIP path is a planned operation
-stream: weights are uploaded once, and one plan submission executes a whole
-token.
+The current implementation is a **single-request vertical slice** for the
+Qwen3.5 hybrid architecture (`qwen35`). It provides:
 
-## Status
+- a validated, mmap-backed GGUF reader with split-shard support;
+- a Qwen byte-level BPE tokenizer and Qwen chat rendering;
+- a CPU reference decoder used as the correctness oracle and default backend;
+- a HIP decoder that executes the full model on the GPU;
+- a CLI (`inspect`, `run`, `bench`);
+- an OpenAI-compatible server for single-request chat completions.
 
-| Area | State |
+WMMA/rocBLAS prefill, Flash Attention, chunked prefill, paged KV, continuous
+batching, prefix caching, and HIP Graph are not implemented yet. A short-context
+greedy baseline for Qwen3.5-4B Q4_K_M measured 1.93 decode tok/s on the CPU
+reference and 9.87 decode tok/s on HIP; see
+[`docs/benchmarks.md`](docs/benchmarks.md) for the exact conditions.
+
+## Supported models
+
+Only the Qwen3.5 dense hybrid architecture is supported.
+
+| Item | Support |
 | --- | --- |
-| GGUF reader | Validated metadata, tensor directory, split shards, alignment, byte ranges |
-| Tokenizer | Qwen3.5 byte-level BPE, special tokens, Qwen chat rendering, golden token IDs |
-| CPU reference | Full `qwen35` forward pass, FP32 accumulation, FP32 KV cache |
-| HIP execution | Embedding, RMSNorm, RoPE, GQA attention, GDN convolution/state, SwiGLU, LM head |
-| Quantized kernels | `F16`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` GEMV, validated against CPU |
-| CLI | `inspect`, `run`, `bench` with CPU/HIP selection |
-| Server | OpenAI-compatible chat completions, SSE, stop sequences, health, metrics |
-| Prefill | Per-token execution; no WMMA/rocBLAS batched prefill yet |
-| Serving | Single request; no paged KV, batching, prefix cache, or HIP Graph |
+| `general.architecture` | `qwen35` only |
+| Validated model | Qwen3.5-4B, Q4_K_M GGUF, SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
+| Tokenizer | GPT-2-style byte-level BPE with `tokenizer.ggml.pre` set to `qwen35` or `qwen2` |
+| Chat | Qwen `<|im_start|>` template; `--chat` and the server require it |
+| GGUF | Versions 2 and 3; split shards using `-NNNNN-of-NNNNN.gguf` names |
+| Weight dtypes | `F32`, `F16`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` |
 
-Measured baseline: CPU 1.93 decode tok/s, HIP 9.87 decode tok/s for
-Qwen3.5-4B Q4_K_M at short context. See [docs/benchmarks.md](docs/benchmarks.md)
-and [docs/hardware.md](docs/hardware.md).
+Q4_K_M is a mixed quantization preset, not a single tensor type. A file with
+that label works only when every tensor uses a supported dtype. Two-dimensional
+weight matrices may use any dtype in the table above. One-dimensional vectors
+such as norm weights, `ssm_conv1d.weight`, `ssm_dt.bias`, and `ssm_a` must be
+`F32`.
+
+The following are rejected explicitly rather than approximated:
+
+- other architectures such as Qwen3 dense, Qwen2, Llama, Gemma, MoE, or
+  DeepSeek-style models;
+- SentencePiece tokenizers and non-Qwen chat templates;
+- unsupported tensor types such as `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q2_K`,
+  `Q3_K`, `Q8_K`, and IQ formats;
+- image, audio, tool, and other non-text chat content.
+
+Other `qwen35` GGUF files that satisfy the metadata, tensor-layout, tokenizer,
+and dtype constraints may load, but only the Qwen3.5-4B Q4_K_M file above is
+part of the validated test matrix.
 
 ## Requirements
 
-- Linux with ROCm/HIP 7.16 (validated on ROCm 10.1 layout)
-- Go 1.24+
-- CMake 3.31+
-- rocBLAS and rocWMMA development packages for the hardware probe
+| Component | Requirement |
+| --- | --- |
+| Host OS | Linux for the HIP backend; the CPU-only build has no ROCm dependency |
+| Go | 1.24 or newer |
+| C/C++ | C++17 compiler and CMake 3.20 or newer for the native library |
+| ROCm | HIP 7.16 on the ROCm 10.1 layout, validated on `gfx1151` |
+| GPU | AMD `gfx1151` (Radeon 8060S) for the validated HIP path |
+| Optional native tools | rocBLAS and rocWMMA development packages for the hardware probe |
+
+CMake searches `ROCM_PATH` and the usual `/opt/rocm` layout. Other ROCm and HIP
+versions may work, but they are not part of the recorded test environment.
 
 ## Build
 
+### CPU-only
+
+The CPU reference backend does not link the HIP library.
+
 ```bash
+mkdir -p bin
+
+go build -o bin/yuuka ./cmd/yuuka
+go build -o bin/yuuka-server ./cmd/yuuka-server
+```
+
+### HIP backend
+
+Build the native library first, then build the Go binaries with the `hip` build
+tag. The cgo link path expects the native build directory to be `build/` at the
+repository root.
+
+```bash
+mkdir -p bin
+
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 
-go build -o bin/yuuka ./cmd/yuuka
 go build -tags hip -o bin/yuuka-hip ./cmd/yuuka
-go build -tags hip -o bin/yuuka-server ./cmd/yuuka-server
+go build -tags hip -o bin/yuuka-server-hip ./cmd/yuuka-server
 ```
 
-The `hip` build tag is required for Go code that links the native library.
-The default build is CPU-only and does not require `libyuuka_hip.so`.
+The default native build also compiles the C ABI tests, kernel tests, and the
+hardware probe. Disable the probe with `-DYUUKA_BUILD_BENCH=OFF` if rocBLAS or
+rocWMMA is unavailable.
 
-## Run
+The `-tags hip` binaries still default to the CPU backend. Select the GPU with
+`--backend hip`. A binary built without the tag rejects `--backend hip` with an
+explicit error.
+
+## Usage
+
+### Inspect a model
 
 ```bash
-MODEL=~/llm/models/qwen3.5-4b/Qwen3.5-4B-Q4_K_M.gguf
+export MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf
 
 ./bin/yuuka inspect --model "$MODEL"
-./bin/yuuka run --model "$MODEL" --prompt "The capital of France is" --max-tokens 16
-./bin/yuuka-hip run --model "$MODEL" --backend hip --prompt "The capital of France is" --max-tokens 16
+./bin/yuuka inspect --model "$MODEL" --tensors --hash
 ```
 
-Chat mode applies the GGUF Qwen chat template:
+`inspect` prints the architecture, layer layout, attention and state-space
+dimensions, tokenizer metadata, tensor dtypes, and optional per-tensor details.
+
+### Generate text
+
+CPU reference backend:
 
 ```bash
-./bin/yuuka-hip run --model "$MODEL" --backend hip --chat \
-  --system "You are concise." --prompt "Explain RoPE in one sentence." --max-tokens 64
+./bin/yuuka run \
+  --model "$MODEL" \
+  --prompt "The capital of France is" \
+  --max-tokens 32
 ```
 
-## Server
+HIP backend:
 
 ```bash
-./bin/yuuka-server --model "$MODEL" --backend hip --ctx 4096 --addr 127.0.0.1:8080
+./bin/yuuka-hip run \
+  --model "$MODEL" \
+  --backend hip \
+  --prompt "The capital of France is" \
+  --max-tokens 32
+```
 
+Chat mode applies the Qwen chat template stored in the GGUF metadata:
+
+```bash
+./bin/yuuka-hip run \
+  --model "$MODEL" \
+  --backend hip \
+  --chat \
+  --system "You are concise." \
+  --prompt "Explain RoPE in one sentence." \
+  --max-tokens 64
+```
+
+When `--prompt` is empty, the prompt is read from standard input.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--model` | required | GGUF model path |
+| `--backend` | `cpu` | `cpu` or `hip` |
+| `--ctx` | `4096` | Context capacity; may not exceed the model context |
+| `--max-tokens` | `128` | Maximum generated tokens |
+| `--temperature` | `0` | Sampling temperature; `0` means greedy |
+| `--top-k` | `40` | Top-k cutoff |
+| `--top-p` | `0.95` | Nucleus cutoff |
+| `--seed` | `0` | Sampling seed |
+| `--chat` | `false` | Render the model chat template |
+| `--system` | empty | System message used with `--chat` |
+| `--thinking` | `false` | Leave an open reasoning block in chat mode |
+
+Generation stops on EOS, on the token limit, or on interrupt/SIGTERM. Prefill,
+TTFT, decode throughput, and the finish reason are written to standard error so
+that generated text stays clean on standard output.
+
+### Benchmark
+
+```bash
+./bin/yuuka-hip bench \
+  --model "$MODEL" \
+  --backend hip \
+  --prompt-tokens 128 \
+  --decode-tokens 32 \
+  --warmup 1 \
+  --reps 3 \
+  --hash
+```
+
+`bench` reports p50/p95 prefill, TTFT, and decode timings. It uses a synthetic
+English prompt and greedy sampling.
+
+### OpenAI-compatible server
+
+```bash
+./bin/yuuka-server-hip \
+  --model "$MODEL" \
+  --backend hip \
+  --ctx 4096 \
+  --model-name yuuka \
+  --addr 127.0.0.1:8080
+```
+
+Non-streaming request:
+
+```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":false}'
+  -d '{
+    "model": "yuuka",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 16,
+    "temperature": 0
+  }'
 ```
 
-Endpoints: `POST /v1/chat/completions`, `GET /v1/models`, `GET /healthz`,
-`GET /metrics`.
+Streaming request:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "yuuka",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 16,
+    "stream": true
+  }'
+```
+
+Endpoints:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/chat/completions` | Chat completions, JSON or SSE |
+| `GET /v1/models` | Loaded model metadata |
+| `GET /healthz` | Health and backend status |
+| `GET /metrics` | Prometheus-format counters and gauges |
+
+Server flags: `--model`, `--backend`, `--ctx`, `--model-name`, and `--addr`.
+The server handles one request at a time and returns HTTP `503` with
+`Retry-After` when busy. It supports `temperature`, `top_p`, `top_k`, `seed`,
+`stop`, `max_tokens`, `max_completion_tokens`, `stream`, and
+`enable_thinking`; tool and image content are rejected.
 
 ## Tests
+
+CPU and Go tests:
 
 ```bash
 go build ./...
 go test ./...
 go test -race ./...
-go build -tags hip ./...
+go vet ./...
+```
 
+Native C ABI and kernel tests:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
+```
 
-# Real-model verification (skipped when the variable is absent)
+Real-model and HIP/CPU agreement tests:
+
+```bash
 YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./... -count=1
 ```
 
-The GPU runtime is checked against the CPU reference on prompt logits and
-greedy token sequences. Native tests cover the C ABI and every quantized GEMV
-kernel.
+Without `YUUKA_TEST_MODEL`, model-dependent Go tests are skipped. Native tests
+skip with exit code 77 when the requested HIP device is unavailable.
 
 ## Limitations
 
-- Only `general.architecture = qwen35` is supported.
-- Only GPT-2-style byte-level BPE (Qwen2/Qwen3.5 pre-tokenization) is
-  implemented; SentencePiece vocabularies are not.
-- The HIP executor submits one token at a time and does not batch prefill.
-- KV cache is contiguous FP32; paged KV and quantized KV are not implemented.
-- The server handles one request at a time and returns `503` when busy.
-- Tool and vision chat content is rejected explicitly.
+- The supported architecture is `qwen35` only; there are no dense Llama, Qwen3,
+  Gemma, MoE, or multimodal model adapters.
+- The tokenizer implementation covers Qwen byte-level BPE only. SentencePiece
+  and non-Qwen chat templates are not implemented.
+- Prefill executes one token at a time. There is no batched prefill, WMMA or
+  rocBLAS GEMM path, or Flash Attention.
+- KV cache is contiguous `F32`. Paged KV, quantized KV, prefix caching, and
+  continuous batching are not implemented.
+- The server is single-request. It rejects concurrent work instead of queueing
+  it.
+- The validated HIP environment is Linux, ROCm 10.1 layout / HIP 7.16, and
+  `gfx1151`. Other devices and toolchain versions are unverified.
 
 ## Documentation
 
-Start at [docs/README.md](docs/README.md). The design contracts are in
-[docs/architecture.md](docs/architecture.md), [docs/gguf.md](docs/gguf.md),
-[docs/kernels.md](docs/kernels.md), [docs/serving.md](docs/serving.md),
-[docs/testing.md](docs/testing.md), and
-[docs/roadmap.md](docs/roadmap.md).
+Start at [`docs/README.md`](docs/README.md). The main design contracts are:
+
+- [`docs/architecture.md`](docs/architecture.md) - layers, interfaces, memory
+  ownership, and the Go/HIP boundary;
+- [`docs/gguf.md`](docs/gguf.md) - GGUF parsing, metadata, tokenizer, and model
+  support plan;
+- [`docs/kernels.md`](docs/kernels.md) - prefill/decode kernels, quantization,
+  attention, and dispatch;
+- [`docs/serving.md`](docs/serving.md) - scheduling, KV cache, API, and
+  observability;
+- [`docs/testing.md`](docs/testing.md) - correctness strategy, test matrix,
+  benchmark protocol, and regression gates;
+- [`docs/roadmap.md`](docs/roadmap.md) - phases, deliverables, and exit criteria.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
