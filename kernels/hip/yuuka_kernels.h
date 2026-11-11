@@ -82,10 +82,26 @@ void launch_copy_f32(float * dst, const float * src, int64_t n, hipStream_t stre
 void launch_scale_f32(float * x, int64_t n, float scale, hipStream_t stream);
 void launch_rope_f32(float * data, int heads, int stride, int head_dim, int rot_dim,
                      int pos, float base, hipStream_t stream);
+void launch_rope_dynamic_f32(float * data, int heads, int stride, int head_dim,
+                             int rot_dim, const int32_t * dynamic, float base,
+                             hipStream_t stream);
 void launch_attention_f32(float * out, const float * q, const float * k_cache,
                           const float * v_cache, float * scores,
                           int kv_heads, int heads, int head_dim, int kv_dim,
                           int position, int capacity, float scale, hipStream_t stream);
+void launch_attention_paged_f32(float * out, const float * q, const float * k_pool,
+                                const float * v_pool, float * scores,
+                                const int32_t * block_table, int block_size,
+                                int kv_heads, int heads, int head_dim, int kv_dim,
+                                int position, int score_stride, float scale,
+                                hipStream_t stream);
+void launch_attention_paged_dynamic_f32(float * out, const float * q,
+                                        const float * k_pool, const float * v_pool,
+                                        float * scores, const int32_t * block_table,
+                                        const int32_t * dynamic, int block_size,
+                                        int kv_heads, int heads, int head_dim,
+                                        int kv_dim, int score_stride, float scale,
+                                        hipStream_t stream);
 void launch_conv1d_f32(float * state, const float * weights, const float * qkv,
                        float * out, int channels, int kernel, hipStream_t stream);
 void launch_gdn_f32(float * state, const float * q, const float * k, const float * v,
@@ -95,6 +111,9 @@ void launch_gdn_f32(float * state, const float * q, const float * k, const float
 void launch_embedding_f32(float * out, const void * weights, int32_t token,
                           uint64_t row_bytes, int64_t cols, uint32_t dtype,
                           hipStream_t stream);
+void launch_embedding_dynamic_f32(float * out, const void * weights,
+                                  const int32_t * dynamic, uint64_t row_bytes,
+                                  int64_t cols, uint32_t dtype, hipStream_t stream);
 
 /* Chunked prefill operators. Every row-pointer argument is a contiguous
  * [rows, width] buffer in row-major order. position is the token position of
@@ -112,6 +131,16 @@ void launch_rope_batch_f32(float * data, int rows, int heads, int stride,
 void launch_kv_write_batch_f32(float * k_cache, float * v_cache, const float * k,
                                const float * v, int rows, int kv_dim, int position,
                                hipStream_t stream);
+void launch_kv_write_paged_f32(float * k_pool, float * v_pool, const float * k,
+                               const float * v, int rows, int kv_dim,
+                               const int32_t * block_table, int block_size,
+                               int position, hipStream_t stream);
+void launch_kv_write_paged_dynamic_f32(float * k_pool, float * v_pool,
+                                       const float * k, const float * v,
+                                       int rows, int kv_dim,
+                                       const int32_t * block_table,
+                                       const int32_t * dynamic, int block_size,
+                                       hipStream_t stream);
 void launch_embedding_batch_f32(float * out, const void * weights,
                                 const int32_t * tokens, int rows, uint64_t row_bytes,
                                 int64_t cols, uint32_t dtype, hipStream_t stream);
@@ -120,6 +149,12 @@ void launch_attention_prefill_f32(float * out, const float * q,
                                   int kv_heads, int heads, int head_dim, int kv_dim,
                                   int rows, int position, int capacity, float scale,
                                   hipStream_t stream);
+void launch_attention_prefill_paged_f32(float * out, const float * q,
+                                        const float * k_pool, const float * v_pool,
+                                        const int32_t * block_table, int block_size,
+                                        int kv_heads, int heads, int head_dim,
+                                        int kv_dim, int rows, int position,
+                                        float scale, hipStream_t stream);
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
                                 const float * qkv, const float * z,
                                 const float * alpha, const float * beta,

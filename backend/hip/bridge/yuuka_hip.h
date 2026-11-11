@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 2
+#define YUUKA_HIP_ABI_VERSION 3
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -75,6 +75,18 @@ YUUKA_API yuuka_status yuuka_memcpy_h2d(yuuka_buffer * dst, const void * src, ui
 YUUKA_API yuuka_status yuuka_memcpy_d2h(void * dst, const yuuka_buffer * src, uint64_t bytes);
 YUUKA_API yuuka_status yuuka_memset(yuuka_stream * stream, yuuka_buffer * dst, int value, uint64_t bytes);
 
+/* Asynchronous device-to-device copy on stream. Offsets and length must fit
+ * both buffers. Used to give a request a private prefix block. */
+YUUKA_API yuuka_status yuuka_buffer_copy(yuuka_stream * stream,
+                                yuuka_buffer * dst, uint64_t dst_offset,
+                                const yuuka_buffer * src, uint64_t src_offset,
+                                uint64_t bytes, yuuka_event * completion);
+
+/* Uploads the two dynamic decode parameters: int32 token and int32 position.
+ * Graph replay reads them from device memory so kernel arguments stay fixed. */
+YUUKA_API yuuka_status yuuka_dynamic_set(yuuka_stream * stream, yuuka_buffer * dynamic,
+                                int32_t token, uint32_t position);
+
 /* Elementwise smoke operation used by the ABI test. */
 YUUKA_API yuuka_status yuuka_add_f32(yuuka_stream * stream, yuuka_buffer * dst,
                            const yuuka_buffer * a, const yuuka_buffer * b,
@@ -112,7 +124,11 @@ typedef enum yuuka_op_code {
     YUUKA_OP_ATTENTION_PREFILL = 22,
     YUUKA_OP_RECURRENT_CHUNK = 23,
     YUUKA_OP_EMBEDDING_BATCH = 24,
-    YUUKA_OP_CAST_F16 = 25
+    YUUKA_OP_CAST_F16 = 25,
+    YUUKA_OP_KV_WRITE_PAGED = 26,
+    YUUKA_OP_ATTENTION_PAGED = 27,
+    YUUKA_OP_KV_WRITE_BATCH_PAGED = 28,
+    YUUKA_OP_ATTENTION_PREFILL_PAGED = 29
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -136,6 +152,7 @@ typedef struct yuuka_op {
 } yuuka_op;
 
 typedef struct yuuka_plan yuuka_plan;
+typedef struct yuuka_graph yuuka_graph;
 
 typedef enum yuuka_dtype {
     YUUKA_DTYPE_F32 = 0,
@@ -233,7 +250,33 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   EMBEDDING_BATCH:     buf0 weight table, buf1 out, buf2 int32 tokens;
  *                        n={cols,rows,row_bytes,vocab}; u[0]=dtype
  *   CAST_F16:            buf0 FP32 src, buf1 FP16 dst; n[0]=elements
- */
+ *
+ * Paged family. The block table is an int32 buffer with ceil(capacity/block_size)
+ * entries mapping logical token positions to pool blocks. The pool holds
+ * ceil(capacity/block_size)*block_size rows of kv_dim FP32 values.
+ *   KV_WRITE_PAGED:         buf0 k, buf1 v, buf2 k_pool, buf3 v_pool,
+ *                           buf4 block table; n[0]=kv_dim; u[0]=block_size;
+ *                           u[1]=capacity
+ *   KV_WRITE_BATCH_PAGED:   same buffers; n={kv_dim,rows,capacity};
+ *                           u[0]=block_size
+ *   ATTENTION_PAGED:        buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
+ *                           buf4 scores, buf5 block table;
+ *                           n={kv_heads,heads,head_dim,kv_dim,score_stride};
+ *                           u[0]=block_size; u[1]=capacity
+ *   ATTENTION_PREFILL_PAGED: buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
+ *                           buf4 block table;
+ *                           n={kv_heads,heads,head_dim,kv_dim,rows};
+ *                           u[0]=block_size; u[1]=capacity
+ *
+ * Graph capture executes a plan with device-resident dynamic parameters. Only
+ * ops with dynamic-aware kernels may be captured; otherwise capture fails with
+ * YUUKA_ERR_UNSUPPORTED and the caller falls back to normal submission. */
+YUUKA_API yuuka_status yuuka_graph_create(yuuka_plan * plan, yuuka_stream * stream,
+                                          yuuka_buffer * dynamic, int run_tail,
+                                          yuuka_graph ** out);
+YUUKA_API yuuka_status yuuka_graph_replay(yuuka_graph * graph, yuuka_stream * stream,
+                                          yuuka_event * completion);
+YUUKA_API void yuuka_graph_destroy(yuuka_graph * graph);
 YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out);
 YUUKA_API void yuuka_plan_destroy(yuuka_plan * plan);
 YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op);

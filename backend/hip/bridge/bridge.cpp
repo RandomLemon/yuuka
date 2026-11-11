@@ -33,6 +33,11 @@ struct yuuka_plan {
     std::vector<yuuka_op> ops;
 };
 
+struct yuuka_graph {
+    hipGraph_t graph;
+    hipGraphExec_t exec;
+};
+
 namespace {
 
 thread_local std::string g_last_error;
@@ -472,6 +477,172 @@ yuuka_status validate_cast_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+
+uint64_t paged_blocks(uint64_t capacity, uint64_t block_size) {
+    return (capacity + block_size - 1) / block_size;
+}
+
+yuuka_status validate_paged_pool(const yuuka_op & op, uint64_t kv_dim,
+                                 uint64_t block_size, uint64_t capacity,
+                                 int table_index) {
+    if (block_size == 0 || capacity == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged op needs positive geometry");
+    }
+    const uint64_t blocks = paged_blocks(capacity, block_size);
+    uint64_t rows = 0;
+    uint64_t pool_elems = 0;
+    uint64_t pool_bytes = 0;
+    uint64_t table_bytes = 0;
+    if (__builtin_mul_overflow(blocks, block_size, &rows) ||
+        __builtin_mul_overflow(rows, kv_dim, &pool_elems) ||
+        __builtin_mul_overflow(pool_elems, uint64_t(sizeof(float)), &pool_bytes) ||
+        __builtin_mul_overflow(blocks, uint64_t(sizeof(int32_t)), &table_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged op dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[table_index], 0, table_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged block table is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_kv_write_paged_plan_op(const yuuka_op & op, bool batched) {
+    const uint64_t kv_dim = op.n[0];
+    const uint64_t rows = batched ? op.n[1] : 1;
+    const uint64_t block_size = op.u[0];
+    const uint64_t capacity = op.u[1];
+    if (kv_dim == 0 || rows == 0 || capacity < rows) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged KV write dimensions");
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged KV write buffer %d is null", i);
+        }
+    }
+    uint64_t elems = 0;
+    uint64_t bytes = 0;
+    if (__builtin_mul_overflow(rows, kv_dim, &elems) ||
+        __builtin_mul_overflow(elems, uint64_t(sizeof(float)), &bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged KV write dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged KV write source is too small");
+    }
+    yuuka_status status = validate_paged_pool(op, kv_dim, block_size, capacity, 4);
+    if (status != YUUKA_OK) {
+        return status;
+    }
+    const uint64_t blocks = paged_blocks(capacity, block_size);
+    uint64_t pool_elems = 0;
+    uint64_t pool_bytes = 0;
+    if (__builtin_mul_overflow(blocks * block_size, kv_dim, &pool_elems) ||
+        __builtin_mul_overflow(pool_elems, uint64_t(sizeof(float)), &pool_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged KV pool dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[2], 0, pool_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, pool_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged KV pool is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_attention_paged_plan_op(const yuuka_op & op) {
+    const uint64_t kv_heads = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t head_dim = op.n[2];
+    const uint64_t kv_dim = op.n[3];
+    const uint64_t score_stride = op.n[4];
+    const uint64_t block_size = op.u[0];
+    const uint64_t capacity = op.u[1];
+    if (kv_heads == 0 || heads == 0 || head_dim == 0 || heads % kv_heads != 0 ||
+        kv_dim != kv_heads * head_dim || score_stride < capacity) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged attention dimensions");
+    }
+    if (head_dim > 256) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "paged attention head dimension exceeds 256");
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged attention buffer %d is null", i);
+        }
+    }
+    yuuka_status status = validate_paged_pool(op, kv_dim, block_size, capacity, 5);
+    if (status != YUUKA_OK) {
+        return status;
+    }
+    uint64_t q_bytes = 0;
+    uint64_t out_bytes = 0;
+    uint64_t score_bytes = 0;
+    uint64_t blocks = paged_blocks(capacity, block_size);
+    if (__builtin_mul_overflow(heads * 2 * head_dim, uint64_t(sizeof(float)), &q_bytes) ||
+        __builtin_mul_overflow(heads * head_dim, uint64_t(sizeof(float)), &out_bytes) ||
+        __builtin_mul_overflow(heads, score_stride, &score_bytes) ||
+        __builtin_mul_overflow(score_bytes, uint64_t(sizeof(float)), &score_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged attention dimensions overflow");
+    }
+    (void)blocks;
+    if (!buffer_range_ok(op.buf[0], op.off[0], q_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], out_bytes) ||
+        !buffer_range_ok(op.buf[4], op.off[4], score_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged attention buffer is too small");
+    }
+    uint64_t pool_elems = 0;
+    uint64_t pool_bytes = 0;
+    if (__builtin_mul_overflow(paged_blocks(capacity, block_size) * block_size, kv_dim, &pool_elems) ||
+        __builtin_mul_overflow(pool_elems, uint64_t(sizeof(float)), &pool_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged attention pool dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[1], 0, pool_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, pool_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged attention pool is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
+    const uint64_t kv_heads = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t head_dim = op.n[2];
+    const uint64_t kv_dim = op.n[3];
+    const uint64_t rows = op.n[4];
+    const uint64_t block_size = op.u[0];
+    const uint64_t capacity = op.u[1];
+    if (kv_heads == 0 || heads == 0 || head_dim == 0 || rows == 0 ||
+        heads % kv_heads != 0 || kv_dim != kv_heads * head_dim || capacity < rows) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid paged prefill attention dimensions");
+    }
+    if (head_dim > 256) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "paged prefill attention head dimension exceeds 256");
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "paged prefill attention buffer %d is null", i);
+        }
+    }
+    yuuka_status status = validate_paged_pool(op, kv_dim, block_size, capacity, 4);
+    if (status != YUUKA_OK) {
+        return status;
+    }
+    const uint64_t q_stride = heads * 2 * head_dim;
+    const uint64_t o_stride = heads * head_dim;
+    if (!range_elements(op.buf[0], op.off[0], rows, q_stride, q_stride) ||
+        !range_elements(op.buf[3], op.off[3], rows, o_stride, o_stride)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention buffer is too small");
+    }
+    uint64_t pool_elems = 0;
+    uint64_t pool_bytes = 0;
+    if (__builtin_mul_overflow(paged_blocks(capacity, block_size) * block_size, kv_dim, &pool_elems) ||
+        __builtin_mul_overflow(pool_elems, uint64_t(sizeof(float)), &pool_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill pool dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[1], 0, pool_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, pool_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "paged prefill attention pool is too small");
+    }
+    return YUUKA_OK;
+}
+
 template <typename Fn>
 yuuka_status guard(Fn && fn) {
     try {
@@ -585,7 +756,7 @@ yuuka_status launch_gemv_dispatch(yuuka_op const & op, hipStream_t stream) {
 }
 
 yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
-                        hipStream_t stream) {
+                        hipStream_t stream, const int32_t * dynamic = nullptr) {
     switch (op.code) {
         case YUUKA_OP_GEMV: {
             yuuka_status status = launch_gemv_dispatch(op, stream);
@@ -715,11 +886,21 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             break;
         }
         case YUUKA_OP_ROPE:
-            yuuka::launch_rope_f32(op_ptr<float>(op, 0),
-                                   int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
-                                   int(position), op.f[0], stream);
+            if (dynamic != nullptr) {
+                yuuka::launch_rope_dynamic_f32(op_ptr<float>(op, 0),
+                                               int(op.n[0]), int(op.n[1]), int(op.n[2]),
+                                               int(op.n[3]), dynamic, op.f[0], stream);
+            } else {
+                yuuka::launch_rope_f32(op_ptr<float>(op, 0),
+                                       int(op.n[0]), int(op.n[1]), int(op.n[2]), int(op.n[3]),
+                                       int(position), op.f[0], stream);
+            }
             break;
         case YUUKA_OP_ATTENTION:
+            if (dynamic != nullptr) {
+                return fail(YUUKA_ERR_UNSUPPORTED,
+                            "legacy attention cannot capture dynamic parameters");
+            }
             yuuka::launch_attention_f32(
                 op_ptr<float>(op, 3),
                 op_ptr<const float>(op, 0),
@@ -770,11 +951,21 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                                     int64_t(op.n[0]), op.f[0], stream);
             break;
         case YUUKA_OP_EMBEDDING:
-            yuuka::launch_embedding_f32(op_ptr<float>(op, 1),
-                                        op_ptr<const void>(op, 0), token, op.n[1], int64_t(op.n[0]),
-                                        op.u[0], stream);
+            if (dynamic != nullptr) {
+                yuuka::launch_embedding_dynamic_f32(op_ptr<float>(op, 1),
+                                                    op_ptr<const void>(op, 0), dynamic,
+                                                    op.n[1], int64_t(op.n[0]), op.u[0], stream);
+            } else {
+                yuuka::launch_embedding_f32(op_ptr<float>(op, 1),
+                                            op_ptr<const void>(op, 0), token, op.n[1],
+                                            int64_t(op.n[0]), op.u[0], stream);
+            }
             break;
         case YUUKA_OP_KV_WRITE: {
+            if (dynamic != nullptr) {
+                return fail(YUUKA_ERR_UNSUPPORTED,
+                            "legacy KV write cannot capture dynamic parameters");
+            }
             const uint64_t bytes = op.n[0] * sizeof(float);
             const uint64_t cache_offset = uint64_t(position) * bytes;
             hipError_t err = hipMemcpyAsync(
@@ -791,10 +982,93 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             }
             break;
         }
+        case YUUKA_OP_KV_WRITE_PAGED:
+        case YUUKA_OP_KV_WRITE_BATCH_PAGED: {
+            const uint64_t rows = op.code == YUUKA_OP_KV_WRITE_PAGED ? 1 : op.n[1];
+            const uint64_t capacity = op.u[1];
+            if (uint64_t(position) + rows > capacity) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "paged KV write at %u with %llu rows exceeds capacity %llu",
+                            position, static_cast<unsigned long long>(rows),
+                            static_cast<unsigned long long>(capacity));
+            }
+            if (dynamic != nullptr) {
+                yuuka::launch_kv_write_paged_dynamic_f32(
+                    op_ptr<float>(op, 2), op_ptr<float>(op, 3),
+                    op_ptr<const float>(op, 0), op_ptr<const float>(op, 1),
+                    int(rows), int(op.n[0]), op_ptr<const int32_t>(op, 4),
+                    dynamic, int(op.u[0]), stream);
+            } else {
+                yuuka::launch_kv_write_paged_f32(
+                    op_ptr<float>(op, 2), op_ptr<float>(op, 3),
+                    op_ptr<const float>(op, 0), op_ptr<const float>(op, 1),
+                    int(rows), int(op.n[0]), op_ptr<const int32_t>(op, 4),
+                    int(op.u[0]), int(position), stream);
+            }
+            break;
+        }
+        case YUUKA_OP_ATTENTION_PAGED: {
+            const uint64_t capacity = op.u[1];
+            if (uint64_t(position) >= capacity) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "paged attention position %u exceeds capacity %llu",
+                            position, static_cast<unsigned long long>(capacity));
+            }
+            if (dynamic != nullptr) {
+                yuuka::launch_attention_paged_dynamic_f32(
+                    op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
+                    op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                    op_ptr<float>(op, 4), op_ptr<const int32_t>(op, 5), dynamic,
+                    int(op.u[0]), int(op.n[0]), int(op.n[1]), int(op.n[2]),
+                    int(op.n[3]), int(op.n[4]), op.f[0], stream);
+            } else {
+                yuuka::launch_attention_paged_f32(
+                    op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
+                    op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                    op_ptr<float>(op, 4), op_ptr<const int32_t>(op, 5),
+                    int(op.u[0]), int(op.n[0]), int(op.n[1]), int(op.n[2]),
+                    int(op.n[3]), int(position), int(op.n[4]), op.f[0], stream);
+            }
+            break;
+        }
+        case YUUKA_OP_ATTENTION_PREFILL_PAGED: {
+            const uint64_t rows = op.n[4];
+            const uint64_t capacity = op.u[1];
+            if (uint64_t(position) + rows > capacity) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "paged prefill attention at %u with %llu rows exceeds capacity %llu",
+                            position, static_cast<unsigned long long>(rows),
+                            static_cast<unsigned long long>(capacity));
+            }
+            yuuka::launch_attention_prefill_paged_f32(
+                op_ptr<float>(op, 3), op_ptr<const float>(op, 0),
+                op_ptr<const float>(op, 1), op_ptr<const float>(op, 2),
+                op_ptr<const int32_t>(op, 4), int(op.u[0]), int(op.n[0]),
+                int(op.n[1]), int(op.n[2]), int(op.n[3]), int(rows),
+                int(position), op.f[0], stream);
+            break;
+        }
         default:
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown plan op %u", op.code);
     }
     return YUUKA_OK;
+}
+
+
+bool op_supports_dynamic(const yuuka_op & op) {
+    switch (op.code) {
+        case YUUKA_OP_EMBEDDING:
+        case YUUKA_OP_ROPE:
+        case YUUKA_OP_KV_WRITE_PAGED:
+        case YUUKA_OP_KV_WRITE_BATCH_PAGED:
+        case YUUKA_OP_ATTENTION_PAGED:
+            return true;
+        case YUUKA_OP_ATTENTION:
+        case YUUKA_OP_KV_WRITE:
+            return false;
+        default:
+            return true;
+    }
 }
 
 } // namespace
@@ -1058,6 +1332,58 @@ YUUKA_API yuuka_status yuuka_memset(yuuka_stream * stream, yuuka_buffer * dst,
         hipError_t err = hipMemsetAsync(dst->ptr, value, bytes, stream->stream);
         if (err != hipSuccess) {
             return fail(YUUKA_ERR_DEVICE, "hipMemsetAsync: %s", hip_error(err));
+        }
+        return YUUKA_OK;
+    });
+}
+
+
+YUUKA_API yuuka_status yuuka_buffer_copy(yuuka_stream * stream,
+                                         yuuka_buffer * dst, uint64_t dst_offset,
+                                         const yuuka_buffer * src, uint64_t src_offset,
+                                         uint64_t bytes, yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || dst == nullptr || src == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "stream or buffer is null");
+        }
+        if (!buffer_range_ok(dst, dst_offset, bytes) ||
+            !buffer_range_ok(src, src_offset, bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "buffer copy range is out of bounds");
+        }
+        if (bytes == 0) {
+            return YUUKA_OK;
+        }
+        hipError_t err = hipMemcpyAsync(
+            static_cast<uint8_t *>(dst->ptr) + dst_offset,
+            static_cast<const uint8_t *>(src->ptr) + src_offset,
+            bytes, hipMemcpyDeviceToDevice, stream->stream);
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "buffer copy: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_dynamic_set(yuuka_stream * stream, yuuka_buffer * dynamic,
+                                         int32_t token, uint32_t position) {
+    return guard([&]() -> yuuka_status {
+        if (stream == nullptr || dynamic == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "stream or dynamic buffer is null");
+        }
+        if (dynamic->bytes < 2 * sizeof(int32_t)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "dynamic buffer must hold two int32 values");
+        }
+        int32_t values[2] = {token, static_cast<int32_t>(position)};
+        hipError_t err = hipMemcpyAsync(dynamic->ptr, values, sizeof(values),
+                                        hipMemcpyHostToDevice, stream->stream);
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "dynamic parameter upload: %s", hip_error(err));
         }
         return YUUKA_OK;
     });
@@ -1419,6 +1745,116 @@ YUUKA_API yuuka_status yuuka_cast_f32_to_f16(yuuka_stream * stream, yuuka_buffer
     });
 }
 
+
+YUUKA_API yuuka_status yuuka_graph_create(yuuka_plan * plan, yuuka_stream * stream,
+                                          yuuka_buffer * dynamic, int run_tail,
+                                          yuuka_graph ** out) {
+    return guard([&]() -> yuuka_status {
+        if (plan == nullptr || stream == nullptr || dynamic == nullptr || out == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "graph arguments are null");
+        }
+        if (dynamic->bytes < 2 * sizeof(int32_t)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "dynamic buffer must hold two int32 values");
+        }
+        *out = nullptr;
+        for (const yuuka_op & op : plan->ops) {
+            if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
+                continue;
+            }
+            if (!op_supports_dynamic(op)) {
+                return fail(YUUKA_ERR_UNSUPPORTED,
+                            "plan op %u has no dynamic-parameter kernel", op.code);
+            }
+        }
+        hipError_t err = hipStreamSynchronize(stream->stream);
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "graph capture synchronize: %s", hip_error(err));
+        }
+        err = hipStreamBeginCapture(stream->stream, hipStreamCaptureModeThreadLocal);
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_UNSUPPORTED, "graph capture begin: %s", hip_error(err));
+        }
+        for (const yuuka_op & op : plan->ops) {
+            if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
+                continue;
+            }
+            for (int i = 0; i < 12; ++i) {
+                if (op.buf[i] != nullptr && op.buf[i]->ptr == nullptr) {
+                    hipGraph_t abandoned = nullptr;
+                    (void)hipStreamEndCapture(stream->stream, &abandoned);
+                    if (abandoned != nullptr) {
+                        (void)hipGraphDestroy(abandoned);
+                    }
+                    return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                                "graph op %u has a null buffer", op.code);
+                }
+            }
+            const int32_t * dynamic_ptr = reinterpret_cast<const int32_t *>(dynamic->ptr);
+            yuuka_status status = execute_op(op, 0, 0, stream->stream, dynamic_ptr);
+            if (status != YUUKA_OK) {
+                hipGraph_t abandoned = nullptr;
+                (void)hipStreamEndCapture(stream->stream, &abandoned);
+                if (abandoned != nullptr) {
+                    (void)hipGraphDestroy(abandoned);
+                }
+                return status;
+            }
+        }
+        hipGraph_t captured = nullptr;
+        err = hipStreamEndCapture(stream->stream, &captured);
+        if (err != hipSuccess) {
+            if (captured != nullptr) {
+                (void)hipGraphDestroy(captured);
+            }
+            return fail(YUUKA_ERR_UNSUPPORTED, "graph capture end: %s", hip_error(err));
+        }
+        hipGraphExec_t executable = nullptr;
+        err = hipGraphInstantiate(&executable, captured, nullptr, nullptr, 0);
+        if (err != hipSuccess) {
+            (void)hipGraphDestroy(captured);
+            return fail(YUUKA_ERR_UNSUPPORTED, "graph instantiate: %s", hip_error(err));
+        }
+        yuuka_graph * graph = new yuuka_graph();
+        graph->graph = captured;
+        graph->exec = executable;
+        *out = graph;
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API yuuka_status yuuka_graph_replay(yuuka_graph * graph, yuuka_stream * stream,
+                                          yuuka_event * completion) {
+    return guard([&]() -> yuuka_status {
+        if (graph == nullptr || graph->exec == nullptr || stream == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "graph or stream is null");
+        }
+        hipError_t err = hipGraphLaunch(graph->exec, stream->stream);
+        if (err != hipSuccess) {
+            return fail(YUUKA_ERR_DEVICE, "graph launch: %s", hip_error(err));
+        }
+        if (completion != nullptr) {
+            err = hipEventRecord(completion->event, stream->stream);
+            if (err != hipSuccess) {
+                return fail(YUUKA_ERR_DEVICE, "hipEventRecord: %s", hip_error(err));
+            }
+        }
+        return YUUKA_OK;
+    });
+}
+
+YUUKA_API void yuuka_graph_destroy(yuuka_graph * graph) {
+    if (graph == nullptr) {
+        return;
+    }
+    if (graph->exec != nullptr) {
+        (void)hipGraphExecDestroy(graph->exec);
+    }
+    if (graph->graph != nullptr) {
+        (void)hipGraphDestroy(graph->graph);
+    }
+    delete graph;
+}
+
 YUUKA_API yuuka_status yuuka_plan_create(yuuka_device * dev, yuuka_plan ** out) {
     return guard([&]() -> yuuka_status {
         if (dev == nullptr || out == nullptr) {
@@ -1438,7 +1874,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_CAST_F16) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_ATTENTION_PREFILL_PAGED) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -1475,6 +1911,18 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_CAST_F16:
                 status = validate_cast_plan_op(*op);
+                break;
+            case YUUKA_OP_KV_WRITE_PAGED:
+                status = validate_kv_write_paged_plan_op(*op, false);
+                break;
+            case YUUKA_OP_KV_WRITE_BATCH_PAGED:
+                status = validate_kv_write_paged_plan_op(*op, true);
+                break;
+            case YUUKA_OP_ATTENTION_PAGED:
+                status = validate_attention_paged_plan_op(*op);
+                break;
+            case YUUKA_OP_ATTENTION_PREFILL_PAGED:
+                status = validate_attention_prefill_paged_plan_op(*op);
                 break;
             default:
                 break;

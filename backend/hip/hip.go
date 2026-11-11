@@ -41,8 +41,14 @@ type Device struct {
 	closed bool
 }
 
-// Open opens a HIP device by index.
+// RequiredABI is the shared-library ABI this package was compiled against.
+const RequiredABI = 3
+
+// Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
+	if got := ABIVersion(); got != RequiredABI {
+		return nil, fmt.Errorf("hip: shared library ABI %d, want %d", got, RequiredABI)
+	}
 	var ptr *C.yuuka_device
 	if err := status(C.yuuka_device_open(C.int32_t(index), &ptr), "device_open"); err != nil {
 		return nil, err
@@ -167,6 +173,46 @@ func (d *Device) Memset(stream *Stream, dst *Buffer, value int, bytes uint64) er
 		return err
 	}
 	return status(C.yuuka_memset(stream.ptr, dst.ptr, C.int(value), C.uint64_t(bytes)), "memset")
+}
+
+// CopyBuffer submits an asynchronous device-to-device copy.
+func (d *Device) CopyBuffer(stream *Stream, dst *Buffer, dstOff uint64, src *Buffer, srcOff uint64, bytes uint64, event *Event) error {
+	if d == nil || d.closed {
+		return errors.New("hip: device is closed")
+	}
+	if stream == nil || stream.closed {
+		return errors.New("hip: stream is closed")
+	}
+	if err := d.validate(dst, dstOff+bytes); err != nil {
+		return err
+	}
+	if err := d.validate(src, srcOff+bytes); err != nil {
+		return err
+	}
+	var ev *C.yuuka_event
+	if event != nil {
+		ev = event.ptr
+	}
+	return status(C.yuuka_buffer_copy(stream.ptr, dst.ptr, C.uint64_t(dstOff),
+		src.ptr, C.uint64_t(srcOff), C.uint64_t(bytes), ev), "buffer_copy")
+}
+
+// SetDynamic uploads the token and position consumed by a captured graph.
+func (d *Device) SetDynamic(stream *Stream, dynamic *Buffer, token int32, position uint32) error {
+	if d == nil || d.closed {
+		return errors.New("hip: device is closed")
+	}
+	if stream == nil || stream.closed {
+		return errors.New("hip: stream is closed")
+	}
+	if dynamic == nil || dynamic.closed {
+		return errors.New("hip: dynamic buffer is closed")
+	}
+	if dynamic.bytes < 8 {
+		return errors.New("hip: dynamic buffer must hold two int32 values")
+	}
+	return status(C.yuuka_dynamic_set(stream.ptr, dynamic.ptr,
+		C.int32_t(token), C.uint32_t(position)), "dynamic_set")
 }
 
 // DownloadFloats copies device bytes into a float32 slice.
@@ -833,6 +879,105 @@ func (p *Plan) AddAttentionPrefillAt(q *Buffer, qOff uint64, kCache, vCache, out
 	return p.add(op)
 }
 
+// AddKVWritePagedAt appends one K/V row write through a block table. capacity
+// is the number of request positions and blockSize is the paged geometry.
+func (p *Plan) AddKVWritePagedAt(k, v, kPool, vPool, table *Buffer, kvDim, capacity int64, blockSize int) error {
+	return p.addKVWritePaged(k, v, kPool, vPool, table, kvDim, 1, capacity, blockSize, C.YUUKA_OP_KV_WRITE_PAGED)
+}
+
+// AddKVWriteBatchPagedAt appends rows K/V writes through a block table.
+func (p *Plan) AddKVWriteBatchPagedAt(k *Buffer, kOff uint64, v *Buffer, vOff uint64, kPool, vPool, table *Buffer, kvDim, rows, capacity int64, blockSize int) error {
+	if kOff != 0 || vOff != 0 {
+		return errors.New("hip: paged batch KV write does not take source offsets")
+	}
+	return p.addKVWritePaged(k, v, kPool, vPool, table, kvDim, rows, capacity, blockSize, C.YUUKA_OP_KV_WRITE_BATCH_PAGED)
+}
+
+func (p *Plan) addKVWritePaged(k, v, kPool, vPool, table *Buffer, kvDim, rows, capacity int64, blockSize int, code C.uint32_t) error {
+	if kvDim <= 0 || rows <= 0 || capacity < rows || blockSize <= 0 {
+		return errors.New("hip: invalid paged KV write dimensions")
+	}
+	if int64(blockSize) > capacity {
+		return errors.New("hip: paged KV block size exceeds capacity")
+	}
+	if err := p.check(k, v, kPool, vPool, table); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: code}
+	op.buf[0] = k.ptr
+	op.buf[1] = v.ptr
+	op.buf[2] = kPool.ptr
+	op.buf[3] = vPool.ptr
+	op.buf[4] = table.ptr
+	op.n[0] = C.uint64_t(kvDim)
+	if code == C.YUUKA_OP_KV_WRITE_BATCH_PAGED {
+		op.n[1] = C.uint64_t(rows)
+	}
+	op.u[0] = C.uint32_t(blockSize)
+	op.u[1] = C.uint32_t(capacity)
+	return p.add(op)
+}
+
+// AddAttentionPagedAt appends single-token attention through a block table.
+// scoreStride is the per-head stride of the scores workspace (usually the
+// maximum context); capacity bounds live positions.
+func (p *Plan) AddAttentionPagedAt(q, kPool, vPool, out, scores, table *Buffer, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize int, scale float32) error {
+	if heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
+		kvDim != kvHeads*headDim || headDim > 256 || capacity <= 0 ||
+		blockSize <= 0 || blockSize > capacity || scoreStride < capacity {
+		return errors.New("hip: invalid paged attention dimensions")
+	}
+	if err := p.check(q, kPool, vPool, out, scores, table); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_ATTENTION_PAGED}
+	op.buf[0] = q.ptr
+	op.buf[1] = kPool.ptr
+	op.buf[2] = vPool.ptr
+	op.buf[3] = out.ptr
+	op.buf[4] = scores.ptr
+	op.buf[5] = table.ptr
+	op.n[0] = C.uint64_t(kvHeads)
+	op.n[1] = C.uint64_t(heads)
+	op.n[2] = C.uint64_t(headDim)
+	op.n[3] = C.uint64_t(kvDim)
+	op.n[4] = C.uint64_t(scoreStride)
+	op.u[0] = C.uint32_t(blockSize)
+	op.u[1] = C.uint32_t(capacity)
+	op.f[0] = C.float(scale)
+	return p.add(op)
+}
+
+// AddAttentionPrefillPagedAt appends causal tiled attention over a prompt chunk
+// through a block table.
+func (p *Plan) AddAttentionPrefillPagedAt(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32) error {
+	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
+		kvDim != kvHeads*headDim || headDim > 256 || capacity < rows ||
+		blockSize <= 0 || blockSize > capacity {
+		return errors.New("hip: invalid paged prefill attention dimensions")
+	}
+	if err := p.check(q, kPool, vPool, out, table); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_ATTENTION_PREFILL_PAGED}
+	op.buf[0] = q.ptr
+	op.buf[1] = kPool.ptr
+	op.buf[2] = vPool.ptr
+	op.buf[3] = out.ptr
+	op.buf[4] = table.ptr
+	op.off[0] = C.uint64_t(qOff)
+	op.off[3] = C.uint64_t(outOff)
+	op.n[0] = C.uint64_t(kvHeads)
+	op.n[1] = C.uint64_t(heads)
+	op.n[2] = C.uint64_t(headDim)
+	op.n[3] = C.uint64_t(kvDim)
+	op.n[4] = C.uint64_t(rows)
+	op.u[0] = C.uint32_t(blockSize)
+	op.u[1] = C.uint32_t(capacity)
+	op.f[0] = C.float(scale)
+	return p.add(op)
+}
+
 // RecurrentChunkArgs groups the per-layer tensors used by a gated delta-net
 // prompt chunk.
 type RecurrentChunkArgs struct {
@@ -1023,6 +1168,64 @@ func (p *Plan) Close() error {
 	}
 	C.yuuka_plan_destroy(p.ptr)
 	p.ptr = nil
+	return nil
+}
+
+// Graph is a captured plan execution with device-resident dynamic parameters.
+// It is owned by the caller and must be closed before the plan. Replay is valid
+// only while every buffer address captured into the graph is alive.
+type Graph struct {
+	ptr    *C.yuuka_graph
+	closed bool
+}
+
+// CaptureGraph captures and instantiates the plan's non-tail or tail ops. Ops
+// without dynamic-parameter kernels make capture fail with ErrUnsupported.
+func (p *Plan) CaptureGraph(stream *Stream, dynamic *Buffer, runTail bool) (*Graph, error) {
+	if p == nil || p.ptr == nil {
+		return nil, errors.New("hip: plan is closed")
+	}
+	if stream == nil || stream.closed {
+		return nil, errors.New("hip: stream is closed")
+	}
+	if dynamic == nil || dynamic.closed {
+		return nil, errors.New("hip: dynamic buffer is closed")
+	}
+	tail := C.int(0)
+	if runTail {
+		tail = 1
+	}
+	var ptr *C.yuuka_graph
+	if err := status(C.yuuka_graph_create(p.ptr, stream.ptr, dynamic.ptr, tail, &ptr),
+		"graph_create"); err != nil {
+		return nil, err
+	}
+	return &Graph{ptr: ptr}, nil
+}
+
+// Replay submits a captured graph and optionally records a completion event.
+func (g *Graph) Replay(stream *Stream, event *Event) error {
+	if g == nil || g.ptr == nil || g.closed {
+		return errors.New("hip: graph is closed")
+	}
+	if stream == nil || stream.closed {
+		return errors.New("hip: stream is closed")
+	}
+	var ev *C.yuuka_event
+	if event != nil {
+		ev = event.ptr
+	}
+	return status(C.yuuka_graph_replay(g.ptr, stream.ptr, ev), "graph_replay")
+}
+
+// Close destroys the captured graph. It is idempotent.
+func (g *Graph) Close() error {
+	if g == nil || g.closed {
+		return nil
+	}
+	C.yuuka_graph_destroy(g.ptr)
+	g.ptr = nil
+	g.closed = true
 	return nil
 }
 

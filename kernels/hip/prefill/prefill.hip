@@ -338,6 +338,137 @@ __global__ void cast_f32_to_f16_kernel(__half * dst, const float * src, int64_t 
     }
 }
 
+
+__device__ __forceinline__ int64_t paged_kv_row(const int32_t * block_table,
+                                                int block_size, int pos) {
+    const int block = block_table[pos / block_size];
+    return static_cast<int64_t>(block) * block_size + (pos % block_size);
+}
+
+__global__ void kv_write_paged_f32_kernel(float * k_pool, float * v_pool,
+                                          const float * k, const float * v,
+                                          int rows, int kv_dim,
+                                          const int32_t * block_table,
+                                          int block_size, int position) {
+    const int64_t total = static_cast<int64_t>(rows) * kv_dim;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(idx / kv_dim);
+        const int col = static_cast<int>(idx % kv_dim);
+        const int64_t dst = paged_kv_row(block_table, block_size, position + row) * kv_dim + col;
+        k_pool[dst] = k[idx];
+        v_pool[dst] = v[idx];
+    }
+}
+
+__global__ void kv_write_paged_dynamic_f32_kernel(float * k_pool, float * v_pool,
+                                                  const float * k, const float * v,
+                                                  int rows, int kv_dim,
+                                                  const int32_t * block_table,
+                                                  const int32_t * dynamic,
+                                                  int block_size) {
+    const int position = dynamic[1];
+    const int64_t total = static_cast<int64_t>(rows) * kv_dim;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int row = static_cast<int>(idx / kv_dim);
+        const int col = static_cast<int>(idx % kv_dim);
+        const int64_t dst = paged_kv_row(block_table, block_size, position + row) * kv_dim + col;
+        k_pool[dst] = k[idx];
+        v_pool[dst] = v[idx];
+    }
+}
+
+__global__ void attention_prefill_paged_f32_kernel(
+    float * out, const float * q, const float * k_pool, const float * v_pool,
+    const int32_t * block_table, int block_size, int kv_heads, int heads,
+    int head_dim, int kv_dim, int rows, int position, float scale) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int head = blockIdx.x;
+    const int q_base = blockIdx.y * kQPerBlock;
+    const int q_row = q_base + wave;
+    const bool active = q_row < rows;
+    const int vec = (head_dim + 31) / 32;
+    const int group = heads / kv_heads;
+    const int kvh = head / group;
+    const int last_row = min(q_base + kQPerBlock, rows) - 1;
+    const int max_pos = position + last_row;
+    const int pos = position + (active ? q_row : last_row);
+    const int row_stride = heads * 2 * head_dim;
+    const float * q_ptr = q + static_cast<int64_t>(active ? q_row : last_row) * row_stride +
+                          head * 2 * head_dim;
+    float qv[kMaxHeadVec];
+    float acc[kMaxHeadVec];
+    #pragma unroll
+    for (int i = 0; i < kMaxHeadVec; ++i) {
+        const int d = lane * vec + i;
+        qv[i] = (i < vec && d < head_dim) ? q_ptr[d] : 0.0f;
+        acc[i] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    extern __shared__ float k_shared[];
+    for (int k0 = 0; k0 <= max_pos; k0 += kKeysPerBlock) {
+        const int valid = min(kKeysPerBlock, max_pos + 1 - k0);
+        for (int idx = tid; idx < valid * head_dim; idx += blockDim.x) {
+            const int kk = idx / head_dim;
+            const int d = idx % head_dim;
+            const int64_t row = paged_kv_row(block_table, block_size, k0 + kk);
+            k_shared[kk * head_dim + d] = k_pool[row * kv_dim + kvh * head_dim + d];
+        }
+        __syncthreads();
+        if (active) {
+            const int stop = min(valid, pos - k0 + 1);
+            for (int kk = 0; kk < stop; ++kk) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < kMaxHeadVec; ++i) {
+                    const int d = lane * vec + i;
+                    if (i < vec && d < head_dim) {
+                        dot += qv[i] * k_shared[kk * head_dim + d];
+                    }
+                }
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot += __shfl_xor(dot, offset);
+                }
+                const float s = dot * scale;
+                const float m_new = fmaxf(m, s);
+                const float corr = expf(m - m_new);
+                const float p = expf(s - m_new);
+                l = l * corr + p;
+                m = m_new;
+                const int64_t vrow = paged_kv_row(block_table, block_size, k0 + kk);
+                const float * v_ptr = v_pool + vrow * kv_dim + kvh * head_dim + lane * vec;
+                #pragma unroll
+                for (int i = 0; i < kMaxHeadVec; ++i) {
+                    const int d = lane * vec + i;
+                    if (i < vec && d < head_dim) {
+                        acc[i] = acc[i] * corr + p * v_ptr[i];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) {
+        return;
+    }
+    const float inv = 1.0f / l;
+    const int64_t out_row = static_cast<int64_t>(q_row) * heads * head_dim + head * head_dim;
+    #pragma unroll
+    for (int i = 0; i < kMaxHeadVec; ++i) {
+        const int d = lane * vec + i;
+        if (i < vec && d < head_dim) {
+            const float gate = q_ptr[head_dim + d];
+            out[out_row + d] = acc[i] * inv / (1.0f + expf(-gate));
+        }
+    }
+}
+
+
 } // namespace
 
 namespace yuuka {
@@ -412,6 +543,53 @@ void launch_attention_prefill_f32(float * out, const float * q,
     attention_prefill_f32_kernel<<<grid, kThreads, shared, stream>>>(
         out, q, k_cache, v_cache, kv_heads, heads, head_dim, kv_dim, rows,
         position, capacity, scale);
+}
+
+
+void launch_kv_write_paged_f32(float * k_pool, float * v_pool, const float * k,
+                               const float * v, int rows, int kv_dim,
+                               const int32_t * block_table, int block_size,
+                               int position, hipStream_t stream) {
+    if (rows <= 0 || kv_dim <= 0 || block_size <= 0 || position < 0) {
+        return;
+    }
+    const int64_t total = static_cast<int64_t>(rows) * kv_dim;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    kv_write_paged_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        k_pool, v_pool, k, v, rows, kv_dim, block_table, block_size, position);
+}
+
+void launch_kv_write_paged_dynamic_f32(float * k_pool, float * v_pool,
+                                       const float * k, const float * v,
+                                       int rows, int kv_dim,
+                                       const int32_t * block_table,
+                                       const int32_t * dynamic, int block_size,
+                                       hipStream_t stream) {
+    if (rows <= 0 || kv_dim <= 0 || block_size <= 0) {
+        return;
+    }
+    const int64_t total = static_cast<int64_t>(rows) * kv_dim;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    kv_write_paged_dynamic_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        k_pool, v_pool, k, v, rows, kv_dim, block_table, dynamic, block_size);
+}
+
+void launch_attention_prefill_paged_f32(float * out, const float * q,
+                                        const float * k_pool, const float * v_pool,
+                                        const int32_t * block_table, int block_size,
+                                        int kv_heads, int heads, int head_dim,
+                                        int kv_dim, int rows, int position,
+                                        float scale, hipStream_t stream) {
+    if (rows <= 0 || heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        block_size <= 0) {
+        return;
+    }
+    const int blocks = (rows + kQPerBlock - 1) / kQPerBlock;
+    const dim3 grid(static_cast<unsigned>(heads), static_cast<unsigned>(blocks));
+    const size_t shared = size_t(kKeysPerBlock) * size_t(head_dim) * sizeof(float);
+    attention_prefill_paged_f32_kernel<<<grid, kThreads, shared, stream>>>(
+        out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
+        head_dim, kv_dim, rows, position, scale);
 }
 
 void launch_recurrent_chunk_f32(float * conv_state, float * rec_state,
