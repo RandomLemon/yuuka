@@ -141,6 +141,32 @@ Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
 Each compares against an independent float implementation and records its
 tolerance in the test.
 
+Paged KV and graph replay have dedicated native coverage in
+`tests/hip/paged_test.cpp`:
+
+- KV writes through a permuted block table land in the mapped physical rows;
+- paged decode and prefill attention match an independent float reference
+  through the same table;
+- device-to-device block copies used for private prefix blocks;
+- graph capture and replay with device-resident token/position updates across
+  several positions;
+- rejection of plans containing position-dependent legacy ops, so the runtime
+  can fall back instead of replaying stale arguments.
+
+Serving tests are split by layer:
+
+- `memory`: allocator reference counting, double-release rejection, table
+  mapping and rollback, aligned and partial prefix splits with copy-on-write,
+  longest-prefix lookup, exact-key comparison, LRU eviction, and allocation
+  unblocking. These run with `-race`.
+- `scheduler`: queue limits, admission rejection, queue and request timeouts,
+  cancellation, build-failure slot release, decode-priority interleaving,
+  explicit batch composition, shutdown drain, and latency summaries.
+- `serving`: concurrent requests versus isolated runs, full and partial prefix
+  reuse versus a fresh run, cancellation cleanup with balanced allocator
+  counters, and repeated cycles with zero residual blocks. Both CPU and HIP
+  backends are covered when the HIP library is available.
+
 ### 3.4 End-to-end tests
 
 - Fixed prompt, greedy sampling, fixed seed where applicable.
@@ -150,7 +176,12 @@ tolerance in the test.
 - Verify streaming deltas reconstruct the non-streaming response.
 - Verify cancellation stops generation and releases resources.
 - Verify concurrent requests do not affect each other's output.
-- Verify prefix-cache reuse produces identical logits and tokens.
+- Verify prefix-cache reuse produces identical logits and tokens, including a
+  longer prompt that reuses a shorter cached prefix.
+- Verify a fully cached prompt samples from cached logits and matches a fresh
+  run.
+- Verify graph replay and fallback produce the same token sequence as a plain
+  session, including an intentionally invalidated dynamic parameter buffer.
 - Verify chunked prefill at chunk sizes that select batched GEMV and WMMA,
   including partial final chunks, matches unchunked CPU logits and the greedy
   top-1 token.
@@ -319,8 +350,9 @@ The repository uses these commands:
 go build ./...
 go test ./...
 go test -race ./...
-go build -tags hip ./...
-go test -tags hip ./backend/hip ./engine/gpu
+go test -tags hip ./...
+go test -tags hip ./backend/hip ./engine/gpu ./serving ./cmd/yuuka-server
+go test ./memory ./scheduler ./serving
 ctest --test-dir build --output-on-failure
 scripts/kernel_resources.sh
 YUUKA_TEST_SPM_VOCAB=/path/to/ggml-vocab-llama-spm.gguf go test ./tokenizer
@@ -340,8 +372,10 @@ YUUKA_TEST_MODEL=/path/to/model.gguf go test ./...
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
-reference, layer-by-layer hidden-state comparison, and server request/stream
-behavior. SentencePiece golden IDs additionally accept
+reference, layer-by-layer hidden-state comparison, and the paged HIP executor.
+HTTP API contract tests use the deterministic tiny fixture so they cover
+streaming, errors, stops, and cancellation independently of the optional model
+environment. SentencePiece golden IDs additionally accept
 `YUUKA_TEST_SPM_VOCAB=/path/to/ggml-vocab-llama-spm.gguf`. Native GPU tests return CTest
 skip code 77; Go GPU tests skip with a message when no HIP device is available
 or `YUUKA_TEST_MODEL` is unset.
@@ -354,7 +388,17 @@ explicitly:
 ./build/yuuka_gemv_sweep
 scripts/thermal_probe.sh 15 ./build/yuuka_hardware_probe
 /tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 16 --decode-tokens 16
+go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
+/tmp/yuuka-serving-bench --model model.gguf --backend hip --ctx 256 \
+    --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16
+/tmp/yuuka-serving-bench --model model.gguf --backend hip --ctx 256 \
+    --concurrency 4 --requests 8 --prompt-tokens 64 --decode-tokens 16
 ```
+
+The serving benchmark reports queue wait, TTFT, prefill, decode, and sampling
+percentiles plus aggregate request and output-token throughput. Run one
+benchmark process at a time; concurrent benchmark processes contend for the GPU
+and invalidate both results.
 
 A clean export of the tracked tree can be validated without relying on local
 build artifacts:
@@ -372,7 +416,7 @@ HIP-tagged Go tests in the exported tree.
 
 | Tier | Environment | Contents |
 | --- | --- | --- |
-| **Unit** | Any Linux machine | GGUF parser, tokenizer, metadata mapping, CPU reference; scheduler logic once implemented |
+| **Unit** | Any Linux machine | GGUF parser, tokenizer, metadata mapping, CPU reference, paged KV allocator/prefix cache, scheduler and serving state machines |
 | **GPU correctness** | gfx1151 runner | Kernel tests, end-to-end generation, logits comparison |
 | **GPU performance** | gfx1151 runner, controlled power profile | Tracked benchmark subset, nightly or per-release |
 | **Compatibility** | gfx1151 runner | llama.cpp HIP/Vulkan comparison on the same GGUF |

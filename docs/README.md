@@ -6,14 +6,15 @@ written in **HIP/C++**. It loads GGUF models directly and does not use
 llama.cpp, GGML, or Ollama as an inference execution kernel. Those projects are
 treated as format and correctness references only.
 
-> **Status: CPU and HIP single-request vertical slice with chunked prefill
-> implemented.** The repository contains a validated GGUF reader, a Qwen3.5
-> tokenizer, a CPU reference forward pass, a HIP device executor for the same
-> decoder, rocWMMA/rocBLAS prefill GEMM, Flash Attention, chunked prefill, a
-> CLI, an OpenAI-compatible single-request server, and a validated kernel
-> library. Paged KV, continuous batching, prefix caching, and HIP Graph remain
-> future work. See the implementation status below, [hardware.md](hardware.md),
-> and [benchmarks.md](benchmarks.md).
+> **Status: CPU and HIP single-request vertical slice with chunked prefill and
+> concurrent paged serving implemented.** The repository contains a validated
+> GGUF reader, a Qwen3.5 tokenizer, a CPU reference forward pass, a HIP device
+> executor for the same decoder, rocWMMA/rocBLAS prefill GEMM, paged Flash
+> Attention, chunked prefill, a continuous scheduler, a reference-counted
+> paged KV and prefix cache, opt-in HIP Graph replay with fallback, a CLI, and
+> an OpenAI-compatible SSE server with health, metrics, and pprof endpoints.
+> Phase 5 expansion work remains open. See the implementation status below,
+> [hardware.md](hardware.md), and [benchmarks.md](benchmarks.md).
 
 ## Target configuration
 
@@ -81,7 +82,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [npu.md](npu.md) | Deferred XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
-| [benchmarks.md](benchmarks.md) | CPU versus HIP single-request baseline and reproduction steps | All contributors |
+| [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
 
 ## Implementation status
 

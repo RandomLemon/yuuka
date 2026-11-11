@@ -371,6 +371,119 @@ recorded run used Mesa RADV 25.0.7. Warmup and repetition counts differ for the
 longest prompts in the yuuka curves; the values reported below state the actual
 count used.
 
+
+## Phase 4 serving
+
+### Environment and protocol
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-11-11 |
+| Model | `Qwen3.5-4B-Q4_K_M.gguf` |
+| Model SHA-256 | `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
+| Model size | 2,740,937,888 bytes |
+| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
+| ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
+| Backend | HIP, paged FP32 KV, block size 16 |
+| Context | 256 positions |
+| Sampling | Greedy, temperature 0 |
+| Prompt | 64 tokens from repeated English prose |
+| Decode | 16 tokens per request |
+| Prefix cache | disabled unless stated |
+| Graph replay | enabled unless stated |
+| Warmup | one request for latency/throughput runs; none for prefix runs |
+
+Measurements use `bench/serving`, which reports queue wait, TTFT, prefill,
+decode, and sampling separately. Run one benchmark process at a time; two
+processes sharing the GPU invalidate both results.
+
+### Single-user latency and graph replay
+
+Concurrency 1, 3 measured requests, one warmup request.
+
+| Configuration | Latency P50 | TTFT P50 | Prefill P50 | Decode P50 | Sampling P50 | Tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Graph replay | 1.793 s | 0.249 s | 0.241 s | 1.533 s | 1.61 ms | 8.93 |
+| Plain stream | 1.796 s | 0.258 s | 0.249 s | 1.530 s | 1.68 ms | 8.90 |
+
+Graph replay changes decode time by less than run-to-run noise at this context,
+so the server default is the plain stream path. Queue wait was about 2 µs in
+both runs.
+
+### Multi-request throughput
+
+Concurrency 4, 8 measured requests, 64 KV blocks, graph replay enabled.
+
+| Metric | P50 | P95 |
+| --- | ---: | ---: |
+| End-to-end latency | 6.820 s | 7.324 s |
+| Queue wait | 0.258 s | 0.351 s |
+| TTFT | 0.557 s | 0.824 s |
+| Prefill | 0.244 s | 0.248 s |
+| Decode | 1.532 s | 1.534 s |
+| Sampling | 1.66 ms | 1.71 ms |
+
+Aggregate throughput was 0.557 requests/s and 8.91 output tokens/s over a
+14.371 s wall interval. Per-request decode time is unchanged from the
+single-request run. The scheduler interleaves request plans on one stream, so
+concurrency improves admission fairness and TTFT under load but does not raise
+aggregate token throughput; mixed-shape batched kernels are the missing
+optimization.
+
+### Prefix cache
+
+Three identical 64-token prompts at concurrency 1 with the prefix cache enabled
+and no warmup: one miss and two full-prompt hits. The first request's TTFT was
+0.255 s; the two hits had TTFT P50 of 0.247 ms and zero prefill time because the
+cached recurrent state and prompt logits were restored. Decode time remained
+1.532 s. Aggregate throughput was 9.83 output tokens/s.
+
+### Phase 4 correctness evidence
+
+- `go test -tags hip ./engine/gpu ./model/qwen35 ./serving` with
+  `YUUKA_TEST_MODEL` set passes on the Q4_K_M model with the paged kernels and
+  graph replay enabled in the GPU serving tests.
+- Concurrent CPU and HIP requests reproduce isolated-run token sequences and
+  text at concurrency 2.
+- Full and partial prefix hits reproduce a fresh run's tokens and text on both
+  backends.
+- Cancellation leaves zero used KV blocks and balanced allocator counters.
+- Twelve sequential request cycles leave zero used blocks and no active
+  requests.
+- Native `hip_paged_graph_correctness` covers paged KV writes, paged decode and
+  prefill attention against a float reference, device copies, dynamic graph
+  replay at several positions, and rejection of non-dynamic plans.
+
+### Phase 4 reproduction
+
+```bash
+go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
+
+# Single user, graph replay.
+/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  --backend hip --ctx 256 --block-size 16 --kv-blocks 16 \
+  --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
+  --warmup 1 --graph
+
+# Same run on the plain stream path.
+/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  --backend hip --ctx 256 --block-size 16 --kv-blocks 16 \
+  --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
+  --warmup 1 --graph=false
+
+# Four concurrent requests.
+/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  --backend hip --ctx 256 --block-size 16 --kv-blocks 64 \
+  --concurrency 4 --requests 8 --prompt-tokens 64 --decode-tokens 16 \
+  --warmup 1 --graph
+
+# Prefix reuse.
+/tmp/yuuka-serving-bench --model /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  --backend hip --ctx 256 --block-size 16 --kv-blocks 16 \
+  --concurrency 1 --requests 3 --prompt-tokens 64 --decode-tokens 16 \
+  --warmup 0 --graph --prefix-cache
+```
+
 ## Reproduction
 
 ```bash

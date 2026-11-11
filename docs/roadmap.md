@@ -58,9 +58,16 @@ prompt lengths; the remaining gap has not been fully attributed, and the 32-row
 M tile plus scalar attention are follow-up optimizations rather than exit
 criteria.
 
-Phase 0 through Phase 3 exit gates are declared complete. Phase 4 and Phase 5
-remain open: paged KV, continuous batching, prefix caching, and HIP Graph are not
-implemented.
+Phase 4 exit criteria are met: paged KV with a block allocator and immutable
+per-request block tables, continuous scheduling with explicit prefill/decode
+interleaving, a collision-safe LRU prefix cache that also snapshots recurrent
+state, opt-in HIP Graph capture/replay with fallback, an OpenAI-compatible SSE
+API, health/metrics/pprof endpoints, cancellation and timeout handling, and
+resource-reclamation tests are implemented. Concurrent CPU and HIP requests
+reproduce isolated-run tokens, repeated request cycles leave no KV blocks
+allocated, and cancellation releases every block. Aggregate decode throughput
+does not scale with concurrency because mixed-shape batched kernels are not
+implemented; requests are interleaved on one stream. Phase 5 remains open.
 
 ## 2. Phase overview
 
@@ -249,15 +256,46 @@ efficient KV reuse.
 
 ### Exit criteria
 
-- [ ] Single-user latency and multi-request throughput are reproducible.
-- [ ] Concurrent requests produce outputs identical to isolated runs under the
-      same sampling settings.
-- [ ] Cancellation and failures return all KV blocks and buffers.
-- [ ] Repeated request cycles show no unbounded memory growth.
-- [ ] Graph replay falls back correctly when shapes, addresses, or block tables
-      cannot be updated.
-- [ ] API contract tests cover streaming, errors, and stop conditions.
-- [ ] Metrics distinguish queue wait, prefill, decode, and sampling time.
+- [x] Single-user latency and multi-request throughput are reproducible.
+      `bench/serving` records queue, TTFT, prefill, decode, and sampling
+      percentiles plus aggregate throughput with full metadata; the Phase 4
+      table is in [benchmarks.md](benchmarks.md).
+- [x] Concurrent requests produce outputs identical to isolated runs under the
+      same sampling settings. CPU and HIP serving tests run the same prompts at
+      concurrency 1 and 2 and compare tokens and text exactly.
+- [x] Cancellation and failures return all KV blocks and buffers. Cancellation
+      tests assert allocator `Used == 0` and balanced allocation/release counts
+      for both backends.
+- [x] Repeated request cycles show no unbounded memory growth. Twelve sequential
+      cycles leave zero used blocks and no active requests.
+- [x] Graph replay falls back correctly when shapes, addresses, or block tables
+      cannot be updated. Native tests cover capture/replay with dynamic
+      positions and rejection of non-dynamic plans; a Go test invalidates the
+      dynamic buffer and verifies normal execution matches a plain session.
+- [x] API contract tests cover streaming, errors, and stop conditions. Tests
+      cover SSE role/delta/finish/[DONE] events, stop strings, strict parameter
+      rejection, structured errors, health, metrics, pprof, and client
+      cancellation.
+- [x] Metrics distinguish queue wait, prefill, decode, and sampling time.
+      Scheduler and per-request results record the four phases separately, and
+      `/metrics` exports totals plus TTFT/TPOT percentiles.
+
+### Implementation notes and limits
+
+- Continuous batching is iteration-level: the scheduler recomposes the active
+  set between steps and records each batch, but each request executes its own
+  plan on the shared stream. Mixed prefill/decode or multi-request decode
+  kernels are not implemented, so aggregate throughput stays near the
+  single-request rate.
+- KV is FP32. FP16 and quantized KV remain Phase 5 extension points.
+- Prefix entries cache KV blocks, the recurrent state snapshot, and prompt
+  logits. Sharing a partially filled block copies it before the request writes
+  past the cached prefix.
+- HIP Graph capture is opt-in. The measured decode difference on Qwen3.5-4B
+  Q4_K_M at 256 context was within noise, so the plain stream path is the
+  default; capture, parameter update, and replay failures fall back to it.
+- The server loads one model. Prefix cache keys include the model identity so a
+  future multi-model server cannot reuse entries across models.
 
 ### Risks and dependencies
 

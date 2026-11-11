@@ -122,11 +122,21 @@ type Event interface {
 }
 ```
 
-Implementation status: these interfaces are not wired into the current
-executor. `backend/backend.go` defines `Backend`, `ExecutionPlan`, `Batch`, and
-related types, but the implemented HIP path uses `engine.Runtime` and
-`backend/hip.Plan`. Adopting the interfaces is part of the batching and serving
-work.
+Implementation status: `backend/backend.go` remains the intended device seam
+and defines `Backend`, `ExecutionPlan`, `Batch`, and related types, but the
+implemented execution path uses narrower concrete interfaces:
+
+- `serving.Backend` and `serving.Sequence` for request construction and
+  prefill/decode steps;
+- `scheduler.Task` for admission-driven request state;
+- `engine.Runtime` for the single-request CLI;
+- `engine/gpu.Model` and `engine/gpu.Session` for the shared HIP model and
+  per-request paged KV state;
+- `backend/hip.Plan`, `Graph`, `Stream`, `Event`, and `Buffer` at the C ABI.
+
+The generic `backend.Backend` interface can be adopted later, but it must not
+introduce a cgo call per tensor and must preserve the current block-table and
+session ownership rules.
 
 ### 4.1 Interface contracts
 
@@ -182,10 +192,12 @@ Decode loop: quantized GEMV + paged attention + sampling
 Stream tokens / finish / release request resources
 ```
 
-Current status: the single-request `qwen35` path processes prompts through
-cached chunked prefill plans (batched WMMA or rocBLAS GEMM, Flash Attention, and
-chunked KV writes) and then decodes through the single-token graph. Paged
-attention and graph replay in this diagram remain target behavior.
+Current status: both CPU and HIP `qwen35` paths process prompts through cached
+chunked prefill plans (batched WMMA or rocBLAS GEMM, paged Flash Attention, and
+paged KV writes) and then decode through the single-token paged plan. The
+serving scheduler interleaves requests on one model stream. HIP Graph capture
+and replay are implemented per session but opt-in; the plain stream path is the
+default because the measured decode gain was within noise.
 
 Key rules:
 
@@ -197,10 +209,10 @@ Key rules:
    prompts because their HIP execution path is not implemented.
 4. Sampling may run on the GPU or on the host through a low-overhead path; the
    choice is a plan decision, not a per-token branch in model code.
-5. In the target design, request cancellation releases KV blocks and scratch
-   through the scheduler and memory manager, not through ad hoc frees in the
-   API layer. The current single-request path resets its contiguous runtime
-   state.
+5. Request cancellation releases KV blocks and scratch through the scheduler
+   and memory manager, not through ad hoc frees in the API layer. The
+   single-request runtime retains its own table for reset; the serving path
+   releases each request table exactly once.
 
 ## 6. Go and HIP boundary
 
@@ -269,26 +281,28 @@ on the assumption that zero-copy access is optimal.
 | --- | --- | --- | --- |
 | **Weights** | Quantized weights, embedding tables, output head | Model lifetime | Device-resident; stable addresses preferred |
 | **Activation** | Layer scratch, attention workspace, logits | Per step or per batch | Reused across layers; sized from the plan |
-| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Target: block allocator; current: contiguous `F32` per request; see [serving.md](serving.md) |
+| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Paged `F32` block allocator; immutable per-request block table; see [serving.md](serving.md) |
 | **Staging** | Host/device transfer buffers | Transient | Reused; explicit synchronization |
 | **Graph workspace** | Stable-address buffers for replay | Backend/model lifetime | Address stability is a requirement |
 
 ### 7.3 KV cache summary
 
-Current implementation: the `qwen35` CPU and HIP runtimes use contiguous `F32`
-KV caches and contiguous recurrent convolution/state buffers, indexed by
-absolute position. The target design is FP16 KV with a configurable block size
-(for example 16 or 32 tokens) and an extension point for quantized KV. The
-logical KV view exposed to model code must not expose the physical block layout.
-Block allocation, reference counting, prefix sharing, cancellation, and
+Current implementation: CPU and HIP use paged `F32` KV pools addressed by
+allocator block ID. A request owns a block table covering its prompt plus output
+budget; positions are resolved through that table by the CPU attention loop and
+by the paged HIP KV-write and attention kernels. Recurrent convolution and
+matrix state stay contiguous per session and are snapshotted for prefix reuse.
+The default block size is 16 tokens. FP16 KV and quantized KV remain extension
+points. The logical KV view exposed to model code does not expose physical block
+layout. Block allocation, reference counting, prefix sharing, cancellation, and
 eviction are specified in [serving.md](serving.md).
 
 ## 8. Backends and fallback
 
 | Backend | Role | Status |
 | --- | --- | --- |
-| HIP GPU | Primary execution path | Implemented for `qwen35` single request |
-| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`; default backend |
+| HIP GPU | Primary execution path | Implemented for `qwen35` single and concurrent requests over a shared paged KV pool; opt-in graph replay |
+| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`; default backend; concurrent paged serving |
 | XDNA NPU | Optional heterogeneous acceleration | Deferred; see [npu.md](npu.md) |
 
 The planner queries backend capabilities, including supported dtypes,
@@ -330,7 +344,10 @@ yuuka/
 ├── engine/
 │   ├── engine.go              # Single-request generation loop
 │   ├── sampling.go            # Greedy, top-k, nucleus sampling
-│   └── gpu/                   # HIP executor implementing engine.Runtime
+│   └── gpu/                   # Shared HIP model plus paged sessions
+├── memory/                    # Block allocator, block tables, prefix cache
+├── scheduler/                 # Admission, continuous batching, timeouts
+├── serving/                   # Request tasks, backends, prefix integration
 ├── backend/
 │   ├── backend.go             # Planned backend interfaces; not wired yet
 │   └── hip/
@@ -347,20 +364,24 @@ yuuka/
 │   └── yuuka_kernels.h
 ├── tests/
 │   ├── fixture/               # Deterministic tiny GGUF generators
-│   └── hip/                   # C ABI, GEMV, GEMM, and operator tests
-├── bench/hip/                 # Hardware probe and GEMV dispatch sweep
+│   └── hip/                   # C ABI, GEMV, GEMM, operators, paged KV, graph
+├── bench/
+│   ├── hip/                   # Hardware probe and kernel sweeps
+│   └── serving/               # Latency and throughput harness
 ├── scripts/
 ├── docs/
 ├── CMakeLists.txt
 └── go.mod
 ```
 
-Planned but not present yet: `scheduler/`, `memory/`, a separate `backend/cpu/`
-package, `backend/npu/`, separate `model/llama/` and `model/qwen3/` packages,
-and `kernels/hip/sampling/`. The CPU reference model code is implemented in
+Planned but not present yet: a separate `backend/cpu/` package, `backend/npu/`,
+separate `model/llama/` and `model/qwen3/` packages, and
+`kernels/hip/sampling/`. The CPU reference model code is implemented in
 `model/qwen35` and `model/dense`; `engine` owns the single-request generation
-loop. The `backend` interfaces and these packages describe the target
-structure; the current executor uses `engine.Runtime` and `backend/hip.Plan`.
+loop, while `serving` and `scheduler` own concurrent requests. The generic
+`backend` interfaces remain the target shape; the current executor uses
+`serving.Backend`, `engine/gpu.Model`, `engine/gpu.Session`, and
+`backend/hip.Plan`.
 
 Use CMake for the HIP shared library and Go Modules for Go components. The two
 build systems meet at the C ABI. Do not embed the HIP/C++ build inside a Go

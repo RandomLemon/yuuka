@@ -21,8 +21,16 @@ chunked prefill with per-chunk KV writes; row-batched RMSNorm, head RMSNorm,
 RoPE, embedding, and KV-write kernels; and a fused gated delta-net chunk kernel
 that performs convolution, L2 normalization, state update, and gated RMSNorm in
 two launches per layer. `backend/hip.SelectPrefillPath` is the measured dispatch
-table described in section 9. Paged KV, continuous batching, prefix caching,
-HIP Graph, and WMMA-based attention are not implemented.
+table described in section 9.
+
+Phase 4 adds the paged KV family: decode and prefill attention kernels that
+resolve every key/value position through an int32 block table, paged KV-write
+kernels for one row and for a chunk, dynamic-parameter variants that read the
+token and position from device memory, and a C ABI for device-to-device block
+copies and HIP Graph capture/replay. KV pools are FP32. Attention remains
+scalar per lane rather than WMMA-based, and continuous batching is
+scheduler-level interleaving of per-request plans; mixed-shape prefill/decode
+kernel batches and split-KV decode are not implemented.
 
 The guiding rule is that **prefill and decode are separate operator families**.
 They may share data layouts and helper primitives, but they are not the same
@@ -268,12 +276,33 @@ chunk length; only the final chunk executes the output tail.
 
 ### 7.2 Decode: Paged Attention
 
-- Locate KV blocks through the per-request block table.
-- Exploit shared KV heads in GQA.
-- Use fewer workgroups for short contexts; use split-KV plus a reduction pass
-  for long contexts.
-- Avoid low occupancy and excessive random reads.
-- Reserve metadata for sliding-window and hybrid-attention models.
+`attention_paged_f32_kernel` runs one workgroup per query head:
+
+- The workgroup stages the query head in shared memory and reduces the score
+  dot product across 256 threads.
+- Each logical position `p` maps to
+  `block_table[p / block_size] * block_size + p % block_size`; K and V are read
+  from the pool through that row. The block table and pool are device buffers.
+- Scores for one head use a per-head stride so one scores workspace serves all
+  heads. The causal length is `position + 1`.
+- GQA maps query head `h` to KV head `h / (heads/kv_heads)`.
+- The attention gate is applied as `sigmoid(gate)` before the output write.
+- The dynamic variant reads `position` from a device parameter buffer so a
+  captured HIP Graph can be replayed without changing kernel arguments.
+
+`attention_prefill_paged_f32_kernel` keeps the same eight-query-row workgroup
+tiling and online softmax as the contiguous prefill kernel, but resolves each
+staged K row and each V read through the block table. `kv_write_paged` and
+`kv_write_batch_paged` map written positions through the same table.
+
+Current limits:
+
+- FP32 KV only; the pool is `ceil(capacity / block_size) * block_size` rows per
+  full-attention layer.
+- One workgroup per head; split-KV and WMMA attention are not implemented.
+- No mixed prefill/decode batch. Each step belongs to one request plan.
+- Block-table entries are immutable for a request; all blocks are allocated at
+  admission, so replay and kernels never observe a changing table.
 
 | Aspect | Prefill | Decode |
 | --- | --- | --- |

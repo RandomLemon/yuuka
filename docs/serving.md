@@ -6,19 +6,37 @@ This document covers the request path above the model executor: admission,
 batching, paged KV cache, HIP Graph replay, APIs, and observability. It assumes
 the single-request GPU path is already correct and measurable.
 
-Current implementation: one model, one request at a time, SSE streaming,
-token and string stop sequences, health, Prometheus-style metrics, request
-cancellation, and explicit `503` rejection while busy. CPU and HIP runtimes are
-selectable. The HIP executor processes prompts in configurable chunks over the
-contiguous KV cache (default 512 rows, maximum 4096). Cancellation is checked
-between decode steps; an in-flight prompt completes all of its prefill chunks
-before cancellation is observed. Continuous batching, paged KV, prefix cache,
-HIP Graph, and scheduler-level prefill/decode interleaving are not implemented
-yet.
+Current implementation:
 
-The first release prioritizes a single model and a single request. Continuous
-batching, prefix caching, and graph replay are introduced only after the
-single-request baseline is stable.
+- One loaded model served by a continuous scheduler with configurable active
+  request, queue, batch, chunk, timeout, and concurrency limits.
+- Paged KV cache: a reference-counted block allocator, per-request immutable
+  block tables, shared prefix blocks, and explicit release on cancellation and
+  failure. The current pool is FP32; FP16 and quantized KV remain extension
+  points.
+- Prefix cache keyed by the model identity, block size, and exact token prefix.
+  Entries retain KV blocks, the recurrent state snapshot, and the prompt logits.
+  Reuse is longest-prefix and collision-safe (full token comparison), with LRU
+  eviction under block pressure.
+- Continuous batching at the scheduler level: prefill and decode steps are
+  interleaved between requests, and each iteration records its batch
+  composition. One model stream executes one request plan at a time; mixed
+  prefill/decode shapes are not submitted to a single kernel batch.
+- HIP Graph capture and replay for decode, using device-resident token and
+  position parameters. Graph capture is opt-in because the Phase 4
+  measurements on Qwen3.5-4B Q4_K_M showed no material decode gain at 256
+  context; the plain stream path is the default and capture/replay falls back
+  to it on any failure.
+- OpenAI-compatible `POST /v1/chat/completions` with SSE streaming, structured
+  errors, stop strings, and a strict supported-parameter subset.
+- `/healthz`, `/metrics`, `/v1/models`, and `/debug/pprof/` endpoints.
+- Request cancellation from the HTTP context, request and queue timeouts,
+  queue-depth backpressure, and graceful shutdown.
+
+The current throughput mode is decode-priority interleaving. The scheduler does
+not yet compose one mixed-shape kernel batch across requests, so aggregate
+decode throughput stays close to the single-request rate; concurrency improves
+admission and TTFT fairness rather than token throughput.
 
 ## 2. Serving architecture
 
@@ -42,6 +60,17 @@ The scheduler owns admission and batch composition. The executor owns the
 model-specific prefill/decode loop. The memory manager owns KV blocks and
 scratch. No layer may bypass admission to allocate KV blocks directly.
 
+Implementation mapping:
+
+| Layer | Package |
+| --- | --- |
+| HTTP API, SSE, metrics | `cmd/yuuka-server` |
+| Request state machine, sampling, stops, prefix insertion | `serving` |
+| Admission, continuous batching, timeouts, lifecycle metrics | `scheduler` |
+| Block allocator, block table, reference counting, prefix cache | `memory` |
+| CPU model execution | `model/qwen35`, `serving.Qwen35Backend` |
+| HIP model execution, paged kernels, graph replay | `engine/gpu`, `serving.Qwen35GPUBackend` |
+
 ## 3. Request lifecycle
 
 | State | Meaning | Exit conditions |
@@ -49,37 +78,39 @@ scratch. No layer may bypass admission to allocate KV blocks directly.
 | **Queued** | Accepted but not yet admitted | Admitted, rejected, timed out, client cancelled |
 | **Prefill** | Prompt chunks are being processed | Prefill complete, cancelled, failed |
 | **Decode** | Tokens are being generated | Stop condition, max tokens, cancelled, failed |
-| **Finishing** | Sampling and stream flush | Response completed |
+| **Finishing** | Stream flush and prefix insertion | Response completed |
 | **Closed** | Resources released | Terminal state |
 
-Each request carries a stable ID used by logs, metrics, cancellation, and
-cleanup. A request that fails must release its KV blocks, scratch, and stream
-state exactly once.
+Each request carries a stable ID (`chatcmpl-<n>` in the server) used by logs,
+metrics, cancellation, and cleanup. A request that fails or is cancelled
+releases its block table, task, and stream state exactly once. Cancellation is
+observed between model steps; a prefill chunk or decode step already submitted
+to the device completes first.
 
 ## 4. Admission and budgets
 
 Admission prevents overcommit and keeps latency predictable. It accounts for:
 
-- **Token budget:** prompt plus reserved output tokens, bounded by the model
-  context length.
-- **KV budget:** blocks required for the prompt and the maximum generated
-  sequence, including prefix-cache sharing.
-- **Concurrency limit:** maximum active requests and maximum batch size.
-- **Scratch and graph workspace:** plan-specific temporary memory.
+- **Token budget:** prompt plus requested output tokens, bounded by the
+  configured context length.
+- **KV budget:** blocks required for prompt plus output positions, checked
+  against the allocator total before queueing. A prefix hit can reduce the
+  actual allocation but does not reduce the conservative admission estimate.
+- **Concurrency limit:** active requests (`--max-concurrency`) and queue depth
+  (`--max-queue`).
+- **Scratch and graph workspace:** per-session prefill plans, trace buffers, and
+  graph executables.
 
-Initial policy:
+Implementation policy:
 
-- Reject a request that cannot fit even with an empty queue, returning a clear
-  capacity error.
-- Otherwise queue it, subject to a queue-depth limit and request timeout.
-- Reserve KV capacity for the maximum output length when configured; otherwise
-  reserve incrementally and fail the request if it exhausts its budget.
-- Never admit a request by silently truncating its context. Truncation, if
-  supported, is an explicit, documented request option.
-
-Exact queueing and rejection semantics are configuration, not hard-coded
-behavior. The implementation must expose the chosen limits and report them in
-health and metrics endpoints.
+- A request whose prompt plus output exceeds the context is rejected with
+  `context_length_exceeded`.
+- A request that cannot fit the KV pool even with an empty queue is rejected
+  with `insufficient_capacity`.
+- A full queue is rejected with `server_overloaded` and `Retry-After: 1`.
+- Output tokens are clamped to the remaining context, matching the CLI.
+- A request that fails allocation when its task is built fails alone; the
+  server stays alive and the scheduler slot is released.
 
 ## 5. Scheduling modes
 
@@ -91,137 +122,145 @@ health and metrics endpoints.
 The mode is a server-level or request-class configuration. It must not change
 model semantics or numerical results.
 
-### 5.1 Initial scheduling policy
+Current status: one decode-priority continuous mode. Each scheduler iteration
+first runs up to `DecodePerCycle` ready decode steps in round-robin order, then
+one prefill opportunity (configurable) so a long prompt cannot monopolize the
+stream. Newly admitted requests join the rotation immediately. A separate
+latency/throughput mode switch is not exposed yet.
+
+### 5.1 Scheduling policy
 
 - Decode steps have priority over new prefill work to protect TPOT.
 - Prefill is split into chunks; a long prompt cannot occupy the GPU for an
   unbounded period while other requests are decoding.
 - A newly admitted request receives a bounded prefill opportunity, then yields
   to pending decode work.
-- The scheduler records why a request was delayed: queueing, prefill chunking,
-  KV pressure, or GPU execution.
-
-The precise policy is expected to be tuned. The policy must be observable and
-must not starve a request indefinitely.
+- Ready decode requests are rotated so every request gets a step.
+- Metrics and per-request results record queue wait, prefill, decode, and
+  sampling separately.
 
 ## 6. Continuous batching and chunked prefill
 
-Current status: the HIP executor supports chunked prefill with causal KV
-semantics across chunk boundaries, but the scheduler still admits one request
-at a time. Paged block tables, per-request batch composition, and prefill/decode
-interleaving described below are target behavior.
+Continuous batching admits new requests between decode steps rather than
+waiting for the entire batch to finish. The batch is recomposed as requests
+arrive, complete, or cancel. Every iteration records its decode and prefill
+request IDs through the scheduler's `OnStep` hook.
 
-Continuous batching admits new requests between decode steps rather than waiting
-for the entire batch to finish. The batch is recomposed as requests arrive,
-complete, or cancel.
+Requirements and current behavior:
 
-Requirements:
-
-- Batch composition is explicit and recorded for each step.
+- Batch composition is explicit and observable.
 - Per-request sequence lengths and block tables are passed to the kernels.
-- Padding is minimized; padded lanes must not affect sampling or KV writes.
-- A request removal must not invalidate the KV blocks of other requests.
-- Chunked prefill uses the same attention semantics as full prefill, including
-  causal masking across chunk boundaries.
-- Prefill and decode may share a step only if the executor and kernels support
-  the mixed shape; otherwise they alternate under the scheduler's budget.
-
-The initial target is correctness and reproducible throughput, not a specific
-batching algorithm. Batch-size and chunk-size thresholds are measured.
+- There is no padded lane because requests are not fused into one kernel batch;
+  each request's plan sees only its own table and positions.
+- A request removal does not invalidate the KV blocks of other requests.
+- Chunked prefill uses the same causal attention semantics as full prefill; the
+  paged prefill kernel enforces the causal limit across chunk boundaries.
+- Prefill and decode alternate rather than sharing a mixed-shape step. The
+  kernels do not yet support a mixed prefill/decode batch, which is why
+  aggregate throughput does not scale with concurrency.
+- Prefill and decode are both submitted to the same explicit model stream, so
+  ordering is deterministic.
 
 ## 7. Paged KV cache
 
-### 7.1 Initial configuration
+### 7.1 Configuration
 
-- FP16 keys and values.
-- Configurable block size, initially 16 or 32 tokens.
+- FP32 keys and values. FP16 KV and quantized KV remain extension points because
+  the accepted numerical baselines use FP32.
+- Configurable block size; the server and benchmark default to 16 tokens.
+- One allocator per model with a fixed block count derived from context and
+  concurrency, or set explicitly with `--kv-blocks`.
 - Per-request block table mapping logical positions to physical blocks.
-- A logical KV view that does not expose physical block placement to model code.
-
-Quantized KV, sliding windows, and hybrid-attention state caches are extension
-points, not first-release requirements.
+- The model and kernels address KV only through the block table; model code
+  never sees physical block placement.
 
 ### 7.2 Components
 
-| Component | Responsibility |
-| --- | --- |
-| **Block allocator** | Allocate, free, and reuse fixed-size KV blocks; track free capacity |
-| **Request block table** | Map logical token positions to physical blocks for each layer/head |
-| **Reference counting** | Share blocks for prefix caching; free only when the last owner releases |
-| **Prefix cache** | Identify and reuse common prompt prefixes |
-| **Cancellation cleanup** | Release all blocks owned by a cancelled or failed request |
-| **Eviction** | Reclaim cached blocks under memory pressure |
+| Component | Responsibility | Implementation |
+| --- | --- | --- |
+| **Block allocator** | Allocate, free, and reuse fixed-size blocks; track free capacity | `memory.Allocator` |
+| **Request block table** | Map logical positions to physical blocks for each layer | `memory.Table` |
+| **Reference counting** | Share blocks for prefix caching; free only at the last release | `memory.Allocator` reference counts |
+| **Prefix cache** | Identify and reuse common prompt prefixes | `memory.PrefixCache` |
+| **Cancellation cleanup** | Release all blocks owned by a cancelled or failed request | `scheduler` closes the task, which releases the table |
+| **Eviction** | Reclaim cached blocks under memory pressure | LRU callback installed on the allocator |
 
 ### 7.3 Invariants
 
-- A block is freed exactly once.
+- A block is freed exactly once; double release is an error.
 - A block is not returned to the free list while any request or cache entry
   still references it.
-- Kernel reads never cross a block boundary unless the kernel explicitly handles
-  the block table.
-- The block table is immutable for the duration of a submitted step, or updated
-  only at a documented synchronization point.
-- KV writes for a token occur before any later decode step reads that token.
-- A request cannot observe blocks belonging to another request.
+- Kernel reads never cross a block boundary without the block table; the paged
+  attention and KV-write kernels resolve every position through the table.
+- The block table is fixed for the duration of a request. All required blocks
+  are allocated at admission, so a submitted step never reallocates the table.
+- KV writes for a token occur before any later decode step reads that token;
+  both run on the same explicit stream.
+- A request cannot observe blocks belonging to another request. Blocks shared
+  with the prefix cache are read-only; a partially shared last block is copied
+  before the request writes past the cached prefix.
 
 ### 7.4 Prefix cache
 
-A prefix-cache entry represents one or more complete token blocks shared by
-multiple requests. The cache key must include the model identity and all
-tokenizer/model settings that affect the KV values. Hash collisions must not
-produce incorrect reuse; a full key comparison or a collision-resistant key is
-required.
+A prefix-cache entry represents one complete prompt processed by an earlier
+request.
 
-Prefix entries are reference-counted and evicted under a documented policy.
-Eviction policy is an open decision: candidates include LRU and cost-aware
-eviction based on block count and reuse probability. The first implementation
-should choose one simple policy, measure hit rate, and record the tradeoff.
+- **Key:** SHA-256 over a cache version tag, the model identity supplied by the
+  server (by default the SHA-256 of the GGUF file), the block size, the token
+  count, and every token. Lookup additionally compares the full token slice, so
+  a hash collision cannot produce incorrect reuse.
+- **Payload:** block references covering the prompt, the recurrent
+  convolution/matrix state snapshot at the prompt boundary, and the logits for
+  the last prompt token. The logits let a full-prompt hit sample immediately.
+- **Partial final block:** when the prompt is not block-aligned, the cache owns
+  the original partial block and the request receives a private copy, so later
+  decode writes cannot corrupt the cached KV.
+- **Eviction:** least-recently-used. The allocator invokes the cache when no
+  free block remains; cache entries release their own references while
+  request-held references keep shared blocks alive. Entry and block caps are
+  configurable with `--prefix-entries` and `--prefix-blocks`.
+- **Insertion:** after a completed prompt, the serving manager splits the prompt
+  prefix out of the request table and inserts it. Cache failure or allocation
+  pressure never changes the request's generated output.
+
+Hit rate and cache occupancy are reported by `/metrics`.
 
 ## 8. HIP Graph
 
-The plain HIP stream path is the default and must remain correct without graph
-capture. Graph replay is introduced only when profiling shows that host launch
-overhead is a significant part of decode time.
+The plain HIP stream path is the default and remains correct without graph
+capture. Replay is opt-in (`--graph`) and was introduced only after the decode
+host path was measured.
 
-Graph cache keys include:
+Behavior:
 
-- batch size and shape class;
-- model and quantization type;
-- kernel sequence and graph topology;
-- whether KV block tables and sequence lengths are updated in place.
+- The decode plan is captured after its first eligible decode step and
+  instantiated once per session.
+- The captured graph addresses weights, activations, KV pools, the session
+  block table, and the dynamic parameter buffer, all of which have stable
+  addresses for the session lifetime.
+- Kernel arguments do not change between replays. A two-element device buffer
+  supplies the current token and position; `yuuka_dynamic_set` uploads it on
+  the same stream before `hipGraphLaunch`.
+- Before replay the runtime verifies that the session is open, the position is
+  inside capacity, the block table covers the next position, and the dynamic
+  buffer is valid.
+- If capture, parameter upload, or replay fails, the graph is destroyed and the
+  same step is submitted through the plain plan. A capture failure disables
+  graph use for that session; it never corrupts output.
+- Prefill plans are not captured; the decode shape is the stable replay class.
+- Graph resources are released with the session before the model.
 
-Requirements:
-
-- Stable device addresses for weights, scratch, and graph workspace.
-- A documented mechanism to update block-table pointers, sequence lengths, and
-  other dynamic parameters.
-- Validation before replay; if a parameter cannot be updated safely, fall back
-  to normal submission.
-- No graph replay for a request that has been cancelled or whose buffers have
-  been released.
-- Graph resources are released with the executable or model.
-
-Graph capture is not a substitute for a correct stream path. A graph failure
-must degrade to normal execution, not corrupt output.
+Measured Phase 4 result: decode time with and without replay is effectively
+identical for Qwen3.5-4B Q4_K_M at 256 context (1.533 s vs 1.530 s for 16
+tokens), so the server default is off. The implementation remains for stable
+shapes where host launch overhead is measured to matter.
 
 ## 9. API surface
 
 ### 9.1 CLI
 
-The CLI should support:
-
-- loading a GGUF model and reporting its configuration and quantization;
-- interactive prompt and generation;
-- a performance report with prefill and decode timings;
-- a benchmark mode with fixed prompt lengths and decode counts.
-
-Illustrative commands:
-
-```text
-yuuka run --model model.gguf --ctx 8192
-yuuka bench --model model.gguf --prompt-tokens 2048 --decode-tokens 128
-yuuka inspect --model model.gguf
-```
+The CLI supports loading a GGUF model, interactive generation, inspection, and
+benchmark modes. Serving uses `yuuka-server`.
 
 ### 9.2 HTTP
 
@@ -231,73 +270,78 @@ The server targets an OpenAI-compatible subset:
 | --- | --- |
 | `POST /v1/chat/completions` | Chat generation, streaming or non-streaming |
 | `GET /v1/models` | Loaded model metadata and capabilities |
-| `GET /healthz` | Liveness and device readiness |
-| `GET /metrics` | Runtime metrics in a machine-readable format |
+| `GET /healthz` | Liveness, queue/active counts, KV occupancy |
+| `GET /metrics` | Prometheus text metrics |
+| `GET /debug/pprof/*` | Go runtime profiling endpoints |
 
-Streaming uses server-sent events with incremental deltas and a terminal
-completion event. Unsupported OpenAI parameters must be rejected explicitly or
-documented as ignored; they must not silently change semantics.
+Supported chat parameters: `model`, string or text-part `messages`,
+`max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`,
+`stream`, `stop` (string or array), `stop_token_ids`, `enable_thinking`,
+`chat_template_kwargs.enable_thinking`, and `user` (ignored). Unknown JSON
+fields are rejected. `n != 1`, nonzero penalties, logprobs, `response_format`,
+`tools`, and `stream_options` are rejected explicitly rather than ignored.
 
-Request parameters include context length, temperature, top-p, top-k, seed,
-stop sequences, maximum output tokens, and concurrency class where supported.
-Sampling behavior must be identical between CLI and HTTP for the same
-parameters and seed.
+Streaming uses server-sent events with an initial assistant role chunk,
+incremental content deltas, a terminal chunk with `finish_reason`, and
+`data: [DONE]`. A cancelled client context stops generation, releases the
+request, and is reported in cancellation metrics.
 
 ### 9.3 Error model
 
-API errors should be structured and include:
+Errors are JSON objects containing `message`, `type`, `code`, `request_id`, and
+`retryable`. Streaming errors use the same payload inside a `data:` event
+followed by `[DONE]`.
 
-- a stable error code;
-- a human-readable message;
-- the request ID;
-- whether the request can be retried;
-- capacity details for admission failures.
-
-A cancelled client connection must propagate cancellation to the scheduler and
-release resources. It must not leave a request decoding in the background.
+| Code | Status | Meaning |
+| --- | --- | --- |
+| `invalid_request` | 400 | Malformed JSON, empty messages, invalid content |
+| `unsupported_parameter` | 400 | A known OpenAI parameter outside the supported subset |
+| `context_length_exceeded` | 400 | Prompt plus output exceeds the configured context |
+| `model_not_found` | 404 | Requested model identifier is not loaded |
+| `server_overloaded` | 429 | Queue depth limit reached; retryable |
+| `insufficient_capacity` | 503 | KV pool cannot admit the request; retryable |
+| `request_timeout` | 504 | Request deadline expired |
+| `client_closed` | 499 | Client cancelled the request |
+| `generation_error` | 500 | Model, device, or streaming failure |
 
 ## 10. Observability
 
-| Metric | Why it matters |
-| --- | --- |
-| Queue depth and wait time | Admission and fairness |
-| Active requests and batch size | Batching efficiency |
-| TTFT | Prefill and queueing latency |
-| TPOT / inter-token latency | Decode smoothness |
-| Prefill and decode tokens/s | Throughput split |
-| KV blocks used / free / cached | Memory pressure and prefix-cache value |
-| Prefix-cache hit rate | Cache effectiveness |
-| Kernel time and launch overhead | Where decode time goes |
-| Sampling time | Host-side overhead |
-| Cancellation and error counts | Correctness of lifecycle |
-| Peak RAM / device memory | Capacity planning |
+The scheduler records:
 
-Metrics must distinguish single-request latency from aggregate throughput.
-Percentiles (P50/P95/P99) are required for latency reporting; averages alone are
-insufficient.
+- queue depth, active requests, last and maximum batch size, maximum active;
+- queue wait, prefill, decode, and sampling totals;
+- TTFT and TPOT P50/P95/P99 and maximum over a bounded sample window;
+- prompt and generated token totals;
+- submissions, admissions, completions, failures, cancellations, timeouts,
+  queue-full rejections, and capacity rejections.
 
-Logging should include the request ID, scheduler decisions, prefill chunk
-boundaries, decode step counts, cancellation, and terminal status. Logs must not
-include prompt contents by default.
+The KV allocator reports total, used, free, shared, and block size. The prefix
+cache reports entries, blocks, hits, misses, insertions, and evictions.
+
+`/metrics` exposes these as `yuuka_*` Prometheus counters and gauges, including
+`yuuka_ttft_seconds{quantile="0.5|0.95|0.99"}`, `yuuka_tpot_seconds`,
+`yuuka_queue_wait_seconds_total`, `yuuka_prefill_seconds_total`,
+`yuuka_decode_seconds_total`, and `yuuka_sampling_seconds_total`.
+
+Logging includes the request ID, finish reason, token counts, phase timings,
+and prefix hit; prompt contents are not logged.
 
 ## 11. Backpressure and failure handling
 
-- Enforce queue-depth and concurrency limits.
-- Reject work before KV allocation when capacity is insufficient.
-- Reserve headroom for scratch and graph workspace; do not fill device memory
-  to the last block.
-- On device allocation failure during a request, fail that request, release its
-  resources, and keep the server alive if the device remains usable.
-- On device loss, fail all active requests and report an unhealthy state.
-- On shutdown, stop admission, cancel or drain active requests according to
-  configuration, and release model resources.
-
-The server must never silently drop a request or return a successful response
-for a generation that failed.
+- Queue-depth and concurrency limits are enforced before task construction.
+- Capacity is checked before KV allocation; allocation failure fails one
+  request and releases its blocks and task.
+- The model stream is explicit; a device error fails the active request and is
+  surfaced as `generation_error`. The server keeps running while the device
+  remains usable.
+- On shutdown, HTTP stops accepting connections, the scheduler stops admission,
+  and active requests drain for up to 10 seconds before cancellation.
+- A cancelled or failed request always releases its task, block table, and
+  graph resources. The server never returns success for a failed generation.
 
 ## 12. Deferred: multiple models
 
 Model unload and multi-model management are deferred until the serving path is
-stable. The first release keeps one model resident. The model manager interface
-should not preclude later support, but it must not add complexity to the
-single-model hot path.
+accepted. The current server loads exactly one model for its lifetime and uses
+the model identity in every prefix-cache key so a future multi-model server
+cannot mix cache entries.

@@ -5,9 +5,10 @@ APUs. The runtime is written in Go, and performance-critical device code is writ
 in HIP/C++. It reads GGUF files directly, keeps quantized weights packed, and
 does not use llama.cpp, GGML, or Ollama as an execution engine.
 
-The current implementation is a **single-request vertical slice** for the
-Qwen3.5 hybrid architecture (`qwen35`), plus CPU reference decoders for dense
-Llama and Qwen3 layouts. It provides:
+The current implementation is a complete **single-request vertical slice** for
+the Qwen3.5 hybrid architecture (`qwen35`), plus CPU reference decoders for
+dense Llama and Qwen3 layouts and a concurrent, paged serving path. It
+provides:
 
 - a validated, mmap-backed GGUF reader with split-shard support;
 - Qwen byte-level BPE and Llama SentencePiece tokenizers with Qwen chat rendering;
@@ -16,15 +17,20 @@ Llama and Qwen3 layouts. It provides:
 - a validated prefill family: rocWMMA FP16 and quantized GEMM, a rocBLAS FP16
   baseline, Flash Attention, and chunked prefill;
 - a CLI (`inspect`, `run`, `bench`);
-- an OpenAI-compatible server for single-request chat completions.
+- a continuous scheduler with paged KV, reference-counted prefix caching, and
+  request cancellation;
+- an OpenAI-compatible server with SSE streaming, health, metrics, and pprof
+  endpoints.
 
 CPU and GPU greedy tokens match, layer-by-layer hidden states agree on the
 decode path, and the recorded decode-path first-step maximum absolute logit
 difference is `4.58e-5`. The chunked prefill path on the same 5-token prompt
 differs from the CPU reference by `3.65e-3` in the worst logit and selects the
 same top-1 token; chunk-size equivalence at 1024 tokens is exact.
-Paged KV, continuous batching, prefix caching, and HIP Graph are not
-implemented yet. A short-context greedy baseline for Qwen3.5-4B Q4_K_M measured
+Paged KV, iteration-level continuous batching, prefix caching, and opt-in HIP
+Graph capture/replay are implemented. Concurrent requests reproduce isolated-run
+tokens; cancellation and repeated cycles release every KV block. A
+short-context greedy baseline for Qwen3.5-4B Q4_K_M measured
 1.93 decode tok/s on the CPU reference and 9.87 decode tok/s on HIP; prefill
 throughput and prompt-length curves are in
 [`docs/benchmarks.md`](docs/benchmarks.md) with the exact conditions.
@@ -244,14 +250,24 @@ Endpoints:
 | --- | --- |
 | `POST /v1/chat/completions` | Chat completions, JSON or SSE |
 | `GET /v1/models` | Loaded model metadata |
-| `GET /healthz` | Health and backend status |
-| `GET /metrics` | Prometheus-format counters and gauges |
+| `GET /healthz` | Health, queue/active counts, KV occupancy |
+| `GET /metrics` | Prometheus-format counters, gauges, and latency percentiles |
+| `GET /debug/pprof/*` | Go runtime profiling endpoints |
 
-Server flags: `--model`, `--backend`, `--ctx`, `--model-name`, and `--addr`.
-The server handles one request at a time and returns HTTP `503` with
-`Retry-After` when busy. It supports `temperature`, `top_p`, `top_k`, `seed`,
-`stop`, `max_tokens`, `max_completion_tokens`, `stream`, and
-`enable_thinking`; tool and image content are rejected.
+Serving flags include `--model`, `--backend`, `--ctx`, `--model-name`, `--addr`,
+`--block-size`, `--kv-blocks`, `--max-concurrency`, `--max-queue`,
+`--prefill-chunk`, `--request-timeout`, `--queue-timeout`, `--prefix-cache`,
+`--prefix-entries`, `--prefix-blocks`, `--graph`, and `--model-key`.
+
+The server admits concurrent requests through the continuous scheduler. It
+supports `temperature`, `top_p`, `top_k`, `seed`, `stop` (string or array),
+`stop_token_ids`, `max_tokens`, `max_completion_tokens`, `stream`, and
+`enable_thinking`. Unknown parameters and unsupported OpenAI features
+(`n != 1`, logprobs, penalties, tools, response formats, stream options) are
+rejected explicitly. A full queue returns HTTP `429` with `Retry-After`.
+
+HIP Graph replay is opt-in with `--graph`; the measured decode difference on the
+validated model was within noise, so the plain stream path is the default.
 
 ## Tests
 
@@ -278,6 +294,14 @@ Real-model and HIP/CPU agreement tests:
 YUUKA_TEST_MODEL="$MODEL" go test -tags hip ./... -count=1
 ```
 
+Serving throughput and latency:
+
+```bash
+go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
+/tmp/yuuka-serving-bench --model "$MODEL" --backend hip --ctx 256 \
+  --concurrency 4 --requests 8 --prompt-tokens 64 --decode-tokens 16
+```
+
 Without `YUUKA_TEST_MODEL`, model-dependent Go tests are skipped. Native tests
 skip with exit code 77 when the requested HIP device is unavailable.
 
@@ -290,14 +314,16 @@ skip with exit code 77 when the requested HIP device is unavailable.
   and Go packages.
 - The tokenizer implementation covers Qwen byte-level BPE and Llama-family
   SentencePiece vocabularies. Non-Qwen chat templates are not implemented.
-- Prefill uses chunked batched plans with rocWMMA/rocBLAS GEMM and Flash
-  Attention. The Flash Attention kernel supports head dimensions up to 256.
-  Chunks are bounded at 4096 rows; paged attention and continuous batching are
-  not implemented.
-- KV cache is contiguous `F32`. Paged KV, quantized KV, prefix caching, and
-  continuous batching are not implemented.
-- The server is single-request. It rejects concurrent work instead of queueing
-  it.
+- Prefill uses chunked batched plans with rocWMMA/rocBLAS GEMM and paged Flash
+  Attention. The attention kernel supports head dimensions up to 256. Chunks are
+  bounded at 4096 rows.
+- KV cache is paged `F32` with a default block size of 16 tokens. FP16 and
+  quantized KV are not implemented.
+- Continuous batching is iteration-level: requests are interleaved on one model
+  stream, but mixed-shape batched kernels are not implemented, so aggregate
+  decode throughput does not scale with concurrency.
+- HIP Graph replay is opt-in and per session; prefill plans are not captured.
+- The server loads one model for its lifetime.
 - The validated HIP environment is Linux, ROCm 10.1 layout / HIP 7.16, and
   `gfx1151`. Other devices and toolchain versions are unverified.
 
