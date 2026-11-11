@@ -37,6 +37,39 @@ echo
 echo "== kernel and module =="
 uname -r
 lsmod | grep -E '^amdgpu|^amdkfd' || true
+modinfo amdgpu 2>/dev/null | sed -n 's/^version:[[:space:]]*//p; s/^/amdgpu_version: /' || true
+echo
+
+echo "== firmware and vbios =="
+for device in /sys/class/drm/card*/device; do
+    if [ -d "$device/fw_version" ]; then
+        echo "device: $device"
+        for firmware in "$device"/fw_version/*; do
+            [ -r "$firmware" ] || continue
+            printf '%s: ' "$(basename "$firmware")"
+            cat "$firmware"
+        done
+        if [ -r "$device/vbios_version" ]; then
+            printf 'vbios_version: '
+            cat "$device/vbios_version"
+        fi
+    fi
+done
+amd-smi static -I -d 2>&1 | sed -n '1,40p' || true
+echo
+
+echo "== power, clock, temperature, throttling =="
+for device in /sys/class/drm/card*/device; do
+    [ -r "$device/power_dpm_force_performance_level" ] || continue
+    printf 'power_dpm_force_performance_level: '
+    cat "$device/power_dpm_force_performance_level"
+    if [ -r "$device/power_dpm_state" ]; then
+        printf 'power_dpm_state: '
+        cat "$device/power_dpm_state"
+    fi
+    break
+done
+amd-smi metric -p -c -t -v -m 2>&1 | sed -n '1,140p' || true
 echo
 
 echo "== c ABI smoke test =="

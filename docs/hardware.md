@@ -32,11 +32,54 @@ property.
 
 ```bash
 ./scripts/hardware_report.sh
+scripts/thermal_probe.sh 15 ./build/yuuka_hardware_probe
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ./build/yuuka_hardware_probe
 ```
+
+## Firmware and power management
+
+Captured on the reference machine with `./scripts/hardware_report.sh`:
+
+| Item | Value |
+| --- | --- |
+| VBIOS | `113-STRXLGEN-001` |
+| IFWI | `AMD STRIX_HALO_GENERIC`, built 2024/06/17, part `113-STRXLGEN-001`, version `023.011.000.039.000001` |
+| `rlc_fw_version` | `0x11530506` |
+| `smc_fw_version` | `0x0a640700` |
+| `sdma_fw_version` | `0x00000012` |
+| `vcn_fw_version` | `0x09118037` |
+| `mes_fw_version` | `0x00000096` |
+| `power_dpm_force_performance_level` | `auto` |
+| `power_dpm_state` | `performance` |
+
+`amd-smi static -d` reports the `amdgpu` driver name but `VERSION: N/A`; the
+kernel module does not expose a version string on this host. The kernel version
+above is the stable identifier for driver comparisons. `amd-smi metric -v`
+reports all throttle accumulators as `N/A` on this APU, so throttle residency
+cannot be quantified from that interface.
+
+## Sustained-load telemetry
+
+`scripts/thermal_probe.sh` samples the hwmon `power1_input` and `temp1_input`
+plus the active `pp_dpm_sclk` entry while repeating a load command. A 15-second
+run of the hardware probe on the reference machine produced:
+
+| Metric | Result |
+| --- | ---: |
+| Samples | 14 |
+| Socket power average | 28.40 W |
+| Socket power minimum / maximum | 24.00 W / 30.01 W |
+| Edge temperature average | 46.29 °C |
+| Edge temperature minimum / maximum | 46.00 °C / 47.00 °C |
+| Active SCLK at end | 1215 MHz |
+
+This is a short smoke test, not a thermal soak: it does not establish steady
+state, fan behavior, or long-running throttling. The hwmon power reading is
+socket power, not a GPU-only counter. Re-run the script with a longer duration
+before using the values for a sustained-performance claim.
 
 The C ABI test and the quantized GEMV test run through CTest. The hardware probe
 is a benchmark and is run explicitly.
@@ -114,7 +157,6 @@ available to the toolchain and that a wave32 launch works on this device.
 
 ## Remaining Phase 0 work
 
-- Power, clock, and thermal characterization under sustained load.
-- Firmware and driver version capture through a stable source.
+- Longer thermal soak with fan and steady-state power recording.
 - A larger rocBLAS shape sweep and a WMMA tiled GEMM benchmark.
 - A final decision on which buffer classes, if any, should use mapped memory.
