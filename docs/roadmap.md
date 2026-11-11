@@ -29,13 +29,13 @@ planned operators, and the full decoder execution path are implemented and
 tested; CPU and HIP greedy tokens match, and the recorded first-step maximum
 absolute logit difference is `4.58e-5`.
 
-Current gaps: Phase 0 has no checked-in CI, small model fixture, or
-firmware/power/thermal record. Phase 1 covers only `qwen35`; Qwen3 Dense, Llama
-Dense, and FP16 GEMM are not implemented. Phase 2 has quantized GEMV and
-end-to-end Q4_K_M generation, but no profiler attribution, batch dispatch
-thresholds, or per-shape sweep. WMMA/rocBLAS prefill, paged KV, batching, and
-prefix caching are not implemented yet. The current measured baseline is in
-[benchmarks.md](benchmarks.md).
+Current gaps: Phase 0 has checked-in CI tiers and a generated tiny GGUF fixture,
+but the firmware/power/thermal record is incomplete. Phase 1 covers only
+`qwen35`; Qwen3 Dense, Llama Dense, and FP16 GEMM are not implemented. Phase 2
+has quantized GEMV and end-to-end Q4_K_M generation, but no profiler
+attribution, batch dispatch thresholds, or per-shape sweep. WMMA/rocBLAS
+prefill, paged KV, batching, and prefix caching are not implemented yet. The
+current measured baseline is in [benchmarks.md](benchmarks.md).
 
 This status does not declare any phase exit gate complete. It identifies the
 current boundary for contributors.

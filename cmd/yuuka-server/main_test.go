@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/yuuka-ai/yuuka/engine"
 	"github.com/yuuka-ai/yuuka/gguf"
 	"github.com/yuuka-ai/yuuka/model/qwen35"
+	"github.com/yuuka-ai/yuuka/tests/fixture"
 	"github.com/yuuka-ai/yuuka/tokenizer"
 )
 
@@ -65,8 +67,13 @@ func TestChatMessageTextParts(t *testing.T) {
 func newTestServer(t *testing.T) *server {
 	t.Helper()
 	path := os.Getenv("YUUKA_TEST_MODEL")
+	contextSize := 64
 	if path == "" {
-		t.Skip("YUUKA_TEST_MODEL is not set")
+		path = filepath.Join(t.TempDir(), "tiny-qwen35.gguf")
+		if err := fixture.WriteTinyQwen35(path); err != nil {
+			t.Fatal(err)
+		}
+		contextSize = 128
 	}
 	reader, err := gguf.Open(path)
 	if err != nil {
@@ -81,7 +88,7 @@ func newTestServer(t *testing.T) *server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner, err := engine.New(model, tok, 64, nil)
+	runner, err := engine.New(model, tok, contextSize, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +97,7 @@ func newTestServer(t *testing.T) *server {
 		tokenizer:   tok,
 		model:       model,
 		engine:      runner,
-		contextSize: 64,
+		contextSize: contextSize,
 		modelName:   "yuuka",
 	}
 }
