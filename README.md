@@ -1,7 +1,7 @@
 # yuuka engine
 
-`yuuka` is a from-scratch LLM inference runtime for AMD **gfx1151** (RDNA 3.5)
-APUs. The runtime is written in Go; performance-critical device code is written
+`yuuka` is a from-scratch LLM inference runtime for AMD Strix Halo **gfx1151** (RDNA 3.5)
+APUs. The runtime is written in Go, and performance-critical device code is written
 in HIP/C++. It reads GGUF files directly, keeps quantized weights packed, and
 does not use llama.cpp, GGML, or Ollama as an execution engine.
 
