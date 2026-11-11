@@ -257,7 +257,9 @@ Endpoints:
 Serving flags include `--model`, `--backend`, `--ctx`, `--model-name`, `--addr`,
 `--block-size`, `--kv-blocks`, `--max-concurrency`, `--max-queue`,
 `--prefill-chunk`, `--request-timeout`, `--queue-timeout`, `--prefix-cache`,
-`--prefix-entries`, `--prefix-blocks`, `--graph`, and `--model-key`.
+`--prefix-entries`, `--prefix-blocks`, `--graph`, and `--model-key`. Defaults
+and capacity rules are documented in
+[`docs/serving.md`](docs/serving.md#41-server-limits).
 
 The server admits concurrent requests through the continuous scheduler. It
 supports `temperature`, `top_p`, `top_k`, `seed`, `stop` (string or array),

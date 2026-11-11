@@ -112,6 +112,27 @@ Implementation policy:
 - A request that fails allocation when its task is built fails alone; the
   server stays alive and the scheduler slot is released.
 
+### 4.1 Server limits
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--ctx` | 4096 | Maximum prompt plus output positions per request |
+| `--block-size` | 16 | KV block size in tokens |
+| `--kv-blocks` | derived | Total KV blocks. The default is `(ceil(ctx/block-size) + 1) * max-concurrency`, including one block of headroom per request for prefix copies and cache entries |
+| `--max-concurrency` | 4 | Maximum active requests |
+| `--max-queue` | 64 | Maximum pending requests |
+| `--prefill-chunk` | 512 | Prompt tokens per prefill opportunity |
+| `--request-timeout` | 5m | Per-request deadline, including queue wait |
+| `--queue-timeout` | 30s | Maximum time a request may remain queued |
+| `--prefix-cache` | true | Enable prompt prefix caching |
+| `--prefix-entries` | 64 | Maximum cached prompt prefixes |
+| `--prefix-blocks` | 0 (pool bound) | Maximum blocks held by the prefix cache |
+| `--graph` | false | Enable HIP Graph capture/replay with fallback |
+| `--model-key` | file SHA-256 | Override the prefix-cache model identity |
+
+The HTTP request body limit is 8 MiB. Limits are reported by `/healthz` and
+`/metrics`, and rejected requests include an opaque request ID.
+
 ## 5. Scheduling modes
 
 | Mode | Goal | Batch policy |
@@ -264,7 +285,7 @@ benchmark modes. Serving uses `yuuka-server`.
 
 ### 9.2 HTTP
 
-The server targets an OpenAI-compatible subset:
+The server targets an OpenAI-compatible subset and rejects unknown JSON fields:
 
 | Surface | Purpose |
 | --- | --- |

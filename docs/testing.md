@@ -163,9 +163,11 @@ Serving tests are split by layer:
   cancellation, build-failure slot release, decode-priority interleaving,
   explicit batch composition, shutdown drain, and latency summaries.
 - `serving`: concurrent requests versus isolated runs, full and partial prefix
-  reuse versus a fresh run, cancellation cleanup with balanced allocator
-  counters, and repeated cycles with zero residual blocks. Both CPU and HIP
-  backends are covered when the HIP library is available.
+  reuse versus a fresh run, cancellation and injected decode-failure cleanup
+  with balanced allocator counters, and repeated cycles with zero residual
+  blocks. GPU session tests also assert that per-request device buffers do not
+  grow the model-lifetime allocation list. Both CPU and HIP backends are covered
+  when the HIP library is available.
 
 ### 3.4 End-to-end tests
 
@@ -182,6 +184,8 @@ Serving tests are split by layer:
   run.
 - Verify graph replay and fallback produce the same token sequence as a plain
   session, including an intentionally invalidated dynamic parameter buffer.
+- Verify HTTP API tests remain independent of the real-model environment by
+  using the tiny fixture for streaming, error, stop, and cancellation cases.
 - Verify chunked prefill at chunk sizes that select batched GEMV and WMMA,
   including partial final chunks, matches unchunked CPU logits and the greedy
   top-1 token.

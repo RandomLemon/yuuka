@@ -26,8 +26,8 @@ table described in section 9.
 Phase 4 adds the paged KV family: decode and prefill attention kernels that
 resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
-token and position from device memory, and a C ABI for device-to-device block
-copies and HIP Graph capture/replay. KV pools are FP32. Attention remains
+token and position from device memory, and a C ABI (version 3) for
+device-to-device block copies and HIP Graph capture/replay. KV pools are FP32. Attention remains
 scalar per lane rather than WMMA-based, and continuous batching is
 scheduler-level interleaving of per-request plans; mixed-shape prefill/decode
 kernel batches and split-KV decode are not implemented.
