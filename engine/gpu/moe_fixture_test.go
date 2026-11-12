@@ -145,6 +145,101 @@ func TestTinyMoELayerTrace(t *testing.T) {
 	}
 }
 
+func TestTinyMoEQuantizedGPUMatchesCPU(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny-qwen3moe-q4k.gguf")
+	if err := fixture.WriteTinyMoEQuantized(path); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := gguf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	model, err := dense.Load(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Layers[0].GateExps.DType != tensor.Q4_K {
+		t.Fatalf("expert dtype %s, want Q4_K", model.Layers[0].GateExps.DType)
+	}
+	tok, err := tokenizer.NewFromGGUF(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := tok.Encode("Hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq := make([]int32, 0, 9)
+	for len(seq) < 9 {
+		seq = append(seq, ids...)
+	}
+	seq = seq[:9]
+
+	cpuState, err := dense.NewState(model.Config, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpuLogits, err := model.Forward(seq, cpuState)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mo, err := OpenMoE(reader, model, Options{
+		Blocks:       4,
+		BlockSize:    16,
+		PrefillChunk: 3,
+	})
+	if err != nil {
+		t.Skipf("HIP runtime unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = mo.Close() })
+	newSession := func() *MoESession {
+		table := memory.NewTable(mo.Allocator())
+		if err := table.Cover(32); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(table.Release)
+		session, err := mo.NewMoESession(table, 0, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = session.Close() })
+		return session
+	}
+	compare := func(name string, got []float32) {
+		maxDiff := 0.0
+		for i := range cpuLogits {
+			maxDiff = math.Max(maxDiff, math.Abs(float64(cpuLogits[i]-got[i])))
+		}
+		if maxDiff > 5e-3 {
+			t.Fatalf("%s logits differ from CPU by %.6g", name, maxDiff)
+		}
+		if argmax(cpuLogits) != argmax(got) {
+			t.Fatalf("%s top-1 differs: cpu=%d gpu=%d",
+				name, argmax(cpuLogits), argmax(got))
+		}
+		t.Logf("%s max logit diff %.6g", name, maxDiff)
+	}
+
+	session := newSession()
+	gpuLogits, err := session.Prefill(seq, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare("Q4_K chunked prefill", gpuLogits)
+
+	session = newSession()
+	if _, err := session.Prefill(seq[:8], false); err != nil {
+		t.Fatal(err)
+	}
+	gpuDecode, err := session.Decode(seq[8])
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare("Q4_K prefill plus decode", gpuDecode)
+}
+
 func TestTinyMoEAttentionPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiny-qwen3moe-zero.gguf")
 	if err := fixture.WriteTinyMoEZeroExperts(path); err != nil {

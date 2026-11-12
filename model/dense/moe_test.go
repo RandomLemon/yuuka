@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/yuuka-ai/yuuka/gguf"
+	"github.com/yuuka-ai/yuuka/tensor"
 	"github.com/yuuka-ai/yuuka/tests/fixture"
 	"github.com/yuuka-ai/yuuka/tokenizer"
 )
@@ -89,6 +90,49 @@ func TestExpertSlice(t *testing.T) {
 			if len(gate.Data) == 0 || len(next.Data) == 0 || &gate.Data[0] == &next.Data[0] {
 				t.Fatalf("expert %d and %d share storage", expert, expert+1)
 			}
+		}
+	}
+}
+
+func TestMoEQuantizedFixture(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny-qwen3moe-q4k.gguf")
+	if err := fixture.WriteTinyMoEQuantized(path); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := gguf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	model, err := Load(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Layers[0].GateExps.DType != tensor.Q4_K {
+		t.Fatalf("expert dtype %s, want Q4_K", model.Layers[0].GateExps.DType)
+	}
+	tok, err := tokenizer.NewFromGGUF(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := tok.Encode("Hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := NewState(model.Config, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logits, err := model.Forward(ids, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logits) != model.Config.VocabSize {
+		t.Fatalf("logit count %d, want %d", len(logits), model.Config.VocabSize)
+	}
+	for i, logit := range logits {
+		if math.IsNaN(float64(logit)) || math.IsInf(float64(logit), 0) {
+			t.Fatalf("logit %d is not finite: %v", i, logit)
 		}
 	}
 }
