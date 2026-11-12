@@ -152,6 +152,10 @@ func (l *loadedModel) cpuEngine(capacity int, sampler *engine.Sampler, format qw
 	if l.qwen != nil {
 		return engine.NewWithKVFormat(l.qwen, l.tokenizer, capacity, sampler, format)
 	}
+	if format != qwen35.KVF32 {
+		return nil, fmt.Errorf("--kv-type %s is not supported for architecture %q on the CPU backend; only f32 is implemented",
+			format, l.arch)
+	}
 	runtime, err := dense.NewRuntime(l.dense, capacity)
 	if err != nil {
 		return nil, err
@@ -275,11 +279,11 @@ func runGenerate(args []string) error {
 	topK := fs.Int("top-k", 40, "top-k sampling cutoff")
 	topP := fs.Float64("top-p", 0.95, "nucleus sampling cutoff")
 	seed := fs.Int64("seed", 0, "sampling seed")
-	kvType := fs.String("kv-type", "f32", "KV cache format: f32, f16, or q8_0")
+	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 and qwen3moe HIP: f32, f16, or q8_0")
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
-	npuOpt := fs.Bool("npu", false, "request NPU execution and fall back to the selected backend")
+	npuOpt := fs.Bool("npu", false, "probe NPU availability and fall back to the selected backend")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -379,11 +383,11 @@ func runBench(args []string) error {
 	warmup := fs.Int("warmup", 1, "warmup repetitions")
 	reps := fs.Int("reps", 3, "measured repetitions")
 	hash := fs.Bool("hash", false, "print the model SHA-256")
-	kvType := fs.String("kv-type", "f32", "KV cache format: f32, f16, or q8_0")
+	kvType := fs.String("kv-type", "f32", "KV cache format for qwen35 and qwen3moe HIP: f32, f16, or q8_0")
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
-	npuOpt := fs.Bool("npu", false, "request NPU execution and fall back to the selected backend")
+	npuOpt := fs.Bool("npu", false, "probe NPU availability and fall back to the selected backend")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
