@@ -42,7 +42,10 @@ The XDNA device node and the `amdxdna` kernel module are present, but no
 `xrt-smi`, `libxrt_core`, or XRT library directory was found. The toolchain
 prerequisite in section 6 is therefore unmet, and no NPU kernel, graph compiler,
 or subgraph partition is shipped. `--npu` records the probe result and falls back
-to the selected GPU backend; it never silently changes results.
+to the selected GPU backend; it never silently changes results. The Phase 5
+deliverable is therefore the capability probe and explicit fallback; NPU
+prefill/decode and subgraph execution are deferred until the activation criteria
+in section 6 are met.
 
 ## 3. Why it is deferred
 

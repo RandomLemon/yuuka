@@ -367,7 +367,9 @@ expert's assignment list:
 
 The routing and assignment buffers are sized `experts * rows * used`, which is
 safe because one row contributes exactly `used` assignments. A malformed plan
-that would exceed a bucket is rejected at plan construction.
+that would exceed a bucket is rejected at plan construction. The pipeline is
+validated with F32 and Q4_K synthetic fixtures; the Q4_K fixture covers chunked
+prefill and prefill-plus-decode against the CPU reference.
 
 ### 8.2 Speculative verification
 

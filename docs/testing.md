@@ -213,14 +213,14 @@ model output. A text-only comparison is insufficient.
 
 | Dimension | Values |
 | --- | --- |
-| Model | Qwen3.5-4B hybrid (primary), Qwen3 MoE fixture, Qwen3 Dense, Llama Dense, small fixtures |
+| Model | Qwen3.5-4B hybrid (primary), Qwen3 MoE F32/Q4_K fixtures, Qwen3 Dense, Llama Dense, small fixtures |
 | Quantization | F16, Q8_0, Q6_K, Q5_K, Q4_K, Q5_0, Q4_0 |
 | KV format | F32, F16, Q8_0 |
 | Context | short, medium, maximum supported |
 | Prompt language | English, Chinese, mixed |
 | Batch | 1, small batch, continuous batch |
 | Concurrency | 1, 2, 4 |
-| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding, grouped MoE experts, NPU probe fallback |
+| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding including partial-accept rollback, grouped MoE experts, NPU probe fallback |
 | Backends | CPU reference, HIP GPU, library fallback |
 
 ### 5.2 Performance matrix
@@ -378,7 +378,9 @@ YUUKA_TEST_MODEL=/path/to/model.gguf go test ./...
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
 reference, layer-by-layer hidden-state comparison, the paged HIP executor, KV
-formats, and speculative decoding against the plain greedy path.
+formats, and speculative decoding against the plain greedy path. Synthetic
+coverage includes F32 and Q4_K `qwen3moe` fixtures for chunked prefill and
+prefill-plus-decode, plus a scripted partial-accept speculative rollback test.
 HTTP API contract tests use the deterministic tiny fixture so they cover
 streaming, errors, stops, and cancellation independently of the optional model
 environment. SentencePiece golden IDs additionally accept

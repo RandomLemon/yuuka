@@ -202,8 +202,8 @@ Expert tensors are rank-3 `ffn_{gate,up,down}_exps` tensors with the GGUF layout
 adapter requires a scalar `expert_feed_forward_length` or a layer array whose
 entries are all equal; per-layer expert widths are rejected explicitly. Top-k routing
 and grouped expert kernels are shared by decode and chunked prefill. The HIP
-path is validated on a synthetic four-expert fixture because no standard
-`qwen3moe` GGUF is available on the target host. Other architectures in the
+path is validated on F32 and Q4_K synthetic four-expert fixtures because no
+standard `qwen3moe` GGUF is available on the target host. Other architectures in the
 table remain planned.
 
 ## 9. Quantization support by phase

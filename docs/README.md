@@ -15,8 +15,9 @@ treated as format and correctness references only.
 > an OpenAI-compatible SSE server with health, metrics, and pprof endpoints.
 > Phase 5 adds `qwen3moe` grouped expert execution, F16/Q8_0 KV formats, greedy
 > prompt-lookup speculative decoding, Q4_0/Q5_0 tensors, and an opt-in NPU
-> capability probe with explicit fallback. NPU execution itself is not enabled
-> because the target host has no XRT userspace runtime. See the implementation
+> capability probe with explicit fallback. NPU prefill/decode and subgraph
+> execution are deferred because the target host has no XRT userspace runtime;
+> the probe and fallback are the Phase 5 NPU evidence. See the implementation
 > status below, [hardware.md](hardware.md), and [benchmarks.md](benchmarks.md).
 
 ## Target configuration
@@ -134,9 +135,13 @@ Implemented and tested:
 - Paged KV with a block allocator, iteration-level continuous scheduling, a
   collision-safe prefix cache, opt-in HIP Graph replay, and an
   OpenAI-compatible server.
-- Opt-in F16 and Q8_0 KV formats with CPU and HIP write/attention kernels.
+- Opt-in F16 and Q8_0 KV formats with CPU and HIP write/attention kernels for
+  `qwen35` and `qwen3moe` HIP. Dense CPU runtimes implement F32 only and reject
+  other `--kv-type` values.
 - `qwen3moe` HIP execution with top-k routing, per-expert assignment buckets,
-  and grouped expert kernels that keep expert weights packed.
+  and grouped expert kernels that keep expert weights packed. The F32 and Q4_K
+  synthetic fixtures cover chunked prefill and prefill-plus-decode against the
+  CPU reference.
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.
 - An opt-in NPU capability probe (`yuuka npu-probe`, `--npu`) that reports
@@ -145,6 +150,9 @@ Implemented and tested:
 Not yet implemented:
 
 - HIP execution for dense Llama/Qwen3 (non-MoE) models.
+- Real-model `qwen3moe` validation; the HIP path is covered by F32 and Q4_K
+  synthetic fixtures because no standard `qwen3moe` GGUF is available on the
+  target host.
 - NPU execution kernels, graph compilation, and subgraph partitioning; the
   reference host lacks an XRT userspace runtime.
 - Quantization presets and architectures outside the tested set, including

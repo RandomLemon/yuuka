@@ -70,15 +70,16 @@ every block. This is not fused multi-request batching: aggregate decode
 throughput does not scale with concurrency because mixed-shape batched kernels
 are not implemented; requests are interleaved on one stream.
 
-Phase 5 features are implemented and opt-in: `qwen3moe` expert routing with
-grouped HIP expert kernels, F16 and Q8_0 KV cache formats, exact greedy
-prompt-lookup speculative decoding, Q4_0/Q5_0 tensor support, and an NPU
-capability probe with explicit GPU fallback. Each feature is covered by CPU
-reference tests and a measured result in [benchmarks.md](benchmarks.md). NPU
-execution itself remains disabled because the target host has the device and
-`amdxdna` driver but no XRT userspace runtime; `--npu` therefore records the
-capability result and falls back to the selected backend instead of claiming
-acceleration.
+Phase 5 executable features are implemented and opt-in: `qwen3moe` expert
+routing with grouped HIP expert kernels, F16 and Q8_0 KV cache formats, exact
+greedy prompt-lookup speculative decoding, and Q4_0/Q5_0 tensor support. Each
+executable feature is covered by CPU reference tests and a measured result in
+[benchmarks.md](benchmarks.md). Q4_K expert execution is covered by a synthetic
+quantized fixture as well as the F32 fixture. NPU execution is explicitly
+deferred, not claimed: the target host has the device and `amdxdna` driver but
+no XRT userspace runtime; the Phase 5 NPU evidence is the opt-in capability
+probe and GPU fallback. No NPU kernel, graph compiler, or subgraph partition is
+shipped, and the activation criteria in [npu.md](npu.md) are not met.
 
 ## 2. Phase overview
 
@@ -89,7 +90,7 @@ acceleration.
 | **2. Quantized decode** | Native low-bit decode | Q4_K/Q6_K/Q8_0 GEMV, fused unpack/scale, dispatch thresholds, profiling | Qwen3.5-4B Q4_K_M runs correctly; decode bottleneck is attributable to a kernel and memory behavior |
 | **3. High-performance prefill** | Fast prompt processing | WMMA quantized GEMM, Flash Attention, chunked prefill, key fusions, tuning tables | Performance curves at 128/512/2048/8192/32768 tokens and same-condition comparison with llama.cpp |
 | **4. Multi-request serving** | Concurrent, cache-aware service | Paged KV, iteration-level continuous scheduling, prefix cache, HIP Graph, SSE/OpenAI API, metrics | Reproducible latency and throughput; cancellation and reclamation are leak-free |
-| **5. Expansion** | Broader models and research | MoE/grouped GEMM, KV quantization, speculative decoding, NPU experiments, more architectures | Each feature is opt-in, measured, and does not regress the GPU-only path |
+| **5. Expansion** | Broader models and research | MoE/grouped GEMM, KV quantization, speculative decoding, NPU feasibility probe/fallback, more architectures | Each executable feature is opt-in, measured, and does not regress the GPU-only path; NPU execution remains deferred |
 
 ## 3. Phase 0 — Bootstrap and Hardware Validation
 
@@ -333,8 +334,10 @@ destabilizing the core GPU path.
 - MoE routing and grouped GEMM for Qwen3 MoE and similar models.
 - KV-cache quantization.
 - Speculative decoding experiments.
-- NPU prefill/decode and subgraph experiments under
-  [npu.md](npu.md).
+- NPU feasibility evaluation under [npu.md](npu.md): capability probe and
+  explicit fallback. NPU prefill/decode and subgraph execution are **deferred**
+  until the activation criteria in [npu.md](npu.md) are met; they are not part
+  of this phase's exit gate.
 - Additional GGUF architectures and quantization types driven by demand.
 
 ### Exit criteria
@@ -350,7 +353,9 @@ destabilizing the core GPU path.
 - [x] No feature regresses the accepted GPU-only path. Phase 5 features are
       additive or opt-in; F32 KV and plain decode remain the defaults.
 - [x] NPU paths are opt-in and fall back to the selected backend. The target host reports
-      `device_only`; the probe result and fallback are recorded below.
+      `device_only`; the probe result and fallback are recorded below. NPU
+      prefill/decode and subgraph execution are a deferred deliverable, not a
+      checked exit criterion.
 - [x] Documentation and benchmark metadata are updated.
 
 ### Implementation notes and limits
@@ -358,15 +363,20 @@ destabilizing the core GPU path.
 - `qwen3moe` is a CPU reference and HIP decode/prefill architecture. Routing
   selects the top-k experts deterministically, grouped HIP kernels bin
   assignments by expert, and the expert weights stay packed. The HIP path is
-  validated on synthetic GGUF fixtures because no standard `qwen3moe` model is
-  available on the target host.
+  validated on F32 and Q4_K synthetic GGUF fixtures because no standard
+  `qwen3moe` model is available on the target host. `TestTinyMoEQuantizedGPUMatchesCPU`
+  covers chunked prefill and prefill-plus-decode with Q4_K expert matrices;
+  real-model MoE validation remains open.
 - KV formats are F32 (default), F16, and Q8_0. Q8_0 stores one FP16 scale per
-  32-value group. Prefix-cache keys include the format. KV format does not
-  change decode latency measurably at 128 prompt / 32 decode tokens; its benefit
-  is cache memory.
+  32-value group. Prefix-cache keys include the format. The CPU `qwen35` runtime
+  and the `qwen3moe` HIP runtime implement all three; dense `llama`/`qwen3` CPU
+  runtimes implement F32 and reject other `--kv-type` values explicitly. KV
+  format does not change decode latency measurably at 128 prompt / 32 decode
+  tokens; its benefit is cache memory.
 - Speculative decoding is exact greedy prompt-lookup speculation. It is not
   available for non-greedy sampling or the MoE HIP runtime, and it is exposed
-  only through the CLI/bench path.
+  only through the CLI/bench path. `TestSpeculativePartialAcceptanceMatchesGreedy`
+  covers the partial-accept rollback and replay path.
 - Q4_0 and Q5_0 are supported by the GGUF reader, CPU reference, HIP GEMV,
   embedding, and WMMA GEMM. Q4_1/Q5_1/Q2_K/Q3_K/quantized K-cache remain
   unsupported.
@@ -490,9 +500,10 @@ items remain release gates.
       implemented single-request behavior; later-phase behavior remains
       documented as target design.
 
-Phase 5 exit criteria are met; the first release remains gated by the
-decode-length performance matrix. Prefill lengths are covered by the Phase 3
-curves, and Phase 4 serving evidence is recorded in this document and
-[benchmarks.md](benchmarks.md). NPU acceleration is not claimed because the
-target host lacks an XRT userspace runtime; the opt-in probe and GPU fallback are
-documented in [npu.md](npu.md).
+Phase 5 exit criteria are met for the executable scope; NPU prefill/decode and
+subgraph execution are a deferred deliverable, not an implementation claim. The
+first release remains gated by the decode-length performance matrix. Prefill
+lengths are covered by the Phase 3 curves, and Phase 4 serving evidence is
+recorded in this document and [benchmarks.md](benchmarks.md). NPU acceleration is
+not claimed because the target host lacks an XRT userspace runtime; the opt-in
+probe and GPU fallback are documented in [npu.md](npu.md).

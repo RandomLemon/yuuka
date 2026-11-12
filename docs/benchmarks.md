@@ -503,10 +503,11 @@ go build -tags hip -o /tmp/yuuka-serving-bench ./bench/serving
 
 Phase 5 measurements use the same model, device, ROCm/HIP version, greedy
 sampling, warmup, and repetition settings as the Phase 2/4 sections unless a
-row states otherwise. The KV-format and speculative runs use a 128-token prompt
-and 32 generated tokens. The MoE sweep uses synthetic Q4_K weights at
-Qwen3-30B-A3B-like single-layer shapes because no standard `qwen3moe` GGUF is
-available on the target host.
+row states otherwise. The KV-format runs use a 128-token prompt and 32 generated
+tokens. The speculative HIP rows use the same 128/32 protocol; the CPU rows in
+that table are a 16-prompt/8-decode negative control. The MoE sweep uses
+synthetic Q4_K weights at Qwen3-30B-A3B-like single-layer shapes because no
+standard `qwen3moe` GGUF is available on the target host.
 
 ### KV cache formats
 
@@ -533,20 +534,25 @@ maximum logit differences from F32 were `1.12e-3` (F16) and `4.53e-2` (Q8_0).
 ### Speculative decoding
 
 Exact greedy prompt-lookup speculation with `--speculative`, four draft tokens,
-and two-token minimum match, on the same 128-token repeated-prose prompt:
+and two-token minimum match. The HIP comparison uses the 128-token
+repeated-prose prompt; the CPU negative control uses 16 prompt tokens and 8
+generated tokens:
 
-| Path | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s | Acceptance |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| HIP plain greedy | 0.412 s | 0.412 s | 3.203 s | 9.68 | — |
-| HIP speculative | 0.429 s | 0.575 s | 1.024 s | 30.26 | 32/32 draft tokens |
-| CPU plain greedy | 7.328 s | 7.329 s | 3.637 s | 1.92 | — |
-| CPU speculative | 7.327 s | 9.996 s | 6.277 s | 1.12 | 0/10 draft tokens |
+| Path | Prompt/decode | Prefill p50 | TTFT p50 | Decode p50 | Decode tok/s | Acceptance |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| HIP plain greedy | 128/32 | 0.412 s | 0.412 s | 3.203 s | 9.68 | — |
+| HIP speculative | 128/32 | 0.429 s | 0.575 s | 1.024 s | 30.26 | 32/32 draft tokens |
+| CPU plain greedy | 16/8 | 7.328 s | 7.329 s | 3.637 s | 1.92 | — |
+| CPU speculative | 16/8 | 7.327 s | 9.996 s | 6.277 s | 1.12 | 0/10 draft tokens |
 
 The generated token sequence is identical to the plain greedy path. TTFT rises
 because the first step drafts and verifies a block before emitting its first
 token. The measured decode speedup is about 3.1x; repeated runs ranged from 30.3
 to 31.2 tok/s. On a 24-token real-model test the same settings produced 2.333 s
 baseline decode versus 0.719 s speculative decode with identical tokens.
+`TestSpeculativePartialAcceptanceMatchesGreedy` additionally forces a block
+with one accepted and one rejected draft through a scripted runtime and checks
+the rollback/replay result against plain greedy tokens.
 
 The CPU reference path is not a speculative target. On the same model with a
 16-token prompt and 8 generated tokens, plain CPU decode was 3.637 s (1.92
@@ -576,9 +582,13 @@ total is the steady-state wall time including the plan submission.
 
 These are kernel-pipeline numbers, not end-to-end model throughput. Routing and
 reduction are negligible; gate/up and down are limited by packed-weight reads.
-The CPU reference and HIP pipeline agree within `3.9e-5` maximum logit
-difference on the synthetic fixture, and the native MoE test agrees within
-`8.7e-9` on its direct kernel comparison.
+The F32 synthetic fixture CPU reference and HIP pipeline agree within `3.9e-5`
+maximum logit difference, and the native F32 MoE test agrees within `8.7e-9` on
+its direct kernel comparison. The Q4_K synthetic fixture test
+`TestTinyMoEQuantizedGPUMatchesCPU` compares chunked prefill and
+prefill-plus-decode against the CPU decoder; the observed maximum logit
+difference is `1.19e-6`. No standard `qwen3moe` GGUF is available on the target
+host, so real-model MoE validation remains open.
 
 ### Q4_0 and Q5_0 GEMV
 
@@ -589,9 +599,10 @@ difference on the synthetic fixture, and the native MoE test agrees within
 | Q4_0 | 0.060 | 0.093 | 0.240 | 0.409 | 3.5 |
 | Q5_0 | 0.102 | 0.092 | 0.263 | 0.433 | 4.3 |
 
-Batched GEMV wins from batch 4 for Q4_0 and from batch 1 for Q5_0 in this sweep.
-The tensor, GEMV, embedding, and WMMA paths pass randomized and non-aligned
-shape tests.
+Batched GEMV wins from batch 4 for Q4_0. The Q5_0 batch-1 difference was within
+run-to-run noise in repeated sweeps; the dispatch table uses batch 4 for both
+Q4_0 and Q5_0. The tensor, GEMV, embedding, and WMMA paths pass randomized and
+non-aligned shape tests.
 
 ### NPU capability result
 
@@ -606,8 +617,10 @@ reason: device and amdxdna driver are present, but no XRT userspace runtime was 
 fallback: selected backend
 ```
 
-No NPU prefill, decode, or subgraph execution result is claimed. The opt-in
-`--npu` flag records the probe and falls back to the selected backend.
+No NPU prefill, decode, or subgraph execution result is claimed. NPU execution
+is a deferred deliverable because the activation criteria in
+[npu.md](npu.md) are not met. The opt-in `--npu` flag records the probe and
+falls back to the selected backend.
 
 ### Phase 5 reproduction
 
@@ -623,6 +636,8 @@ go run -tags hip ./cmd/yuuka bench --model "$YUUKA_TEST_MODEL" --backend hip \
 
 ./build/yuuka_gemv_sweep
 ./build/yuuka_moe_sweep
+go test ./engine -run TestSpeculativePartialAcceptanceMatchesGreedy -v
+go test -tags hip ./engine/gpu -run TestTinyMoEQuantizedGPUMatchesCPU -v
 YUUKA_TEST_MODEL="$YUUKA_TEST_MODEL" go test -tags hip ./engine/gpu/... \
   -run 'TestGPURealModelKVFormats|TestGPURealModelSpeculativeMatchesGreedy' -v
 ```

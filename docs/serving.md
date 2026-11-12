@@ -194,8 +194,10 @@ Requirements and current behavior:
 ### 7.1 Configuration
 
 - F32 keys and values by default. `--kv-type f16` and `--kv-type q8_0` select
-  opt-in F16 and Q8_0 pools. The prefix-cache model key includes the format, and
-  the F32 path remains the numerical baseline.
+  opt-in F16 and Q8_0 pools for the `qwen35` CPU backend and the `qwen3moe` HIP
+  backend. Dense CPU runtimes implement F32 only and reject other values
+  explicitly. The prefix-cache model key includes the format, and the F32 path
+  remains the numerical baseline.
 - Configurable block size; the server and benchmark default to 16 tokens.
 - One allocator per model with a fixed block count derived from context and
   concurrency, or set explicitly with `--kv-blocks`.
@@ -290,7 +292,8 @@ shapes where host launch overhead is measured to matter.
 
 The CLI supports loading a GGUF model, interactive generation, inspection,
 benchmark, and NPU-probe modes. `yuuka run` and `yuuka bench` accept
-`--kv-type f32|f16|q8_0`, `--speculative`, `--spec-max-draft`, and
+`--kv-type f32|f16|q8_0` for `qwen35` and `qwen3moe` HIP; dense CPU paths reject
+`f16`/`q8_0`. They also accept `--speculative`, `--spec-max-draft`, and
 `--spec-min-match`. `--npu` records the NPU capability result and falls back to
 the selected backend. Serving uses `yuuka-server`, which also accepts
 `--kv-type` and `--npu`.
