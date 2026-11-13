@@ -137,18 +137,18 @@ For the prompt `The capital of France is`:
 
 - CPU and HIP greedy tokens are identical for the first six generated tokens:
   `[11751, 13, 198, 32, 13, 2912]`.
-- The decode-path maximum absolute logit difference at the first generated
-  position is `4.58e-5`. Phase 3 routes multi-token prompts through chunked
-  prefill; the same prompt in that path differs from the CPU reference by
-  `3.65e-3` in the worst logit and selects the same top-1 token. Both numbers
-  are observations under the current kernels, not enforced tolerances except
-  for the loose `5.0` logit guard in the GPU/CPU test.
-- The checked-in GPU test compares final logits and greedy tokens with the CPU
-  reference. The checked-in `TestGPULayerTraceMatchesCPU` compares every layer's
-  hidden state for the same prompt; the worst recorded layer difference is
-  `5.53e-5`. The logit test enforces the greedy token sequence and a loose `5.0`
-  maximum absolute logit guard; `4.58e-5` is the observed first-step difference,
-  not the enforced threshold.
+- A direct sequential `Step` run of the decode graph gives a first-step maximum
+  absolute logit difference of `4.58e-5`; `TestGPUDecodePathMatchesCPU` covers
+  that path. Phase 3 routes multi-token prompts through chunked prefill; the
+  same prompt in that path differs from the CPU reference by `3.65e-3` in the
+  worst logit and selects the same top-1 token. Both numbers are observations
+  under the current kernels; the chunked-path test enforces a loose `5.0` logit
+  guard, and the decode-path test enforces `1e-3`.
+- The checked-in `TestGPUMatchesCPU` compares chunked-prefill final logits and
+  greedy tokens with the CPU reference and reports `3.65e-3` for the same
+  prompt, not `4.58e-5`. The checked-in `TestGPULayerTraceMatchesCPU` compares
+  every layer's hidden state for the same prompt; the worst recorded layer
+  difference is `5.53e-5`.
 - Golden CPU token tests also cover `1+1=` and `Once upon a time`.
 
 ## Phase 3 prefill

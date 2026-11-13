@@ -124,9 +124,10 @@ Implemented and tested:
   event profile path, and per-quantization/per-batch decode baselines.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
   match. The decode path's recorded first-step maximum absolute logit
-  difference is `4.58e-5`; the chunked prefill path reports `3.65e-3` on the
-  same prompt with the same top-1 token. The checked-in tests enforce the token
-  sequence, a loose logit bound, and a layer-by-layer hidden-state comparison;
+  difference is `4.58e-5` (`TestGPUDecodePathMatchesCPU`); the chunked prefill
+  path reports `3.65e-3` on the same prompt with the same top-1 token. The
+  checked-in tests enforce the token sequence, a loose logit bound, and a
+  layer-by-layer hidden-state comparison;
   the worst recorded first-prompt layer difference is `5.53e-5`. Chunked
   prefill at 1024 tokens produced bitwise identical logits in the recorded run
   across chunk sizes 128, 512, and 1024; the checked-in test enforces the same

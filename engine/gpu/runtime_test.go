@@ -110,6 +110,45 @@ func TestGPUMatchesCPU(t *testing.T) {
 	}
 }
 
+// TestGPUDecodePathMatchesCPU exercises the single-token decode graph for every
+// prompt token instead of the chunked prefill path used by TestGPUMatchesCPU.
+// This is the path behind the recorded 4.58e-5 first-step logit difference.
+func TestGPUDecodePathMatchesCPU(t *testing.T) {
+	reader, _, model, prompt := goldenPrompt(t)
+	rt, err := New(reader, model, 64)
+	if err != nil {
+		t.Skipf("HIP runtime unavailable: %v", err)
+	}
+	defer rt.Close()
+	cpuState, err := qwen35.NewState(model.Config, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.Reset()
+	var cpuLogits, gpuLogits []float32
+	for _, token := range prompt {
+		cpuLogits, err = model.Step(token, cpuState)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gpuLogits, err = rt.Step(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	maxDiff := 0.0
+	for i := range cpuLogits {
+		maxDiff = math.Max(maxDiff, math.Abs(float64(cpuLogits[i]-gpuLogits[i])))
+	}
+	if maxDiff > 1e-3 {
+		t.Fatalf("decode-path logits differ by %.6g", maxDiff)
+	}
+	if argmax(cpuLogits) != argmax(gpuLogits) {
+		t.Fatalf("decode-path top-1 differs: cpu=%d gpu=%d", argmax(cpuLogits), argmax(gpuLogits))
+	}
+	t.Logf("decode-path first-step max logit diff %.6g", maxDiff)
+}
+
 func TestGPUReset(t *testing.T) {
 	reader, _, model, prompt := goldenPrompt(t)
 	rt, err := New(reader, model, 32)
