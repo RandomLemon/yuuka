@@ -396,8 +396,14 @@ type chatRequest struct {
 type stopSequences []string
 
 func (s *stopSequences) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "null" {
+		return fmt.Errorf("stop must be a string or array of strings")
+	}
 	var single string
 	if err := json.Unmarshal(data, &single); err == nil {
+		if single == "" {
+			return fmt.Errorf("stop strings must not be empty")
+		}
 		*s = []string{single}
 		return nil
 	}
@@ -405,11 +411,19 @@ func (s *stopSequences) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &many); err != nil {
 		return fmt.Errorf("stop must be a string or array of strings")
 	}
+	for _, stop := range many {
+		if stop == "" {
+			return fmt.Errorf("stop strings must not be empty")
+		}
+	}
 	*s = many
 	return nil
 }
 
 func (m chatMessage) text() (string, error) {
+	if strings.TrimSpace(string(m.Content)) == "null" {
+		return "", fmt.Errorf("message content must be a string or text parts")
+	}
 	var single string
 	if err := json.Unmarshal(m.Content, &single); err == nil {
 		return single, nil
@@ -443,11 +457,24 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("chatcmpl-%d", s.requestSeq.Add(1))
 	w.Header().Set("X-Request-ID", id)
 
+	if r.ContentLength > int64(maxRequestBody) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body exceeds %d bytes", maxRequestBody), id)
+		return
+	}
 	var req chatRequest
-	decoder := json.NewDecoder(io.LimitReader(r.Body, maxRequestBody))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, int64(maxRequestBody)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), id)
+		writeDecodeError(w, id, err)
+		return
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		writeDecodeError(w, id, err)
 		return
 	}
 	if req.Model != "" && req.Model != s.modelName {
@@ -661,6 +688,16 @@ func logRequest(id string, promptTokens, outputTokens int, err error, result *se
 		result.PrefixCacheHit)
 }
 
+func writeDecodeError(w http.ResponseWriter, id string, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body exceeds %d bytes", maxRequestBody), id)
+		return
+	}
+	writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), id)
+}
+
 func validateOptionalParameters(req *chatRequest) error {
 	if req.N != nil && *req.N != 1 {
 		return fmt.Errorf("n=%d is not supported; only n=1 is available", *req.N)
@@ -740,26 +777,24 @@ func writeChunk(w io.Writer, id string, created int64, model string, delta map[s
 	fmt.Fprintf(w, "data: %s\n\n", data)
 }
 
-func writeSSEError(w io.Writer, id, code, message string, status int) {
-	payload := map[string]any{"error": map[string]any{
-		"message":    message,
-		"type":       code,
-		"code":       code,
-		"request_id": id,
-		"status":     status,
-	}}
-	data, _ := json.Marshal(payload)
-	fmt.Fprintf(w, "data: %s\n\n", data)
-}
-
-func writeError(w http.ResponseWriter, status int, code, message, id string) {
-	writeJSON(w, status, map[string]any{"error": map[string]any{
+func errorPayload(code, message, id string, status int) map[string]any {
+	return map[string]any{
 		"message":    message,
 		"type":       code,
 		"code":       code,
 		"request_id": id,
 		"retryable":  status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable,
-	}})
+	}
+}
+
+func writeSSEError(w io.Writer, id, code, message string, status int) {
+	payload := map[string]any{"error": errorPayload(code, message, id, status)}
+	data, _ := json.Marshal(payload)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+func writeError(w http.ResponseWriter, status int, code, message, id string) {
+	writeJSON(w, status, map[string]any{"error": errorPayload(code, message, id, status)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

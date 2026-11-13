@@ -283,8 +283,9 @@ The server admits concurrent requests through the continuous scheduler. It
 supports `temperature`, `top_p`, `top_k`, `seed`, `stop` (string or array),
 `stop_token_ids`, `max_tokens`, `max_completion_tokens`, `stream`, and
 `enable_thinking`. Unknown parameters and unsupported OpenAI features
-(`n != 1`, logprobs, penalties, tools, response formats, stream options) are
-rejected explicitly. A full queue returns HTTP `429` with `Retry-After`.
+(`n != 1`, `logprobs: true`, nonzero penalties, tools, response formats, stream
+options) are rejected explicitly. `logprobs: false` is accepted because it
+requests no logprobs. A full queue returns HTTP `429` with `Retry-After`.
 
 HIP Graph replay is opt-in with `--graph`; the measured decode difference on the
 validated model was within noise, so the plain stream path is the default.

@@ -143,8 +143,11 @@ Implementation policy:
 | `--graph` | false | Enable HIP Graph capture/replay with fallback |
 | `--model-key` | file SHA-256 | Override the prefix-cache model identity |
 
-The HTTP request body limit is 8 MiB. Effective limits are reported in the
-`limits` object of `/healthz` and as `yuuka_max_concurrency`, `yuuka_max_queue`,
+The HTTP request body limit is 8 MiB; larger bodies return HTTP 413 with
+`request_too_large`. The decoder accepts exactly one JSON value, so trailing
+data after the request object is rejected with `invalid_request`. Effective
+limits are reported in the `limits` object of `/healthz` and as
+`yuuka_max_concurrency`, `yuuka_max_queue`,
 `yuuka_max_batch`, `yuuka_prefill_chunk`, `yuuka_prefill_per_cycle`,
 `yuuka_decode_per_cycle`, `yuuka_request_timeout_seconds`,
 `yuuka_queue_timeout_seconds`, `yuuka_prefix_max_entries`, and
@@ -304,8 +307,9 @@ shapes where host launch overhead is measured to matter.
 
 ### 9.1 CLI
 
-The CLI supports loading a GGUF model, interactive generation, inspection,
-benchmark, and a diagnostic NPU-probe mode. `yuuka run` and `yuuka bench` accept
+The CLI supports loading a GGUF model, single-prompt generation (including
+stdin input), inspection, benchmark, and a diagnostic NPU-probe mode.
+`yuuka run` and `yuuka bench` accept
 `--kv-type f32|f16|q8_0` for `qwen35` and `qwen3moe` HIP; dense CPU paths reject
 `f16`/`q8_0`. They also accept `--speculative`, `--spec-max-draft`, and
 `--spec-min-match`. `--npu` records the NPU capability result and falls back to
@@ -328,8 +332,10 @@ Supported chat parameters: `model`, string or text-part `messages`,
 `max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`,
 `stream`, `stop` (string or array), `stop_token_ids`, `enable_thinking`,
 `chat_template_kwargs.enable_thinking`, and `user` (ignored). Unknown JSON
-fields are rejected. `n != 1`, nonzero penalties, logprobs, `response_format`,
-`tools`, and `stream_options` are rejected explicitly rather than ignored.
+fields are rejected. `n != 1`, nonzero penalties, `logprobs: true`,
+`response_format`, `tools`, and `stream_options` are rejected explicitly rather
+than ignored. `logprobs: false` is accepted because it requests no logprobs.
+`stop: null` and empty stop strings are rejected.
 
 Streaming uses server-sent events with an initial assistant role chunk,
 incremental content deltas, a terminal chunk with `finish_reason`, and
@@ -344,8 +350,9 @@ followed by `[DONE]`.
 
 | Code | Status | Meaning |
 | --- | --- | --- |
-| `invalid_request` | 400 | Malformed JSON, empty messages, invalid content |
+| `invalid_request` | 400 | Malformed JSON, trailing data, empty messages, invalid content, or rejected chat rendering |
 | `unsupported_parameter` | 400 | A known OpenAI parameter outside the supported subset |
+| `request_too_large` | 413 | Request body exceeds the 8 MiB limit |
 | `context_length_exceeded` | 400 | Prompt alone exceeds the configured context |
 | `model_not_found` | 404 | Requested model identifier is not loaded |
 | `method_not_allowed` | 405 | An endpoint was called with the wrong HTTP method |
@@ -354,7 +361,7 @@ followed by `[DONE]`.
 | `request_timeout` | 504 | Request deadline expired |
 | `client_closed` | 499 | Client cancelled the request |
 | `generation_error` | 500 | Model, device, or streaming failure |
-| `tokenizer_error` | 500 | Tokenization or chat rendering failed after admission |
+| `tokenizer_error` | 500 | Tokenization failed while preparing the prompt; rejected chat rendering uses `invalid_request` |
 
 ## 10. Observability
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -125,7 +126,7 @@ func TestChatCompletions(t *testing.T) {
 	httpServer := httptest.NewServer(testMux(s))
 	defer httpServer.Close()
 
-	body := `{"model":"yuuka","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":4,"temperature":0,"enable_thinking":false}`
+	body := `{"model":"yuuka","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":4,"temperature":0,"enable_thinking":false,"logprobs":false}`
 	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json", bytes.NewBufferString(body))
 	if err != nil {
 		t.Fatal(err)
@@ -289,6 +290,10 @@ func TestServerRejectsUnsupportedAndBadRequests(t *testing.T) {
 	}{
 		{"empty messages", `{"messages":[]}`, http.StatusBadRequest, "invalid_request"},
 		{"unknown field", `{"messages":[{"role":"user","content":"hi"}],"banana":1}`, http.StatusBadRequest, "invalid_request"},
+		{"null content", `{"messages":[{"role":"user","content":null}]}`, http.StatusBadRequest, "invalid_request"},
+		{"null stop", `{"messages":[{"role":"user","content":"hi"}],"stop":null}`, http.StatusBadRequest, "invalid_request"},
+		{"empty stop", `{"messages":[{"role":"user","content":"hi"}],"stop":""}`, http.StatusBadRequest, "invalid_request"},
+		{"trailing json", `{"messages":[{"role":"user","content":"hi"}]} {}`, http.StatusBadRequest, "invalid_request"},
 		{"multiple choices", `{"messages":[{"role":"user","content":"hi"}],"n":2}`, http.StatusBadRequest, "unsupported_parameter"},
 		{"tools", `{"messages":[{"role":"user","content":"hi"}],"tools":[{}]}`, http.StatusBadRequest, "unsupported_parameter"},
 		{"bad model", `{"model":"other","messages":[{"role":"user","content":"hi"}]}`, http.StatusNotFound, "model_not_found"},
@@ -313,6 +318,63 @@ func TestServerRejectsUnsupportedAndBadRequests(t *testing.T) {
 		if payload.Error.RequestID == "" {
 			t.Fatalf("%s: missing request id", tc.name)
 		}
+	}
+}
+
+func TestServerRejectsOversizedBody(t *testing.T) {
+	s := newTestServer(t)
+	httpServer := httptest.NewServer(testMux(s))
+	defer httpServer.Close()
+
+	body := `{"messages":[{"role":"user","content":"hi"}],"max_tokens":1}` +
+		strings.Repeat(" ", maxRequestBody)
+	response, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.NewDecoder(response.Body).Decode(&payload)
+	if response.StatusCode != http.StatusRequestEntityTooLarge || payload.Error.Code != "request_too_large" {
+		t.Fatalf("status %d code %q", response.StatusCode, payload.Error.Code)
+	}
+}
+
+func TestSSEErrorPayloadMatchesHTTPError(t *testing.T) {
+	const (
+		id      = "chatcmpl-test"
+		code    = "insufficient_capacity"
+		message = "capacity exhausted"
+		status  = http.StatusServiceUnavailable
+	)
+	var sse bytes.Buffer
+	writeSSEError(&sse, id, code, message, status)
+	wire := strings.TrimSpace(strings.TrimPrefix(sse.String(), "data: "))
+	var ssePayload struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(wire), &ssePayload); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	writeError(recorder, status, code, message, id)
+	var httpPayload struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&httpPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ssePayload.Error, httpPayload.Error) {
+		t.Fatalf("SSE error %v, HTTP error %v", ssePayload.Error, httpPayload.Error)
+	}
+	if ssePayload.Error["retryable"] != true {
+		t.Fatalf("retryable = %v, want true", ssePayload.Error["retryable"])
 	}
 }
 
