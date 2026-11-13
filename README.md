@@ -190,7 +190,7 @@ When `--prompt` is empty, the prompt is read from standard input.
 | `--speculative` | `false` | Exact greedy prompt-lookup speculation |
 | `--spec-max-draft` | `4` | Maximum speculative draft tokens |
 | `--spec-min-match` | `2` | Minimum prompt-lookup suffix length |
-| `--npu` | `false` | Probe NPU availability and fall back to the selected backend |
+| `--npu` | `false` | Diagnostic NPU probe; falls back to the selected backend. NPU execution is a future task |
 
 Generation stops on EOS, on the token limit, or on interrupt/SIGTERM. Prefill,
 TTFT, decode throughput, and the finish reason are written to standard error so
@@ -347,9 +347,10 @@ skip with exit code 77 when the requested HIP device is unavailable.
   draft model, and is not wired into the MoE HIP runtime or the server. The MoE
   HIP runtime uses a default 512-token prefill chunk; `--chunk-size` currently
   applies to `qwen35` only.
-- The NPU probe finds `/dev/accel/accel0` and the `amdxdna` module on the
+- NPU support is a future task, not a Phase 5 or first-release requirement. The
+  diagnostic probe finds `/dev/accel/accel0` and the `amdxdna` module on the
   reference host but no XRT userspace runtime. `--npu` records this and falls
-  back to the GPU; no NPU execution is claimed.
+  back to the GPU; no NPU execution is implemented or claimed.
 - The validated HIP environment is Linux, ROCm 10.1 layout / HIP 7.16, and
   `gfx1151`. Other devices and toolchain versions are unverified.
 

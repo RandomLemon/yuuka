@@ -283,7 +283,7 @@ func runGenerate(args []string) error {
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
-	npuOpt := fs.Bool("npu", false, "probe NPU availability and fall back to the selected backend")
+	npuOpt := fs.Bool("npu", false, "diagnostic NPU probe; fall back to the selected backend")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -387,7 +387,7 @@ func runBench(args []string) error {
 	speculative := fs.Bool("speculative", false, "enable greedy prompt-lookup speculative decoding")
 	specDraft := fs.Int("spec-max-draft", 4, "maximum speculative draft tokens")
 	specMin := fs.Int("spec-min-match", 2, "minimum prompt-lookup suffix length")
-	npuOpt := fs.Bool("npu", false, "probe NPU availability and fall back to the selected backend")
+	npuOpt := fs.Bool("npu", false, "diagnostic NPU probe; fall back to the selected backend")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

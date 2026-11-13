@@ -291,12 +291,12 @@ shapes where host launch overhead is measured to matter.
 ### 9.1 CLI
 
 The CLI supports loading a GGUF model, interactive generation, inspection,
-benchmark, and NPU-probe modes. `yuuka run` and `yuuka bench` accept
+benchmark, and a diagnostic NPU-probe mode. `yuuka run` and `yuuka bench` accept
 `--kv-type f32|f16|q8_0` for `qwen35` and `qwen3moe` HIP; dense CPU paths reject
 `f16`/`q8_0`. They also accept `--speculative`, `--spec-max-draft`, and
 `--spec-min-match`. `--npu` records the NPU capability result and falls back to
-the selected backend. Serving uses `yuuka-server`, which also accepts
-`--kv-type` and `--npu`.
+the selected backend; it is diagnostic only, and NPU support is a future task.
+Serving uses `yuuka-server`, which also accepts `--kv-type` and `--npu`.
 
 ### 9.2 HTTP
 

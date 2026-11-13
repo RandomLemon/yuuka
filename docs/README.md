@@ -14,11 +14,11 @@ treated as format and correctness references only.
 > paged KV and prefix cache, opt-in HIP Graph replay with fallback, a CLI, and
 > an OpenAI-compatible SSE server with health, metrics, and pprof endpoints.
 > Phase 5 adds `qwen3moe` grouped expert execution, F16/Q8_0 KV formats, greedy
-> prompt-lookup speculative decoding, Q4_0/Q5_0 tensors, and an opt-in NPU
-> capability probe with explicit fallback. NPU prefill/decode and subgraph
-> execution are deferred because the target host has no XRT userspace runtime;
-> the probe and fallback are the Phase 5 NPU evidence. See the implementation
-> status below, [hardware.md](hardware.md), and [benchmarks.md](benchmarks.md).
+> prompt-lookup speculative decoding, and Q4_0/Q5_0 tensors. NPU support is a
+> future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
+> and does not execute model operations. See the implementation status below,
+> [npu.md](npu.md), [hardware.md](hardware.md), and
+> [benchmarks.md](benchmarks.md).
 
 ## Target configuration
 
@@ -83,7 +83,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [kernels.md](kernels.md) | Prefill/decode kernel design, quantized GEMV/GEMM, attention, fusion, dispatch and tuning | Kernel contributors |
 | [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |
 | [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, reporting, regression gates | All contributors |
-| [npu.md](npu.md) | Deferred XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
+| [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
@@ -144,8 +144,9 @@ Implemented and tested:
   CPU reference.
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.
-- An opt-in NPU capability probe (`yuuka npu-probe`, `--npu`) that reports
+- A diagnostic NPU capability probe (`yuuka npu-probe`, `--npu`) that reports
   `device_only` on the reference host and falls back to the selected backend.
+  It does not execute model operations; NPU support is a future task.
 
 Not yet implemented:
 
@@ -153,8 +154,9 @@ Not yet implemented:
 - Real-model `qwen3moe` validation; the HIP path is covered by F32 and Q4_K
   synthetic fixtures because no standard `qwen3moe` GGUF is available on the
   target host.
-- NPU execution kernels, graph compilation, and subgraph partitioning; the
-  reference host lacks an XRT userspace runtime.
+- NPU execution kernels, graph compilation, and subgraph partitioning. NPU
+  support is a future task; the reference host also lacks an XRT userspace
+  runtime.
 - Quantization presets and architectures outside the tested set, including
   Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, and the IQ families.
 - Speculative decoding for non-greedy sampling or the MoE HIP runtime.

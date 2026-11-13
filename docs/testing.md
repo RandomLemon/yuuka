@@ -220,8 +220,11 @@ model output. A text-only comparison is insufficient.
 | Prompt language | English, Chinese, mixed |
 | Batch | 1, small batch, continuous batch |
 | Concurrency | 1, 2, 4 |
-| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding including partial-accept rollback, grouped MoE experts, NPU probe fallback |
+| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding including partial-accept rollback, grouped MoE experts |
 | Backends | CPU reference, HIP GPU, library fallback |
+
+NPU support is a future task and is not part of Phase 5 acceptance. The
+`npu-probe` command remains a diagnostic check only.
 
 ### 5.2 Performance matrix
 
@@ -395,7 +398,7 @@ explicitly:
 ./build/yuuka_hardware_probe
 ./build/yuuka_gemv_sweep
 ./build/yuuka_moe_sweep
-go run ./cmd/yuuka npu-probe
+go run ./cmd/yuuka npu-probe  # diagnostic only; NPU support is a future task
 scripts/thermal_probe.sh 15 ./build/yuuka_hardware_probe
 /tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 16 --decode-tokens 16
 /tmp/yuuka-hip bench --model model.gguf --backend hip --prompt-tokens 128 \

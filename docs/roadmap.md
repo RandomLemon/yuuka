@@ -13,7 +13,7 @@ The sequence is deliberate:
 2. Optimize the decode hot path with native quantized GEMV.
 3. Optimize prefill with WMMA and Flash Attention.
 4. Add concurrent serving, paged KV, and graph replay.
-5. Expand architecture, quantization, and NPU coverage.
+5. Expand architecture and quantization coverage.
 
 Each phase has an evidence-based exit gate. A phase is not complete because code
 has merged; it is complete when its acceptance results are reproducible under
@@ -75,11 +75,11 @@ routing with grouped HIP expert kernels, F16 and Q8_0 KV cache formats, exact
 greedy prompt-lookup speculative decoding, and Q4_0/Q5_0 tensor support. Each
 executable feature is covered by CPU reference tests and a measured result in
 [benchmarks.md](benchmarks.md). Q4_K expert execution is covered by a synthetic
-quantized fixture as well as the F32 fixture. NPU execution is explicitly
-deferred, not claimed: the target host has the device and `amdxdna` driver but
-no XRT userspace runtime; the Phase 5 NPU evidence is the opt-in capability
-probe and GPU fallback. No NPU kernel, graph compiler, or subgraph partition is
-shipped, and the activation criteria in [npu.md](npu.md) are not met.
+quantized fixture as well as the F32 fixture. NPU support is a future task, not
+part of Phase 5 or the first release. The existing `backend/npu` probe and
+`--npu` flag are diagnostic only: they report device, driver, and runtime
+availability and fall back to the selected backend, but they do not execute
+model operations. See [npu.md](npu.md) and the future-task section below.
 
 ## 2. Phase overview
 
@@ -90,7 +90,7 @@ shipped, and the activation criteria in [npu.md](npu.md) are not met.
 | **2. Quantized decode** | Native low-bit decode | Q4_K/Q6_K/Q8_0 GEMV, fused unpack/scale, dispatch thresholds, profiling | Qwen3.5-4B Q4_K_M runs correctly; decode bottleneck is attributable to a kernel and memory behavior |
 | **3. High-performance prefill** | Fast prompt processing | WMMA quantized GEMM, Flash Attention, chunked prefill, key fusions, tuning tables | Performance curves at 128/512/2048/8192/32768 tokens and same-condition comparison with llama.cpp |
 | **4. Multi-request serving** | Concurrent, cache-aware service | Paged KV, iteration-level continuous scheduling, prefix cache, HIP Graph, SSE/OpenAI API, metrics | Reproducible latency and throughput; cancellation and reclamation are leak-free |
-| **5. Expansion** | Broader models and research | MoE/grouped GEMM, KV quantization, speculative decoding, NPU feasibility probe/fallback, more architectures | Each executable feature is opt-in, measured, and does not regress the GPU-only path; NPU execution remains deferred |
+| **5. Expansion** | Broader models and research | MoE/grouped GEMM, KV quantization, speculative decoding, more architectures | Each executable feature is opt-in, measured, and does not regress the GPU-only path |
 
 ## 3. Phase 0 — Bootstrap and Hardware Validation
 
@@ -334,28 +334,22 @@ destabilizing the core GPU path.
 - MoE routing and grouped GEMM for Qwen3 MoE and similar models.
 - KV-cache quantization.
 - Speculative decoding experiments.
-- NPU feasibility evaluation under [npu.md](npu.md): capability probe and
-  explicit fallback. NPU prefill/decode and subgraph execution are **deferred**
-  until the activation criteria in [npu.md](npu.md) are met; they are not part
-  of this phase's exit gate.
 - Additional GGUF architectures and quantization types driven by demand.
+
+NPU support is a future task and is intentionally not part of Phase 5; see
+[section 15](#15-future-tasks-not-scheduled).
 
 ### Exit criteria
 
 - [x] Each feature is behind a capability check or explicit flag.
       KV format is selected by `--kv-type`, speculative decoding by
-      `--speculative`, NPU by `--npu`, and MoE/quantization support by GGUF
-      architecture and dtype capability checks.
+      `--speculative`, and MoE/quantization support by GGUF architecture and
+      dtype capability checks.
 - [x] Each executable feature has correctness evidence against the CPU
       reference and a measured performance result. See the Phase 5 section of
-      [benchmarks.md](benchmarks.md). NPU execution is not claimed: the probe
-      result and fallback are the Phase 5 NPU evidence.
+      [benchmarks.md](benchmarks.md).
 - [x] No feature regresses the accepted GPU-only path. Phase 5 features are
       additive or opt-in; F32 KV and plain decode remain the defaults.
-- [x] NPU paths are opt-in and fall back to the selected backend. The target host reports
-      `device_only`; the probe result and fallback are recorded below. NPU
-      prefill/decode and subgraph execution are a deferred deliverable, not a
-      checked exit criterion.
 - [x] Documentation and benchmark metadata are updated.
 
 ### Implementation notes and limits
@@ -380,17 +374,12 @@ destabilizing the core GPU path.
 - Q4_0 and Q5_0 are supported by the GGUF reader, CPU reference, HIP GEMV,
   embedding, and WMMA GEMM. Q4_1/Q5_1/Q2_K/Q3_K/quantized K-cache remain
   unsupported.
-- NPU: the probe found `/dev/accel/accel0` and the `amdxdna` module but no XRT
-  userspace runtime. No NPU kernel, graph compiler, or subgraph partition is
-  shipped; `--npu` records this result and falls back to the selected GPU
-  backend. Activation criteria in [npu.md](npu.md) are not met.
 
 ### Risks and dependencies
 
 - Scope can expand faster than correctness coverage.
 - MoE and MLA introduce new memory layouts and routing kernels.
 - Speculative decoding changes sampling semantics and needs careful validation.
-- NPU toolchain maturity and memory cost may make acceleration impractical.
 
 ## 9. Milestones and definition of done
 
@@ -439,7 +428,7 @@ Paged KV + continuous batching
         |
 Graph replay + API hardening
         |
-Architecture and NPU expansion
+Architecture expansion
 ```
 
 Critical risks early in the path:
@@ -467,7 +456,7 @@ not declare completion or depend on unverified results from an open gate.
 | Numerical divergence | Silent quality loss | Stage-wise tolerances; deterministic test mode; independent reference |
 | Scheduler complexity | Latency spikes, starvation, leaks | Start single-request; add paged KV and batching incrementally; leak tests |
 | Benchmark noise/thermals | Misleading optimization decisions | Fixed protocol, repetitions, percentiles, power/clock metadata |
-| NPU toolchain immaturity | Wasted effort | Defer; gate on measured end-to-end benefit and opt-in fallback |
+| NPU toolchain immaturity | Wasted effort | Future task; gate on measured end-to-end benefit and opt-in fallback |
 | Scope creep | Core path unfinished | Enforce phase gates and non-goals |
 
 ## 13. Out of scope for the first release
@@ -478,7 +467,8 @@ not declare completion or depend on unverified results from an open gate.
 - Automatic fine-grained multi-device operator partitioning.
 - A general-purpose graph compiler.
 - Multi-model serving and model swapping.
-- NPU-dependent execution paths.
+- NPU-dependent execution paths in the first release; NPU support is a future
+  task.
 
 ## 14. Success criteria for the first release
 
@@ -500,10 +490,23 @@ items remain release gates.
       implemented single-request behavior; later-phase behavior remains
       documented as target design.
 
-Phase 5 exit criteria are met for the executable scope; NPU prefill/decode and
-subgraph execution are a deferred deliverable, not an implementation claim. The
-first release remains gated by the decode-length performance matrix. Prefill
-lengths are covered by the Phase 3 curves, and Phase 4 serving evidence is
-recorded in this document and [benchmarks.md](benchmarks.md). NPU acceleration is
-not claimed because the target host lacks an XRT userspace runtime; the opt-in
-probe and GPU fallback are documented in [npu.md](npu.md).
+Phase 5 exit criteria are met for its executable scope. NPU support is a future
+task, not a Phase 5 or first-release gate; the current `--npu` probe is
+diagnostic only and performs no model execution. The first release remains gated
+by the decode-length performance matrix. Prefill lengths are covered by the Phase
+3 curves, and Phase 4 serving evidence is recorded in this document and
+[benchmarks.md](benchmarks.md).
+
+## 15. Future tasks (not scheduled)
+
+### 15.1 NPU support
+
+NPU support is a future task and is not part of Phase 5 or the first release.
+The current `backend/npu` package and `--npu` flag are diagnostic only: they
+report device, driver, and runtime availability and fall back to the selected
+backend; they do not execute model operations. Implementing NPU prefill/decode,
+graph compilation, or subgraph partitioning requires the activation criteria in
+[npu.md](npu.md), including a reproducible XRT runtime, a correctness path
+against the CPU reference and GPU output, measured end-to-end benefit, opt-in
+fallback, and acceptable APU memory cost. No work on this task is required for
+the current release.

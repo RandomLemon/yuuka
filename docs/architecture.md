@@ -313,7 +313,7 @@ eviction are specified in [serving.md](serving.md).
 | --- | --- | --- |
 | HIP GPU | Primary execution path | Implemented for `qwen35` single and concurrent requests over a shared paged KV pool, and for `qwen3moe` single requests; opt-in graph replay |
 | CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`, dense Llama/Qwen3, and `qwen3moe`; default backend; concurrent paged serving for `qwen35` |
-| XDNA NPU | Optional heterogeneous acceleration | Capability probe and explicit GPU fallback only; execution deferred; see [npu.md](npu.md) |
+| XDNA NPU | Optional heterogeneous acceleration | Diagnostic capability probe and explicit GPU fallback only; execution is a future task; see [npu.md](npu.md) |
 
 The planner queries backend capabilities, including supported dtypes,
 quantization types, maximum batch, graph support, and memory properties. If a
@@ -386,7 +386,7 @@ yuuka/
 
 Planned but not present yet: a separate `backend/cpu/` package, separate
 `model/llama/` and `model/qwen3/` packages, and `kernels/hip/sampling/`.
-`backend/npu/` currently contains the opt-in capability probe, not an execution
+`backend/npu/` currently contains the diagnostic capability probe, not an execution
 backend. The CPU reference model code is implemented in
 `model/qwen35` and `model/dense`; `engine` owns the single-request generation
 loop, while `serving` and `scheduler` own concurrent requests. The generic
@@ -450,10 +450,10 @@ decision and the phase that may reopen it are recorded below.
    stream. Fusing multiple decode requests or prefill plus decode into one
    kernel batch is not implemented; it would require per-lane block tables and
    sequence lengths and is left to a later phase.
-8. **NPU integration boundary.** Deferred. `backend/npu` provides only an
-   opt-in capability probe and fallback decision. NPU execution, graph
-   compilation, and subgraph splitting are not shipped; activation criteria in
-   [npu.md](npu.md) are unmet on the reference host.
+8. **NPU integration boundary.** Future task; not scheduled. `backend/npu`
+   provides only a diagnostic capability probe and fallback decision. NPU
+   execution, graph compilation, and subgraph splitting are not shipped, and
+   activation criteria in [npu.md](npu.md) are unmet on the reference host.
 
 ## 12. Extensibility rules
 

@@ -74,7 +74,7 @@ func main() {
 	prefixBlocks := flag.Int("prefix-blocks", 0, "maximum blocks held by the prefix cache (0 = pool)")
 	graph := flag.Bool("graph", false, "enable HIP Graph decode replay with fallback")
 	kvType := flag.String("kv-type", "f32", "KV cache format for qwen35: f32, f16, or q8_0")
-	npuOpt := flag.Bool("npu", false, "probe NPU availability and fall back to the GPU backend")
+	npuOpt := flag.Bool("npu", false, "diagnostic NPU probe; fall back to the GPU backend")
 	modelKey := flag.String("model-key", "", "override the prefix-cache model identity")
 	flag.Parse()
 

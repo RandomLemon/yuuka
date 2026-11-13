@@ -3,8 +3,9 @@
 ## 1. Status and position
 
 The XDNA 2 NPU in Ryzen AI Max+ 395 is a potential accelerator for `yuuka`, but
-it is **not part of the first release**. The GPU path must remain correct,
-performant, and self-sufficient without any NPU runtime.
+it is **not part of Phase 5 or the first release**. NPU support is a future task.
+The GPU path must remain correct, performant, and self-sufficient without any
+NPU runtime.
 
 Theoretical NPU TOPS are not equivalent to LLM inference speedup. End-to-end
 benefit depends on data movement, quantization compatibility, graph compilation,
@@ -17,8 +18,8 @@ fragmenting execution.
 | --- | --- | --- |
 | **GPU-only** | All model stages run on the HIP backend | Default; first release |
 | **CPU + GPU** | CPU reference or fallback for unsupported operations; GPU for the main path | Correctness and fallback |
-| **NPU prefill + GPU decode** | Whole-phase split: NPU processes prompt chunks, GPU generates tokens | Experimental |
-| **NPU subgraph + GPU subgraph** | Partition the model graph across NPU and GPU with explicit transfers | Experimental, later |
+| **NPU prefill + GPU decode** | Whole-phase split: NPU processes prompt chunks, GPU generates tokens | Future task; not scheduled |
+| **NPU subgraph + GPU subgraph** | Partition the model graph across NPU and GPU with explicit transfers | Future task; not scheduled |
 
 Phase-level splitting is the first candidate because it avoids per-layer
 handoffs. Subgraph partitioning is more complex and requires a cost model,
@@ -42,12 +43,12 @@ The XDNA device node and the `amdxdna` kernel module are present, but no
 `xrt-smi`, `libxrt_core`, or XRT library directory was found. The toolchain
 prerequisite in section 6 is therefore unmet, and no NPU kernel, graph compiler,
 or subgraph partition is shipped. `--npu` records the probe result and falls back
-to the selected GPU backend; it never silently changes results. The Phase 5
-deliverable is therefore the capability probe and explicit fallback; NPU
-prefill/decode and subgraph execution are deferred until the activation criteria
-in section 6 are met.
+to the selected GPU backend; it never silently changes results. NPU support is a
+future task, not part of Phase 5; the probe is diagnostic only. NPU
+prefill/decode and subgraph execution remain unscheduled until the activation
+criteria in section 6 are met.
 
-## 3. Why it is deferred
+## 3. Why it remains a future task
 
 - The Linux NPU toolchain, driver, and runtime may not be available or stable
   enough for the target deployment.

@@ -507,7 +507,8 @@ row states otherwise. The KV-format runs use a 128-token prompt and 32 generated
 tokens. The speculative HIP rows use the same 128/32 protocol; the CPU rows in
 that table are a 16-prompt/8-decode negative control. The MoE sweep uses
 synthetic Q4_K weights at Qwen3-30B-A3B-like single-layer shapes because no
-standard `qwen3moe` GGUF is available on the target host.
+standard `qwen3moe` GGUF is available on the target host. NPU support is a future
+task and is not part of the Phase 5 benchmark set.
 
 ### KV cache formats
 
@@ -603,24 +604,6 @@ Batched GEMV wins from batch 4 for Q4_0. The Q5_0 batch-1 difference was within
 run-to-run noise in repeated sweeps; the dispatch table uses batch 4 for both
 Q4_0 and Q5_0. The tensor, GEMV, embedding, and WMMA paths pass randomized and
 non-aligned shape tests.
-
-### NPU capability result
-
-`yuuka npu-probe` on the reference host reports:
-
-```text
-state: device_only
-device: /dev/accel/accel0
-driver: true
-userspace: false
-reason: device and amdxdna driver are present, but no XRT userspace runtime was found
-fallback: selected backend
-```
-
-No NPU prefill, decode, or subgraph execution result is claimed. NPU execution
-is a deferred deliverable because the activation criteria in
-[npu.md](npu.md) are not met. The opt-in `--npu` flag records the probe and
-falls back to the selected backend.
 
 ### Phase 5 reproduction
 
