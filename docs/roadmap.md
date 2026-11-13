@@ -50,8 +50,10 @@ same-GGUF comparisons against llama.cpp HIP and Vulkan. The measured
 baseline only in shape classes where the sweep showed them faster than the
 compared baseline. Sixteen-token prefill latency improved from 1.433 s to
 0.137 s and decode is unchanged. Chunked prefill passes logit/state equivalence
-tests at chunk sizes 1-64, produces bitwise-identical logits for a 1024-token
-prompt at chunk sizes 128, 512, and 1024, and completes a 32768-token prompt.
+tests at chunk sizes 1-64 and completes a 32768-token prompt. The recorded
+1024-token run produced bitwise-identical logits at chunk sizes 128, 512, and
+1024; the checked-in test enforces the same top-1 token and a `0.05` maximum
+logit difference.
 VGPR, LDS, scratch, and occupancy are recorded. The prompt path remains 5-16x
 behind llama.cpp HIP and 7-18x behind llama.cpp Vulkan across the measured
 prompt lengths; the remaining gap has not been fully attributed, and the 32-row
@@ -366,11 +368,11 @@ NPU support is a future task and is intentionally not part of Phase 5; see
   covers chunked prefill and prefill-plus-decode with Q4_K expert matrices;
   real-model MoE validation remains open.
 - KV formats are F32 (default), F16, and Q8_0. Q8_0 stores one FP16 scale per
-  32-value group. Prefix-cache keys include the format. The CPU `qwen35` runtime
-  and the `qwen3moe` HIP runtime implement all three; dense `llama`/`qwen3` CPU
-  runtimes implement F32 and reject other `--kv-type` values explicitly. KV
-  format does not change decode latency measurably at 128 prompt / 32 decode
-  tokens; its benefit is cache memory.
+  32-value group. Prefix-cache keys include the format. The `qwen35` CPU and HIP
+  runtimes and the `qwen3moe` HIP runtime implement all three; dense
+  `llama`/`qwen3` CPU runtimes implement F32 and reject other `--kv-type` values
+  explicitly. KV format does not change decode latency measurably at 128 prompt
+  / 32 decode tokens; its benefit is cache memory.
 - Speculative decoding is exact greedy prompt-lookup speculation. It is not
   available for non-greedy sampling or the MoE HIP runtime, and it is exposed
   only through the CLI/bench path. `TestSpeculativePartialAcceptanceMatchesGreedy`

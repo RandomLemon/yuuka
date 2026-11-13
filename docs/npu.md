@@ -36,7 +36,7 @@ device: /dev/accel/accel0
 driver: true
 userspace: false
 reason: device and amdxdna driver are present, but no XRT userspace runtime was found
-fallback: selected backend
+fallback: selected (NPU unavailable: device and amdxdna driver are present, but no XRT userspace runtime was found; using the selected backend)
 ```
 
 The XDNA device node and the `amdxdna` kernel module are present, but no

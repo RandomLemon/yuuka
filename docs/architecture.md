@@ -144,9 +144,10 @@ These contracts must be explicit in the implementation:
 
 - **Buffer ownership.** Every `Buffer` has one owner. Transfer of ownership and
   the point of release are part of the API, not an implementation detail.
-- **Event lifetime.** An event represents completion of submitted work. A
+- **Event lifetime.** An event represents completion of one submission. A
   buffer or scratch region may be reused only after the corresponding event has
-  completed. Whether `Wait` is idempotent or single-use must be specified.
+  completed. `Wait` is idempotent after completion and may be called more than
+  once.
 - **Error propagation.** Device errors are returned as Go errors with enough
   context to identify the stage, kernel, and shape. Errors must not cross the C
   ABI as panics or C++ exceptions.
@@ -256,16 +257,17 @@ Event -> Go completion -> sampling/streaming
 - Every path that can fail after partial allocation must have a cleanup path
   that releases all acquired buffers and streams.
 
-### 6.3 Required abstractions
+### 6.3 Target abstractions
 
-| Abstraction | Purpose |
-| --- | --- |
-| `Device`, `Stream`, `Event` | Execution and synchronization |
-| `DeviceBuffer`, `HostPinnedBuffer`, `MappedBuffer` | Allocation classes with different performance and lifetime rules |
-| `GraphExecutable`, `GraphReplay` | Cached launch graphs for stable shapes |
-| `ScratchAllocator`, `WeightAllocator`, `KVAllocator` | Pool-specific allocation policies |
-| `KernelRegistry`, shape signature | Dispatch and tuning lookup |
-| Backend capabilities | Capability negotiation and unsupported-operation fallback |
+| Abstraction | Purpose | Status |
+| --- | --- | --- |
+| `Device`, `Stream`, `Event` | Execution and synchronization | Implemented in `backend/hip` |
+| `DeviceBuffer` | Device allocation with explicit lifetime | Implemented as `hip.Buffer` |
+| `HostPinnedBuffer`, `MappedBuffer` | Allocation classes with different performance and lifetime rules | Not implemented as general types; pinned staging is used only for graph dynamic parameters |
+| `GraphExecutable`, `GraphReplay` | Cached launch graphs for stable shapes | Implemented as `hip.Graph` |
+| `ScratchAllocator`, `WeightAllocator`, `KVAllocator` | Pool-specific allocation policies | KV allocator implemented in `memory`; dedicated scratch and weight allocators are not |
+| Shape signature and dispatch selectors | Dispatch and tuning lookup | Implemented by `SelectGemvPath` and `SelectPrefillPath`; no generic kernel registry |
+| Backend capabilities | Capability negotiation and unsupported-operation fallback | Implemented per operator in plan validation; the generic `backend` seam is not wired |
 
 ## 7. Memory model
 
@@ -295,15 +297,15 @@ on the assumption that zero-copy access is optimal.
 
 ### 7.3 KV cache summary
 
-Current implementation: CPU and HIP use paged `F32` KV pools addressed by
-allocator block ID. A request owns a block table covering its prompt plus output
-budget; positions are resolved through that table by the CPU attention loop and
-by the paged HIP KV-write and attention kernels. Recurrent convolution and
-matrix state stay contiguous per session and are snapshotted for prefix reuse.
-The default block size is 16 tokens. F32 is the default KV storage; opt-in F16
-and Q8_0 formats use the same block table and are selected through `--kv-type`
-for the `qwen35` CPU runtime and the `qwen3moe` HIP runtime. Dense CPU runtimes
-implement F32 only and reject other formats explicitly.
+Current implementation: CPU and HIP use paged KV pools addressed by allocator
+block ID. A request owns a block table covering its prompt plus output budget;
+positions are resolved through that table by the CPU attention loop and by the
+paged HIP KV-write and attention kernels. Recurrent convolution and matrix
+state stay contiguous per session and are snapshotted for prefix reuse. The
+default block size is 16 tokens. F32 is the default KV storage; opt-in F16 and
+Q8_0 formats use the same block table and are selected through `--kv-type` for
+the `qwen35` CPU and HIP runtimes and for the `qwen3moe` HIP runtime. Dense CPU
+runtimes implement F32 only and reject other formats explicitly.
 The logical KV view exposed to model code does not expose physical block layout. Block allocation, reference counting, prefix sharing, cancellation, and
 eviction are specified in [serving.md](serving.md).
 
@@ -423,14 +425,16 @@ decision and the phase that may reopen it are recorded below.
 
 1. **Buffer and event ownership syntax.** Buffers are caller-owned opaque C
    handles with explicit release; the Go wrapper makes `Close` idempotent.
-   Events are single-use completion signals and `Wait` is valid after the
-   signal. Plans do not own bound buffers. Model-lifetime allocations and
-   request session allocations are tracked separately; Phase 4 did not need an
-   arena allocator.
+   An event represents one submission, and `Wait` may be called more than once;
+   implementations must make it idempotent after completion. Plans do not own
+   bound buffers. Model-lifetime allocations and request session allocations
+   are tracked separately; Phase 4 did not need an arena allocator.
 2. **UMA allocation policy.** Weights, activations, KV, and recurrent state use
-   device allocations; transfers stage through pinned host memory. Mapped host
-   memory is measured but is not a default path. Revisit only with a measured
-   prefetch or migration win.
+   device allocations. General uploads currently use synchronous `hipMemcpy`
+   from pageable host memory; graph dynamic-parameter updates use a per-stream
+   pinned staging buffer. Full pinned staging for model uploads is not
+   implemented. Mapped host memory is measured but is not a default path.
+   Revisit only with a measured prefetch or migration win.
 3. **Graph replay mutation.** Implemented in Phase 4 and opt-in. Capture is per
    session for the decode shape. Token and position are read from a
    device-resident dynamic buffer uploaded before `hipGraphLaunch`; replay
@@ -472,7 +476,8 @@ decision and the phase that may reopen it are recorded below.
   packed bytes.
 - **New backend:** implement `Backend`, `Executable`, and `Event`, declare
   capabilities, and provide fallback behavior. Do not modify the scheduler.
-- **New kernel:** register it with a shape signature, correctness tests, and a
-  performance baseline. The planner selects it only when its preconditions hold.
+- **New kernel:** add its shape validation to plan construction, its dispatch
+  rule to the Go selectors, correctness tests, and a performance baseline. The
+  planner selects it only when its preconditions hold.
 - **New API surface:** add it in the transport layer and map it to scheduler
   requests. Do not bypass admission or KV budgeting.

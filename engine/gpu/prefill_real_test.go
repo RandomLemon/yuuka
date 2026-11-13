@@ -14,9 +14,10 @@ import (
 )
 
 // TestGPUChunkedPrefillLongContext checks that different chunk boundaries over
-// a 1024-token real-model prompt produce the same greedy token and nearly the
-// same logits. It is opt-in through YUUKA_TEST_MODEL because it loads and
-// prefills the full model several times.
+// a 1024-token real-model prompt produce the same greedy token and logits
+// within 0.05. The reference run was bitwise identical, but this test does not
+// require bitwise equality. It is opt-in through YUUKA_TEST_MODEL because it
+// loads and prefills the full model several times.
 func TestGPUChunkedPrefillLongContext(t *testing.T) {
 	path := os.Getenv("YUUKA_TEST_MODEL")
 	if path == "" {

@@ -128,8 +128,9 @@ Implemented and tested:
   same prompt with the same top-1 token. The checked-in tests enforce the token
   sequence, a loose logit bound, and a layer-by-layer hidden-state comparison;
   the worst recorded first-prompt layer difference is `5.53e-5`. Chunked
-  prefill at 1024 tokens produces bitwise identical logits across chunk sizes
-  128, 512, and 1024.
+  prefill at 1024 tokens produced bitwise identical logits in the recorded run
+  across chunk sizes 128, 512, and 1024; the checked-in test enforces the same
+  top-1 token and a `0.05` maximum logit bound.
 - Phase 0 hardware probe covering allocation, copy, memset, mapped memory,
   rocBLAS SGEMM, and a rocWMMA FP16 tile.
 - Prefill performance curves at 128-32768 prompt tokens, resource usage, and a
@@ -138,8 +139,8 @@ Implemented and tested:
   collision-safe prefix cache, opt-in HIP Graph replay, and an
   OpenAI-compatible server.
 - Opt-in F16 and Q8_0 KV formats with CPU and HIP write/attention kernels for
-  `qwen35` and `qwen3moe` HIP. Dense CPU runtimes implement F32 only and reject
-  other `--kv-type` values.
+  `qwen35`, plus HIP write/attention kernels for `qwen3moe`. Dense CPU runtimes
+  implement F32 only and reject other `--kv-type` values.
 - `qwen3moe` HIP execution with top-k routing, per-expert assignment buckets,
   and grouped expert kernels that keep expert weights packed. The F32 and Q4_K
   synthetic fixtures cover chunked prefill and prefill-plus-decode against the

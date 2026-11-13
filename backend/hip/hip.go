@@ -699,6 +699,19 @@ func (p *Plan) AddScale(x *Buffer, n int64, scale float32) error {
 }
 
 func (p *Plan) AddEmbedding(weights, out *Buffer, cols, rowBytes int64, dtype tensor.DType) error {
+	if cols <= 0 || rowBytes <= 0 {
+		return fmt.Errorf("hip: invalid embedding dimensions cols=%d row_bytes=%d", cols, rowBytes)
+	}
+	if !dtype.Supported() {
+		return fmt.Errorf("hip: embedding dtype %s is not supported", dtype)
+	}
+	want, err := dtype.RowBytes(cols)
+	if err != nil {
+		return fmt.Errorf("hip: embedding row width %d: %w", cols, err)
+	}
+	if int64(want) != rowBytes {
+		return fmt.Errorf("hip: embedding row bytes %d, want %d for %s", rowBytes, want, dtype)
+	}
 	if err := p.check(weights, out); err != nil {
 		return err
 	}
@@ -1262,6 +1275,9 @@ func (p *Plan) AddRecurrentChunkAt(a RecurrentChunkArgs) error {
 func (p *Plan) AddEmbeddingBatchAt(weights, out, tokens *Buffer, outOff uint64, rows, cols, rowBytes, vocab int64, dtype tensor.DType) error {
 	if rows <= 0 || cols <= 0 || rowBytes <= 0 || vocab <= 0 {
 		return errors.New("hip: invalid batch embedding dimensions")
+	}
+	if !dtype.Supported() {
+		return fmt.Errorf("hip: batch embedding dtype %s is not supported", dtype)
 	}
 	if want, err := dtype.RowBytes(cols); err != nil || int64(want) != rowBytes {
 		return fmt.Errorf("hip: embedding row layout does not match dtype %s", dtype)

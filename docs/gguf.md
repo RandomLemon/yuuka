@@ -34,7 +34,7 @@ builders bind named tensors; kernels interpret the quantization layout.
 | 4. Tensor directory | Read each tensor name, rank, dimensions, `ggml_type`, and data offset | Reject duplicate names, invalid ranks, zero dimensions, or overflow |
 | 5. Layout | Resolve alignment, tensor byte ranges, shard assignment, and data-section bounds | Reject overlaps, out-of-range offsets, or incomplete shards |
 | 6. Model config | Map architecture metadata through an architecture adapter | Reject missing required fields or inconsistent head dimensions |
-| 7. Weight store | Build tensor descriptors and map weight bytes on demand | Reject missing required weights; warn on unexpected extras |
+| 7. Weight store | Build tensor descriptors and map weight bytes on demand | Reject missing required weights; unexpected extras are currently not rejected or warned about |
 | 8. Tokenizer | Build vocabulary, merges/scores, special tokens, and chat template | Reject invalid token IDs or unparsable templates |
 | 9. Handoff | Expose `ModelConfig`, `Tokenizer`, and `WeightStore` to the planner | No device allocation before validation completes |
 
@@ -56,8 +56,9 @@ file into Go heap memory. Tensor data is read-only for the model lifetime.
   ordering, and tensor-to-shard assignment. A model is usable only when every
   required tensor is present exactly once.
 - **Duplicate and missing entries.** Duplicate metadata keys or tensor names are
-  errors. Missing required tensors are errors. Extra tensors are reported and
-  ignored unless the model adapter requires them.
+  errors. Missing required tensors are errors. Extra tensors are currently not
+  rejected or warned about; the HIP loader uploads every tensor in the
+  directory, while the CPU reference loader reads only named tensors.
 - **Read-only mapping.** The mapping must not be mutated. Device upload reads
   from the mapping; it does not modify the source file.
 
@@ -135,6 +136,11 @@ pointers. It is responsible for:
 - tracking which tensors are required by the selected architecture;
 - reporting missing, duplicated, or unexpectedly shaped tensors before
   execution.
+
+Current limitation: unexpected extra tensors are not reported. The HIP loader
+uploads every tensor in the directory, including tensors the selected
+architecture does not use; the CPU reference loader reads only the named
+tensors it needs.
 
 The device upload policy belongs to the memory planner. On a UMA APU, mapped
 host pages may be directly visible to the GPU, but that does not guarantee the

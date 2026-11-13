@@ -26,7 +26,8 @@ CPU and GPU greedy tokens match, layer-by-layer hidden states agree on the
 decode path, and the recorded decode-path first-step maximum absolute logit
 difference is `4.58e-5`. The chunked prefill path on the same 5-token prompt
 differs from the CPU reference by `3.65e-3` in the worst logit and selects the
-same top-1 token; chunk-size equivalence at 1024 tokens is exact.
+same top-1 token; the recorded 1024-token chunk-size run was exact, while the
+checked-in test allows a `0.05` maximum logit difference.
 Paged KV, iteration-level continuous batching, prefix caching, and opt-in HIP
 Graph capture/replay are implemented. Concurrent requests reproduce isolated-run
 tokens; cancellation and repeated cycles release every KV block. A
@@ -53,7 +54,7 @@ fixtures; the Llama fixture is cross-checked against llama.cpp.
 | Chat | Qwen `<|im_start|>` template; `--chat` and the server require it |
 | GGUF | Versions 2 and 3; split shards using `-NNNNN-of-NNNNN.gguf` names |
 | Weight dtypes | `F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K` |
-| KV formats | `F32` (default), `F16`, `Q8_0` for `qwen35` CPU and `qwen3moe` HIP; dense CPU is F32-only |
+| KV formats | `F32` (default), `F16`, `Q8_0` for `qwen35` CPU and HIP and for `qwen3moe` HIP; dense CPU is F32-only |
 
 Q4_K_M is a mixed quantization preset, not a single tensor type. A file with
 that label works only when every tensor uses a supported dtype. Two-dimensional
@@ -332,12 +333,15 @@ skip with exit code 77 when the requested HIP device is unavailable.
   CLI and Go packages.
 - The tokenizer implementation covers Qwen byte-level BPE and Llama-family
   SentencePiece vocabularies. Non-Qwen chat templates are not implemented.
+- Unexpected extra tensors are not rejected or warned about. The HIP loader
+  uploads every tensor in the GGUF directory, including tensors the selected
+  architecture does not use.
 - Prefill uses chunked batched plans with rocWMMA/rocBLAS GEMM and paged Flash
   Attention. The attention kernel supports head dimensions up to 256. Chunks are
   bounded at 4096 rows.
 - KV cache is paged and defaults to `F32` with a block size of 16 tokens.
-  `F16` and `Q8_0` are opt-in memory optimizations for `qwen35` CPU and
-  `qwen3moe` HIP; dense CPU runtimes implement only `F32` and reject other
+  `F16` and `Q8_0` are opt-in memory optimizations for `qwen35` CPU and HIP and
+  for `qwen3moe` HIP; dense CPU runtimes implement only `F32` and reject other
   `--kv-type` values. Q8_0 changes logits slightly and is not a performance win
   at short context.
 - Continuous batching is iteration-level: requests are interleaved on one model

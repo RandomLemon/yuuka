@@ -152,6 +152,37 @@ int main() {
         std::printf("embedding %s: max abs diff %.6g\n",
                     dtype == YUUKA_DTYPE_Q4_0 ? "Q4_0" : "Q5_0", max_diff);
         if (max_diff != 0) ok = false;
+
+        yuuka_plan * single_plan = nullptr;
+        CHECK_STATUS(yuuka_plan_create(device, &single_plan));
+        yuuka_op single{};
+        single.code = YUUKA_OP_EMBEDDING;
+        single.buf[0] = w_buf;
+        single.buf[1] = o_buf;
+        single.n[0] = cols;
+        single.n[1] = row_bytes;
+        single.u[0] = dtype;
+        CHECK_STATUS(yuuka_plan_add(single_plan, &single));
+        CHECK_STATUS(yuuka_plan_execute(single_plan, stream, 2, 0, 1, event));
+        CHECK_STATUS(yuuka_event_wait(event));
+        std::vector<float> single_got(cols);
+        CHECK_STATUS(yuuka_memcpy_d2h(single_got.data(), o_buf, single_got.size() * 4));
+        const float * want_single = want.data() + size_t((rows - 1) * cols);
+        float single_diff = 0;
+        for (int i = 0; i < cols; ++i) {
+            single_diff = std::fmax(single_diff, std::fabs(single_got[i] - want_single[i]));
+        }
+        std::printf("single embedding %s: max abs diff %.6g\n",
+                    dtype == YUUKA_DTYPE_Q4_0 ? "Q4_0" : "Q5_0", single_diff);
+        if (single_diff != 0) ok = false;
+
+        yuuka_op unsupported = single;
+        unsupported.u[0] = 0xffffffffu;
+        if (yuuka_plan_add(single_plan, &unsupported) != YUUKA_ERR_UNSUPPORTED) {
+            std::fprintf(stderr, "unsupported embedding dtype was accepted\n");
+            ok = false;
+        }
+        yuuka_plan_destroy(single_plan);
         yuuka_plan_destroy(plan);
         yuuka_buffer_free(o_buf);
         yuuka_buffer_free(t_buf);

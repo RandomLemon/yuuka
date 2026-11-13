@@ -23,6 +23,9 @@ struct yuuka_buffer {
 
 struct yuuka_stream {
     hipStream_t stream;
+    // Pinned staging for the two-int32 dynamic parameter update. Reused after
+    // the previous replay has completed; calls are serialized per stream.
+    int32_t * dynamic_staging;
 };
 
 struct yuuka_event {
@@ -463,6 +466,48 @@ yuuka_status validate_recurrent_chunk_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+bool embedding_dtype_supported(uint32_t dtype) {
+    switch (dtype) {
+        case YUUKA_DTYPE_F32:
+        case YUUKA_DTYPE_F16:
+        case YUUKA_DTYPE_Q4_0:
+        case YUUKA_DTYPE_Q5_0:
+        case YUUKA_DTYPE_Q8_0:
+        case YUUKA_DTYPE_Q4_K:
+        case YUUKA_DTYPE_Q5_K:
+        case YUUKA_DTYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+yuuka_status validate_embedding_plan_op(const yuuka_op & op) {
+    const uint64_t cols = op.n[0];
+    const uint64_t row_bytes = op.n[1];
+    const uint32_t dtype = op.u[0];
+    if (cols == 0 || row_bytes == 0 || op.buf[0] == nullptr || op.buf[1] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid embedding arguments");
+    }
+    if (!embedding_dtype_supported(dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported embedding dtype %u", dtype);
+    }
+    uint64_t expected_row = 0;
+    if (!checked_row_bytes(cols, dtype, &expected_row) || expected_row != row_bytes) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "embedding dtype %u does not match row layout", dtype);
+    }
+    uint64_t out_bytes = 0;
+    if (__builtin_mul_overflow(cols, uint64_t(sizeof(float)), &out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "embedding output size overflows");
+    }
+    if (!buffer_range_ok(op.buf[1], op.off[1], out_bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], row_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "embedding buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 yuuka_status validate_embedding_batch_plan_op(const yuuka_op & op) {
     const uint64_t cols = op.n[0];
     const uint64_t rows = op.n[1];
@@ -472,6 +517,9 @@ yuuka_status validate_embedding_batch_plan_op(const yuuka_op & op) {
     if (cols == 0 || rows == 0 || vocab == 0 || op.buf[0] == nullptr ||
         op.buf[1] == nullptr || op.buf[2] == nullptr) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid batch embedding arguments");
+    }
+    if (!embedding_dtype_supported(dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "unsupported batch embedding dtype %u", dtype);
     }
     uint64_t expected_row = 0;
     if (!checked_row_bytes(cols, dtype, &expected_row) || expected_row != row_bytes) {
@@ -1477,7 +1525,15 @@ YUUKA_API yuuka_status yuuka_stream_create(yuuka_device * dev, yuuka_stream ** o
         if (err != hipSuccess) {
             return fail(YUUKA_ERR_DEVICE, "hipStreamCreateWithFlags: %s", hip_error(err));
         }
-        *out = new yuuka_stream{stream};
+        int32_t * dynamic_staging = nullptr;
+        err = hipHostMalloc(reinterpret_cast<void **>(&dynamic_staging),
+                            2 * sizeof(int32_t), hipHostMallocPortable);
+        if (err != hipSuccess) {
+            (void)hipStreamDestroy(stream);
+            return fail(YUUKA_ERR_ALLOCATION, "hipHostMalloc dynamic staging: %s",
+                        hip_error(err));
+        }
+        *out = new yuuka_stream{stream, dynamic_staging};
         return YUUKA_OK;
     });
 }
@@ -1490,6 +1546,12 @@ YUUKA_API void yuuka_stream_destroy(yuuka_stream * stream) {
         hipError_t err = hipStreamDestroy(stream->stream);
         if (err != hipSuccess) {
             g_last_error = std::string("hipStreamDestroy: ") + hip_error(err);
+        }
+    }
+    if (stream->dynamic_staging != nullptr) {
+        hipError_t err = hipHostFree(stream->dynamic_staging);
+        if (err != hipSuccess) {
+            g_last_error = std::string("hipHostFree: ") + hip_error(err);
         }
     }
     delete stream;
@@ -1678,8 +1740,13 @@ YUUKA_API yuuka_status yuuka_dynamic_set(yuuka_stream * stream, yuuka_buffer * d
         if (dynamic->bytes < 2 * sizeof(int32_t)) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "dynamic buffer must hold two int32 values");
         }
-        int32_t values[2] = {token, static_cast<int32_t>(position)};
-        hipError_t err = hipMemcpyAsync(dynamic->ptr, values, sizeof(values),
+        if (stream->dynamic_staging == nullptr) {
+            return fail(YUUKA_ERR_DEVICE, "stream has no pinned dynamic staging buffer");
+        }
+        stream->dynamic_staging[0] = token;
+        stream->dynamic_staging[1] = static_cast<int32_t>(position);
+        hipError_t err = hipMemcpyAsync(dynamic->ptr, stream->dynamic_staging,
+                                        2 * sizeof(int32_t),
                                         hipMemcpyHostToDevice, stream->stream);
         if (err != hipSuccess) {
             return fail(YUUKA_ERR_DEVICE, "dynamic parameter upload: %s", hip_error(err));
@@ -2214,6 +2281,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_RECURRENT_CHUNK:
                 status = validate_recurrent_chunk_plan_op(*op);
+                break;
+            case YUUKA_OP_EMBEDDING:
+                status = validate_embedding_plan_op(*op);
                 break;
             case YUUKA_OP_EMBEDDING_BATCH:
                 status = validate_embedding_batch_plan_op(*op);

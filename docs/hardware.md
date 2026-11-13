@@ -28,6 +28,11 @@ which corresponds to workgroup processors (two CUs each on this RDNA part).
 Kernel dispatch decisions use the 40-CU figure from `rocminfo`, not the HIP
 property.
 
+Current-host note (2026-11-13): the reference machine now reports kernel
+`7.0.14-28-pve`, while the measurements below were recorded on
+`6.17.13-21-pve`. They have not been re-baselined after the kernel change; use
+them as historical Phase 0 evidence, not as same-kernel reproducibility proof.
+
 ## Validation commands
 
 ```bash
@@ -106,10 +111,12 @@ to the run; re-measure under a controlled power profile before using it for a
 bandwidth budget.
 
 The measured host/device copy path is much slower than the device-local write
-rate. The initial memory policy is therefore:
+rate. The memory policy is:
 
 - keep weights in device allocations for the model lifetime;
-- stage uploads through pinned host memory;
+- the probe measures pinned uploads, but the runtime currently uploads model
+  data with synchronous `hipMemcpy` from pageable host memory; full pinned
+  staging remains a planned optimization;
 - keep activation, KV, and recurrent state in device memory;
 - do not assume mapped host memory is a zero-cost replacement for device
   allocations;
@@ -148,9 +155,12 @@ available to the toolchain and that a wave32 launch works on this device.
 
 ## Decisions recorded
 
-1. Device execution uses explicit non-blocking streams and single-use events.
+1. Device execution uses explicit non-blocking streams; each event represents
+   one submission and `Wait` is idempotent after completion.
 2. Weights remain packed; kernels dequantize inside the multiply.
-3. Host/device transfers use pinned staging buffers.
+3. Model uploads currently use synchronous `hipMemcpy` from pageable host
+   memory; pinned staging is measured and used for graph dynamic parameters, and
+   general pinned staging remains a planned optimization.
 4. Mapped host memory is measured but not selected by default.
 5. WMMA is available; the prefill GEMM path can target it in a later phase.
 6. The CPU reference path remains the correctness oracle after HIP integration.
@@ -174,7 +184,7 @@ device: /dev/accel/accel0
 driver: true
 userspace: false
 reason: device and amdxdna driver are present, but no XRT userspace runtime was found
-fallback: selected backend
+fallback: selected (NPU unavailable: device and amdxdna driver are present, but no XRT userspace runtime was found; using the selected backend)
 ```
 
 The XDNA device node and the `amdxdna` kernel module are present. No

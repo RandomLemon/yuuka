@@ -32,6 +32,42 @@ func TestDeviceInfo(t *testing.T) {
 	t.Logf("%+v", info)
 }
 
+func TestAddEmbeddingValidation(t *testing.T) {
+	dev := openTestDevice(t)
+	plan, err := dev.NewPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	weights, err := dev.Alloc(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer weights.Close()
+	out, err := dev.Alloc(256 * 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	for _, tc := range []struct {
+		cols, rowBytes int64
+		dtype          tensor.DType
+	}{
+		{64, 36, tensor.Q4_0},
+		{64, 44, tensor.Q5_0},
+	} {
+		if err := plan.AddEmbedding(weights, out, tc.cols, tc.rowBytes, tc.dtype); err != nil {
+			t.Fatalf("AddEmbedding(%s): %v", tc.dtype, err)
+		}
+	}
+	if err := plan.AddEmbedding(weights, out, 64, 36, tensor.Q2_K); err == nil {
+		t.Fatal("unsupported embedding dtype was accepted")
+	}
+	if err := plan.AddEmbedding(weights, out, 64, 35, tensor.Q4_0); err == nil {
+		t.Fatal("embedding row-byte mismatch was accepted")
+	}
+}
+
 func TestPlanCopy(t *testing.T) {
 	dev := openTestDevice(t)
 	stream, err := dev.NewStream()

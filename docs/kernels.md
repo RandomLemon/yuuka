@@ -7,10 +7,11 @@ operator families, prefill/decode separation, quantized GEMV and GEMM,
 attention, fusion, dispatch, and numerical requirements. It does not specify
 the Go scheduler or API; those are in [serving.md](serving.md).
 
-Implementation status: decode-oriented kernels for `F16`, `Q8_0`, `Q4_K`,
-`Q5_K`, and `Q6_K` GEMV, RMSNorm, L2Norm, gated RMSNorm, RoPE, decode attention,
-convolution state, gated delta-net recurrence, embedding, SwiGLU, residual add,
-and copy are implemented and validated against CPU references. Batched GEMV
+Implementation status: decode-oriented kernels for `F16`, `Q8_0`, `Q4_0`,
+`Q5_0`, `Q4_K`, `Q5_K`, and `Q6_K` GEMV, RMSNorm, L2Norm, gated RMSNorm, RoPE,
+decode attention, convolution state, gated delta-net recurrence, embedding,
+SwiGLU, residual add, and copy are implemented and validated against CPU
+references. Batched GEMV
 reuses each packed weight element across up to 16 rows; its measured thresholds
 are encoded in `backend/hip.SelectGemvPath`.
 
@@ -26,11 +27,12 @@ table described in section 9.
 Phase 4 adds the paged KV family: decode and prefill attention kernels that
 resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
-token and position from device memory, and a C ABI (version 3) for
-device-to-device block copies and HIP Graph capture/replay. KV pools are FP32. Attention remains
-scalar per lane rather than WMMA-based, and continuous batching is
-scheduler-level interleaving of per-request plans; mixed-shape prefill/decode
-kernel batches and split-KV decode are not implemented.
+token and position from device memory, and a C ABI (version 4) for
+device-to-device block copies and HIP Graph capture/replay. KV pools support
+F32 (default), F16, and Q8_0; see section 7.3. Attention remains scalar per lane
+rather than WMMA-based, and continuous batching is scheduler-level interleaving
+of per-request plans; mixed-shape prefill/decode kernel batches and split-KV
+decode are not implemented.
 
 The guiding rule is that **prefill and decode are separate operator families**.
 They may share data layouts and helper primitives, but they are not the same
@@ -302,8 +304,9 @@ chunk length; only the final chunk executes the output tail.
 
 `attention_prefill_paged_f32_kernel` keeps the same eight-query-row workgroup
 tiling and online softmax as the contiguous prefill kernel, but resolves each
-staged K row and each V read through the block table. `kv_write_paged` and
-`kv_write_batch_paged` map written positions through the same table.
+staged K row and each V read through the block table. `launch_kv_write_paged_f32`
+and `launch_kv_write_paged_dynamic_f32` map written positions through the same
+table; the batch case is selected by the row count, not a separate kernel name.
 
 ### 7.3 KV cache formats
 
@@ -413,24 +416,30 @@ the unfused path as a fallback when measurements justify it.
 
 ### 9.1 Shape signature
 
-Each kernel is registered with a signature that includes at least:
+Dispatch decisions and plan validation use these shape and capability fields:
 
 ```text
 operator, M, N, K, input dtype, weight dtype, batch, sequence class, backend
 ```
 
-The planner resolves the signature to a kernel configuration. Signature lookup
-must be cheap enough to perform during planning, not per token.
+There is no generic kernel registry in this release. Go selectors map the
+fields they need to a concrete path, and plan construction validates supported
+dtypes, row layout, buffer ranges, and dimensions before submission. Lookup is
+per plan, not per tensor per token.
 
-### 9.2 Kernel registry
+### 9.2 Dispatch selection and validation
 
-The registry records:
+Dispatch is recorded in two explicit Go selectors:
 
-- supported dtypes and quantization types;
-- shape constraints (alignment, minimum dimensions, block divisibility);
-- required scratch and workspace;
-- graph-capture compatibility;
-- the selected implementation (custom kernel or library fallback).
+- `backend/hip.SelectGemvPath` chooses per-row or batched GEMV from dtype and
+  batch size;
+- `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
+  rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
+
+Each plan addition validates the dtype, quantization row layout, shape
+constraints, and buffer ranges. Unsupported combinations fail during planning;
+there is no size-keyed registry, scratch registry, or graph-compatibility
+registry to consult at runtime.
 
 ### 9.3 Offline tuning
 
@@ -456,8 +465,8 @@ benchmarks.
   use `2e-2 * (1 + |expected|)` for GEMM outputs; the observed worst case for
   the checked-in shapes is under `1.2e-2`.
 - The prefill attention reference comparison uses
-  `2e-4 * (1 + |expected|)`; observed worst case is `2.3e-8` for the checked-in
-  shape because both sides use FP32.
+  `2e-4 * (1 + |expected|)`; the current checked-in shape reports about
+  `3.0e-8` because both sides use FP32.
 - Chunked prefill must produce the same greedy token as unchunked CPU prefill.
   The GPU tests compare final logits within `2e-3` and require an identical
   top-1 token for chunk sizes 1, 3, 7, 16, 17, 33, and 64 on the tiny fixture.

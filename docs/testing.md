@@ -125,11 +125,13 @@ batch sizes 1, 2, 3, 4, 8, and 16.
 
 Prefill operators have their own native tests in `tests/hip/prefill_test.cpp`:
 
-- WMMA GEMM for `F32`, `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` at `M` values
-  1, 7, 16, and 33 and non-tile-aligned `N`;
+- WMMA GEMM for `F32`, `F16`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, and
+  `Q6_K` at `M` values 1, 7, 16, and 33 and non-tile-aligned `N`;
 - the rocBLAS FP16 baseline against a float reference;
 - row-batched and head-batched RMSNorm, batched RoPE, batch embedding, and
   batch KV writes;
+- legacy single-token embedding for Q4_0 and Q5_0, compared against the same
+  packed-row reference as the batch path (`tests/hip/embedding_test.cpp`);
 - causal GQA Flash Attention with a non-zero chunk start position;
 - the fused convolution, L2 normalization, gated delta-net recurrence, and
   gated RMSNorm chunk kernel at the model dimensions (128 rows, 16 groups,

@@ -30,6 +30,10 @@ prefill behavior and its known gap to llama.cpp.
 | Prompt | 16 tokens from repeated English prose |
 | Decode | CPU 8 tokens, HIP 16 tokens |
 
+Current-host note (2026-11-13): the machine now reports kernel
+`7.0.14-28-pve`; the tables below were recorded on `6.17.13-21-pve` and have
+not been re-baselined after the kernel change.
+
 The CPU and HIP runs use different decode lengths, so compare throughput and
 latency, not total wall time. The prompt construction and sampling settings are
 identical.
@@ -304,11 +308,13 @@ Chunked prefill correctness is checked at two levels:
   after each chunked prefill and compares that logit vector with the CPU state
   produced by a single unchunked prefill.
 - `TestGPUChunkedPrefillLongContext` prefills 1024 real-model tokens with chunk
-  sizes 128, 512, and 1024. The three logit vectors are bitwise identical
-  (maximum absolute difference `0`) and select the same top-1 token. This is
-  the KV/recurrent-state equivalence check at a context length where the
-  earlier shared-scratch race was observable; the fixed kernel is also checked
-  for bitwise repeatability in the native test.
+  sizes 128, 512, and 1024. In the recorded run the three logit vectors were
+  bitwise identical (maximum absolute difference `0`) and selected the same
+  top-1 token. The checked-in test enforces the same top-1 token and a `0.05`
+  maximum absolute logit difference, so it does not by itself guarantee
+  bitwise identity. This is the KV/recurrent-state equivalence check at a
+  context length where the earlier shared-scratch race was observable; the
+  fixed kernel is also checked for bitwise repeatability in the native test.
 
 A 32-token real-model prompt ("Write a short list of colors...") produces the
 same greedy continuation with chunk sizes 7, 16, and 32 as the CPU reference.
@@ -336,7 +342,7 @@ zero VGPR spills, and 16 waves/SIMD occupancy.
 | `rmsnorm_heads_batch_f32_kernel` | 9 | 20 | 1,024 B | 0 |
 | `rope_batch_f32_kernel` | 19 | 18 | 0 | 0 |
 | `kv_write_batch_f32_kernel` | 14 | 34 | 0 | 0 |
-| `embedding_batch_f32_kernel` | 20 | 19 | 0 | 0 |
+| `embedding_batch_f32_kernel` | 21 | 19 | 0 | 0 |
 | `conv1d_chunk_f32_kernel` | 26 | 34 | 0 | 0 |
 | `cast_f32_to_f16_kernel` | 7 | 18 | 0 | 0 |
 
@@ -353,11 +359,19 @@ go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
 build/yuuka_prefill_sweep
 scripts/kernel_resources.sh
 
-for p in 128 512 2048 8192 32768; do
+for p in 128 512 2048; do
   /tmp/yuuka-hip bench \
     --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
     --prompt-tokens "$p" --decode-tokens 16 \
     --warmup 1 --reps 3 --chunk-size 512
+done
+
+# The recorded 8192 and 32768 runs used one measurement and no warmup.
+for p in 8192 32768; do
+  /tmp/yuuka-hip bench \
+    --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
+    --prompt-tokens "$p" --decode-tokens 16 \
+    --warmup 0 --reps 1 --chunk-size 512
 done
 
 # llama.cpp comparison, same GGUF and device.
@@ -603,8 +617,9 @@ host, so real-model MoE validation remains open.
 
 Batched GEMV wins from batch 4 for Q4_0. The Q5_0 batch-1 difference was within
 run-to-run noise in repeated sweeps; the dispatch table uses batch 4 for both
-Q4_0 and Q5_0. The tensor, GEMV, embedding, and WMMA paths pass randomized and
-non-aligned shape tests.
+Q4_0 and Q5_0. The tensor, GEMV, embedding, and WMMA paths pass randomized
+tests; GEMV and WMMA additionally cover non-aligned dimensions. The embedded
+Q4_0/Q5_0 row test covers both `EMBEDDING` and `EMBEDDING_BATCH`.
 
 ### Phase 5 kernel resource usage
 

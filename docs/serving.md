@@ -104,12 +104,14 @@ Admission prevents overcommit and keeps latency predictable. It accounts for:
 
 Implementation policy:
 
-- A request whose prompt plus output exceeds the context is rejected with
+- A request whose prompt alone consumes the whole context is rejected with
   `context_length_exceeded`.
 - A request that cannot fit the KV pool even with an empty queue is rejected
   with `insufficient_capacity`.
 - A full queue is rejected with `server_overloaded` and `Retry-After: 1`.
-- Output tokens are clamped to the remaining context, matching the CLI.
+- Output tokens are clamped to the remaining context, matching the CLI; the
+  request is not rejected solely because the requested output budget exceeds
+  the remaining positions.
 - A request that fails allocation when its task is built fails alone; the
   server stays alive and the scheduler slot is released.
 
@@ -194,10 +196,10 @@ Requirements and current behavior:
 ### 7.1 Configuration
 
 - F32 keys and values by default. `--kv-type f16` and `--kv-type q8_0` select
-  opt-in F16 and Q8_0 pools for the `qwen35` CPU backend and the `qwen3moe` HIP
-  backend. Dense CPU runtimes implement F32 only and reject other values
-  explicitly. The prefix-cache model key includes the format, and the F32 path
-  remains the numerical baseline.
+  opt-in F16 and Q8_0 pools for the `qwen35` CPU and HIP backends and for the
+  `qwen3moe` HIP backend. Dense CPU runtimes implement F32 only and reject
+  other values explicitly. The prefix-cache model key includes the format, and
+  the F32 path remains the numerical baseline.
 - Configurable block size; the server and benchmark default to 16 tokens.
 - One allocator per model with a fixed block count derived from context and
   concurrency, or set explicitly with `--kv-blocks`.
@@ -332,13 +334,15 @@ followed by `[DONE]`.
 | --- | --- | --- |
 | `invalid_request` | 400 | Malformed JSON, empty messages, invalid content |
 | `unsupported_parameter` | 400 | A known OpenAI parameter outside the supported subset |
-| `context_length_exceeded` | 400 | Prompt plus output exceeds the configured context |
+| `context_length_exceeded` | 400 | Prompt alone exceeds the configured context |
 | `model_not_found` | 404 | Requested model identifier is not loaded |
+| `method_not_allowed` | 405 | An endpoint was called with the wrong HTTP method |
 | `server_overloaded` | 429 | Queue depth limit reached; retryable |
 | `insufficient_capacity` | 503 | KV pool cannot admit the request; retryable |
 | `request_timeout` | 504 | Request deadline expired |
 | `client_closed` | 499 | Client cancelled the request |
 | `generation_error` | 500 | Model, device, or streaming failure |
+| `tokenizer_error` | 500 | Tokenization or chat rendering failed after admission |
 
 ## 10. Observability
 
