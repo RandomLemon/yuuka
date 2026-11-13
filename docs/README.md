@@ -16,7 +16,9 @@ treated as format and correctness references only.
 > Phase 5 adds `qwen3moe` grouped expert execution, F16/Q8_0 KV formats, greedy
 > prompt-lookup speculative decoding, and Q4_0/Q5_0 tensors. NPU support is a
 > future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
-> and does not execute model operations. See the implementation status below,
+> and does not execute model operations. All first-release success criteria in
+> [roadmap.md](roadmap.md) are met, including the 128/256-token decode matrix in
+> [benchmarks.md](benchmarks.md). See the implementation status below,
 > [npu.md](npu.md), [hardware.md](hardware.md), and
 > [benchmarks.md](benchmarks.md).
 

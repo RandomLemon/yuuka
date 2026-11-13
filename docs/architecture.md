@@ -368,9 +368,13 @@ yuuka/
 │   ├── embedding/
 │   ├── gemm/
 │   ├── gemv/
+│   ├── moe/
 │   ├── ops/
+│   ├── prefill/
 │   ├── ssm/
 │   ├── common.cuh
+│   ├── kv.cuh
+│   ├── quant.cuh
 │   └── yuuka_kernels.h
 ├── tests/
 │   ├── fixture/               # Deterministic tiny GGUF generators
@@ -434,10 +438,14 @@ decision and the phase that may reopen it are recorded below.
    and falls back to stream submission on any failure. The measured decode gain
    on the validated model was within noise, so the plain stream path is the
    default.
-4. **Dispatch tables.** Tables are versioned Go data keyed by operator, dtype,
-   shape class, batch class, and measured device. They are generated from the
-   checked-in benchmark harness and gated by correctness tests. Values from
-   other RDNA parts are not accepted.
+4. **Dispatch decisions.** Measured thresholds are encoded in explicit Go
+   selectors (`backend/hip.SelectGemvPath` and `SelectPrefillPath`) keyed by
+   operator family, dtype, shape class, and batch class. They are derived from
+   the checked-in sweep harness and recorded in
+   [benchmarks.md](benchmarks.md), and they are gated by dispatch tests. There is
+   no runtime autotuner or device table registry; adding a device requires
+   re-running the sweeps and updating the selectors and tests. Values from other
+   RDNA parts are not accepted.
 5. **Fallback semantics.** Unsupported dtype/shape combinations fail during
    planning with a capability error; silent numerical substitution is forbidden.
    rocBLAS may be selected for prefill only through a measured dispatch table.

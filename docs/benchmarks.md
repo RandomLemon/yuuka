@@ -1,8 +1,9 @@
 # Benchmark Report: Qwen3.5-4B Q4_K_M
 
 This report records single-request CPU-versus-HIP measurements, the Phase 2
-decode baseline, the Phase 3 prefill results, Phase 4 serving results, and the
-Phase 5 KV-format, speculative-decoding, MoE, and quantization measurements. It
+decode baseline, the Phase 3 prefill results, Phase 4 serving results, the
+release decode-length matrix, and the Phase 5 KV-format,
+speculative-decoding, MoE, and quantization measurements. It
 follows the metadata requirements in [testing.md](testing.md) as far as the
 current tooling allows. The early decode section is a correctness-phase
 baseline, not a tuned performance result; the Phase 3 section records measured
@@ -317,7 +318,7 @@ every projection. Prefill time is 0.526 s, 0.265 s, and 0.167 s respectively.
 
 ### Kernel resource usage
 
-`scripts/kernel_resources.sh` compiles the prefill kernels with
+`scripts/kernel_resources.sh` compiles the dispatched kernel families with
 `-Rpass-analysis=kernel-resource-usage`. All listed kernels report zero scratch,
 zero VGPR spills, and 16 waves/SIMD occupancy.
 
@@ -605,6 +606,25 @@ run-to-run noise in repeated sweeps; the dispatch table uses batch 4 for both
 Q4_0 and Q5_0. The tensor, GEMV, embedding, and WMMA paths pass randomized and
 non-aligned shape tests.
 
+### Phase 5 kernel resource usage
+
+`scripts/kernel_resources.sh` also compiles the Phase 5 GEMV, WMMA, and MoE
+variants. All rows report zero scratch, zero VGPR spills, and 16 waves/SIMD
+occupancy.
+
+| Kernel | VGPR | SGPR | Static LDS | Dynamic LDS |
+| --- | ---: | ---: | ---: | ---: |
+| `gemv_packed_kernel<Q4_0>` | 13 | 17 | 1,024 B | 0 |
+| `gemv_packed_kernel<Q5_0>` | 15 | 17 | 1,024 B | 0 |
+| `gemv_batch_kernel<Q4_0>` | 28 | 37 | 1,024 B | 0 |
+| `gemv_batch_kernel<Q5_0>` | 29 | 37 | 1,024 B | 0 |
+| `gemm_wmma_kernel<Q4_0>` | 46 | 26 | 14,336 B | 0 |
+| `gemm_wmma_kernel<Q5_0>` | 47 | 26 | 14,336 B | 0 |
+| `moe_route_kernel` | 10 | 32 | 0 | 0 |
+| `moe_gate_up_grouped_kernel` | 23 | 48 | 1,024 B | 0 |
+| `moe_down_grouped_kernel` | 21 | 42 | 1,024 B | 0 |
+| `moe_reduce_add_kernel` | 9 | 21 | 0 | 0 |
+
 ### Phase 5 reproduction
 
 ```bash
@@ -619,10 +639,54 @@ go run -tags hip ./cmd/yuuka bench --model "$YUUKA_TEST_MODEL" --backend hip \
 
 ./build/yuuka_gemv_sweep
 ./build/yuuka_moe_sweep
+scripts/kernel_resources.sh
 go test ./engine -run TestSpeculativePartialAcceptanceMatchesGreedy -v
 go test -tags hip ./engine/gpu -run TestTinyMoEQuantizedGPUMatchesCPU -v
 YUUKA_TEST_MODEL="$YUUKA_TEST_MODEL" go test -tags hip ./engine/gpu/... \
   -run 'TestGPURealModelKVFormats|TestGPURealModelSpeculativeMatchesGreedy' -v
+```
+
+## Release decode-length matrix
+
+This matrix completes the output-length dimension of the first-release
+performance gate. The Phase 3 curves cover the prompt-length dimension; this
+run covers the required 128- and 256-token decode lengths on the validated
+Qwen3.5-4B Q4_K_M file.
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-11-13 |
+| Model | `Qwen3.5-4B-Q4_K_M.gguf` |
+| Model SHA-256 | `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
+| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
+| ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
+| Host CPU / kernel | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S; Linux 6.17.13-21-pve |
+| Code commit / Go | `a67ec00`; Go 1.24.4 |
+| Backend / KV | HIP, F32 KV |
+| Execution path | Single request, plain stream (no HIP Graph replay) |
+| Prompt | 128 tokens from the bench prompt generator |
+| Sampling | Greedy, temperature 0 |
+| Warmup / repetitions | 1 / 3 |
+| Power performance level | `auto` reported by the amdgpu sysfs interface |
+
+| Decode tokens | Context | Prefill p50 / p95 | TTFT p50 / p95 | Decode p50 / p95 | Decode tok/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 320 | 0.409 s / 0.409 s | 0.409 s / 0.410 s | 13.223 s / 13.231 s | 9.60 |
+| 256 | 448 | 0.411 s / 0.412 s | 0.411 s / 0.412 s | 26.838 s / 26.846 s | 9.50 |
+
+Decode throughput uses `(decode_tokens - 1) / decode p50`, matching the CLI
+report. Decode is weight-bandwidth bound; the two rows differ by about 1%.
+
+Reproduction:
+
+```bash
+go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
+
+for n in 128 256; do
+  /tmp/yuuka-hip bench \
+    --model /path/to/Qwen3.5-4B-Q4_K_M.gguf --backend hip \
+    --prompt-tokens 128 --decode-tokens "$n" --warmup 1 --reps 3
+done
 ```
 
 ## Reproduction

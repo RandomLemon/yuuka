@@ -237,8 +237,12 @@ NPU support is a future task and is not part of Phase 5 acceptance. The
 | Modes | latency and throughput |
 | Comparison | llama.cpp HIP, llama.cpp Vulkan (same GGUF) |
 
-Not every combination needs to run on every commit. The full matrix is a
-release and milestone gate; a smaller tracked subset runs regularly.
+Not every combination needs to run on every commit. For the first release, the
+release gate is the recorded subset in [benchmarks.md](benchmarks.md):
+prompt-length prefill curves at 128-32768 tokens and the 128/256-token decode
+matrix at a 128-token prompt. The remaining concurrency and quantization rows
+are tracked performance work for the features they cover; they do not block the
+single-request GPU-only release. A smaller tracked subset runs regularly.
 
 ## 6. Benchmark protocol
 

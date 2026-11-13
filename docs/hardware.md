@@ -164,7 +164,7 @@ follow-ups would strengthen the evidence but are not Phase 0 gates:
 - A larger rocBLAS shape sweep and a WMMA tiled GEMM benchmark.
 - A final decision on which buffer classes, if any, should use mapped memory.
 
-## NPU capability probe (Phase 5)
+## NPU capability probe (diagnostic)
 
 `go run ./cmd/yuuka npu-probe` on the reference host reports:
 

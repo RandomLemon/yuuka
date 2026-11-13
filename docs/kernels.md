@@ -434,10 +434,12 @@ The registry records:
 
 ### 9.3 Offline tuning
 
-The primary source of dispatch decisions is an offline tuning table measured on
-gfx1151. Each table entry records the ROCm version, kernel version, shape class,
-and measured result. Runtime autotuning is optional and must be bounded so it
-does not dominate startup latency.
+Dispatch decisions are offline. Thresholds measured on gfx1151 are encoded in
+`backend/hip.SelectGemvPath` and `backend/hip.SelectPrefillPath`, keyed by
+operator family, dtype, shape class, and batch class, and recorded with the
+measurement environment in [benchmarks.md](benchmarks.md). There is no runtime
+autotuner. Adding a device requires re-running the sweeps and updating the
+selectors and tests.
 
 ### 9.4 Fallback
 
@@ -482,7 +484,9 @@ A kernel is not complete until:
 - [x] Its VGPR, LDS, scratch, and occupancy figures are recorded for the Phase
       0-3 kernel families (`scripts/kernel_resources.sh`, results in
       [benchmarks.md](benchmarks.md)).
-- [ ] New Phase 5 kernels have recorded VGPR, LDS, and occupancy figures.
+- [x] New Phase 5 kernels have recorded VGPR, LDS, and occupancy figures for the
+      GEMV, WMMA, and MoE variants (`scripts/kernel_resources.sh`, results in
+      [benchmarks.md](benchmarks.md)).
 - [x] The planner can select it and fall back from it.
 - [x] It is integrated into an end-to-end model run.
 - [x] It does not regress a previously accepted shape class.

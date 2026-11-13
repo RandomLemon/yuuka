@@ -31,9 +31,11 @@ Paged KV, iteration-level continuous batching, prefix caching, and opt-in HIP
 Graph capture/replay are implemented. Concurrent requests reproduce isolated-run
 tokens; cancellation and repeated cycles release every KV block. A
 short-context greedy baseline for Qwen3.5-4B Q4_K_M measured
-1.93 decode tok/s on the CPU reference and 9.87 decode tok/s on HIP; prefill
-throughput and prompt-length curves are in
-[`docs/benchmarks.md`](docs/benchmarks.md) with the exact conditions.
+1.93 decode tok/s on the CPU reference and 9.87 decode tok/s on HIP. At output
+lengths 128 and 256 tokens, HIP decodes 9.60 and 9.50 tok/s at a 128-token
+prompt. The release decode-length matrix, prefill throughput, and prompt-length
+curves are in [`docs/benchmarks.md`](docs/benchmarks.md) with the exact
+conditions.
 
 ## Supported models
 

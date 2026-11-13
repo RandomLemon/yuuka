@@ -30,20 +30,27 @@ First target:
 
 ## 3. Current repository state
 
-The repository contains a working single-request vertical slice:
+The repository contains an end-to-end single-node implementation:
 
 - Go module and package layout for GGUF, tokenizer, tensor, model, engine,
-  backends, CLI, and server.
+  scheduler, memory, serving, backends, CLI, and server.
 - Pure Go GGUF reader with validation and mmap-backed tensor storage.
 - Qwen3.5 (`qwen35`) tokenizer, chat rendering, CPU reference forward pass, and
   golden token tests.
-- HIP C ABI, plan executor, and kernels for the full `qwen35` decode graph.
+- HIP C ABI, plan executor, and kernels for the full `qwen35` decode and chunked
+  prefill graphs, plus `qwen3moe` expert routing and grouped kernels.
 - rocWMMA/rocBLAS prefill GEMM, causal GQA Flash Attention, and chunked prefill.
+- Paged KV, iteration-level continuous scheduling, prefix caching, and opt-in
+  HIP Graph replay.
 - `yuuka` CLI and OpenAI-compatible `yuuka-server`.
-- Native CTest coverage for the ABI, quantized GEMV, and prefill kernels.
+- Native CTest coverage for the ABI, quantized GEMV, operators, GEMM, prefill,
+  paged KV/graph, embedding, and MoE kernels.
 
-Not yet implemented: paged KV, continuous batching, prefix cache, HIP Graph, and
-HIP execution for architectures other than `qwen35`.
+Not yet implemented: HIP execution for dense Llama/Qwen3 models, real-model
+`qwen3moe` validation (synthetic fixtures only), NPU execution (the probe is
+diagnostic), quantization presets outside the documented set, speculative
+decoding for non-greedy sampling or the MoE HIP runtime, and fused mixed-shape
+multi-request batching. See `docs/README.md` for the full status.
 
 Therefore:
 

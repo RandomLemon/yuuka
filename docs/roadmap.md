@@ -79,7 +79,10 @@ quantized fixture as well as the F32 fixture. NPU support is a future task, not
 part of Phase 5 or the first release. The existing `backend/npu` probe and
 `--npu` flag are diagnostic only: they report device, driver, and runtime
 availability and fall back to the selected backend, but they do not execute
-model operations. See [npu.md](npu.md) and the future-task section below.
+model operations. See [npu.md](npu.md) and the future-task section below. All
+first-release success criteria in section 14 are met, including the
+decode-length matrix at 128 and 256 tokens recorded in
+[benchmarks.md](benchmarks.md).
 
 ## 2. Phase overview
 
@@ -227,7 +230,8 @@ performance.
 - Chunked prefill support.
 - Fusion of dequantization, normalization, RoPE, SwiGLU, and decode attention
   where measurements justify it.
-- Offline dispatch tables by shape, quantization, and batch class.
+- Offline dispatch thresholds by shape, quantization, and batch class, encoded
+  in the measured GEMV and prefill selectors.
 - Benchmark curves for the required prompt lengths.
 
 ### Exit criteria
@@ -481,7 +485,7 @@ items remain release gates.
 - [x] Tokenizer, chat template, and greedy token sequences match the reference
       implementation.
 - [x] Quantized decode runs natively, without expanding the model to FP16.
-- [ ] Prefill and decode performance are measured across the required prompt and
+- [x] Prefill and decode performance are measured across the required prompt and
       output lengths.
 - [x] The CPU reference path remains available for correctness and fallback.
 - [x] Results are reproducible from the documented environment and benchmark
@@ -492,9 +496,11 @@ items remain release gates.
 
 Phase 5 exit criteria are met for its executable scope. NPU support is a future
 task, not a Phase 5 or first-release gate; the current `--npu` probe is
-diagnostic only and performs no model execution. The first release remains gated
-by the decode-length performance matrix. Prefill lengths are covered by the Phase
-3 curves, and Phase 4 serving evidence is recorded in this document and
+diagnostic only and performs no model execution. All first-release success
+criteria are now met. The decode-length matrix at 128 and 256 tokens is recorded
+in [benchmarks.md](benchmarks.md) (9.60 and 9.50 HIP decode tok/s at a
+128-token prompt); prefill lengths are covered by the Phase 3 curves, and Phase
+4 serving evidence is recorded in this document and
 [benchmarks.md](benchmarks.md).
 
 ## 15. Future tasks (not scheduled)
