@@ -83,6 +83,27 @@ func TestRenderChatRejectsNonQwenTemplate(t *testing.T) {
 	}
 }
 
+func TestRenderChatMultiTurn(t *testing.T) {
+	tok := &Tokenizer{template: "<|im_start|>"}
+	prompt, err := tok.RenderChat([]Message{
+		{Role: "system", Content: "Be concise."},
+		{Role: "user", Content: "First question"},
+		{Role: "assistant", Content: "First answer"},
+		{Role: "user", Content: "Second question"},
+	}, ChatOptions{AddGenerationPrompt: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "<|im_start|>system\nBe concise.<|im_end|>\n" +
+		"<|im_start|>user\nFirst question<|im_end|>\n" +
+		"<|im_start|>assistant\nFirst answer<|im_end|>\n" +
+		"<|im_start|>user\nSecond question<|im_end|>\n" +
+		"<|im_start|>assistant\n<think>\n\n</think>\n\n"
+	if prompt != want {
+		t.Fatalf("prompt = %q, want %q", prompt, want)
+	}
+}
+
 func TestRenderChatPrompt(t *testing.T) {
 	tok := openTestTokenizer(t)
 	prompt, err := tok.RenderPrompt("You are helpful.", "Hi", ChatOptions{AddGenerationPrompt: true})

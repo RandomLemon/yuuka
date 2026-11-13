@@ -103,7 +103,7 @@ func TestDenseForward(t *testing.T) {
 // and tokenizer. It guards the Llama tensor layout and CPU math.
 func TestTinyLlamaMatchesLlamaCPP(t *testing.T) {
 	_, tok, model := openTinyDense(t, Llama)
-	ids, err := tok.Encode("<s>Hello")
+	ids, err := tok.EncodePrompt("Hello")
 	if err != nil {
 		t.Fatal(err)
 	}

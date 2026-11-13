@@ -485,7 +485,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), id)
 		return
 	}
-	ids, err := s.tokenizer.Encode(prompt)
+	ids, err := s.tokenizer.EncodePrompt(prompt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "tokenizer_error", err.Error(), id)
 		return

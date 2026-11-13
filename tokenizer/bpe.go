@@ -264,7 +264,8 @@ func (t *Tokenizer) BOSToken() int32 { return t.bos }
 // PadToken returns the padding ID, or -1 when absent.
 func (t *Tokenizer) PadToken() int32 { return t.pad }
 
-// AddBOS reports whether the model metadata requests automatic BOS insertion.
+// AddBOS reports whether the GGUF metadata requests BOS insertion for prompts.
+// EncodePrompt applies it; Encode does not.
 func (t *Tokenizer) AddBOS() bool { return t.addBOS }
 
 // ChatTemplate returns the GGUF chat template source, if present.
@@ -278,8 +279,9 @@ func (t *Tokenizer) TokenText(id int32) (string, error) {
 	return t.vocab[id], nil
 }
 
-// Encode converts UTF-8 text to token IDs. Special control tokens in the input
-// are matched literally and are not split by BPE.
+// Encode converts UTF-8 text to token IDs without inserting BOS. Special
+// control tokens in the input are matched literally and are not split by BPE.
+// Use EncodePrompt for generation prompts that must honor add_bos_token.
 func (t *Tokenizer) Encode(text string) ([]int32, error) {
 	out := make([]int32, 0, len(text)/3+1)
 	start := 0
@@ -317,6 +319,27 @@ func (t *Tokenizer) Encode(text string) ([]int32, error) {
 		}
 	}
 	return out, nil
+}
+
+// EncodePrompt converts a generation prompt to token IDs. When the GGUF
+// metadata requests add_bos_token, it prepends the BOS token unless the encoded
+// sequence already starts with it. Raw Encode calls remain free of implicit BOS
+// insertion for tokenizer and cross-framework comparisons.
+func (t *Tokenizer) EncodePrompt(text string) ([]int32, error) {
+	ids, err := t.Encode(text)
+	if err != nil {
+		return nil, err
+	}
+	if !t.addBOS {
+		return ids, nil
+	}
+	if t.bos < 0 {
+		return nil, fmt.Errorf("tokenizer: add_bos_token is set but bos_token_id is missing")
+	}
+	if len(ids) > 0 && ids[0] == t.bos {
+		return ids, nil
+	}
+	return append([]int32{t.bos}, ids...), nil
 }
 
 func (t *Tokenizer) matchSpecial(s string) (int32, int, bool) {

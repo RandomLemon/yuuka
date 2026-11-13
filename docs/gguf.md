@@ -162,8 +162,11 @@ support the tokenizer families used by the target models:
 Current implementation: Qwen2/Qwen3.5 GPT-2 byte-level BPE and Llama-family
 SentencePiece vocabularies are implemented, including special-token matching,
 byte fallback, SentencePiece scores, dummy-prefix handling, and Qwen chat
-rendering gated on the metadata template. Non-Qwen chat templates are rejected
-explicitly and are not yet implemented.
+rendering gated on the metadata template. Generation prompts use
+`Tokenizer.EncodePrompt`, which inserts BOS when `tokenizer.ggml.add_bos_token`
+is true and the encoded sequence does not already start with it; raw `Encode`
+remains BOS-free for tokenizer and cross-framework comparisons. Non-Qwen chat
+templates are rejected explicitly and are not yet implemented.
 
 Correctness checks must compare **token IDs**, not only decoded text, against a
 trusted reference implementation. The comparison set must include:

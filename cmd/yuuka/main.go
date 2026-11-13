@@ -317,7 +317,7 @@ func runGenerate(args []string) error {
 			return err
 		}
 	}
-	ids, err := l.tokenizer.Encode(text)
+	ids, err := l.tokenizer.EncodePrompt(text)
 	if err != nil {
 		return err
 	}
@@ -405,7 +405,7 @@ func runBench(args []string) error {
 	}
 	defer l.Close()
 	corpus := strings.Repeat("The quick brown fox jumps over the lazy dog. ", (*promptTokens+8)/8+2)
-	ids, err := l.tokenizer.Encode(corpus)
+	ids, err := l.tokenizer.EncodePrompt(corpus)
 	if err != nil {
 		return err
 	}

@@ -219,13 +219,13 @@ func printSummary(name string, values []sample, pick func(sample) time.Duration)
 }
 
 func makePrompt(tok *tokenizer.Tokenizer, tokens int) []int32 {
-	var ids []int32
-	for len(ids) < tokens {
-		encoded, err := tok.Encode("The quick brown fox jumps over the lazy dog. ")
-		if err != nil || len(encoded) == 0 {
-			log.Fatal("encode benchmark prompt")
-		}
-		ids = append(ids, encoded...)
+	corpus := strings.Repeat("The quick brown fox jumps over the lazy dog. ", (tokens+8)/8+2)
+	ids, err := tok.EncodePrompt(corpus)
+	if err != nil || len(ids) == 0 {
+		log.Fatal("encode benchmark prompt")
+	}
+	if len(ids) < tokens {
+		log.Fatalf("benchmark prompt produced %d tokens, need %d", len(ids), tokens)
 	}
 	return append([]int32(nil), ids[:tokens]...)
 }
