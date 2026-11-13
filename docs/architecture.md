@@ -194,12 +194,15 @@ Decode loop: quantized GEMV + paged attention + sampling
 Stream tokens / finish / release request resources
 ```
 
-Current status: both CPU and HIP `qwen35` paths process prompts through cached
-chunked prefill plans (batched WMMA or rocBLAS GEMM, paged Flash Attention, and
-paged KV writes) and then decode through the single-token paged plan. The
-serving scheduler interleaves requests on one model stream. HIP Graph capture
-and replay are implemented per session but opt-in; the plain stream path is the
-default because the measured decode gain was within noise.
+Current status: the HIP `qwen35` path processes prompts through cached chunked
+prefill plans (batched WMMA or rocBLAS GEMM, paged Flash Attention, and paged KV
+writes) and then decodes through the single-token paged plan. The CPU reference
+path processes the prompt one token at a time through the reference operators
+and uses the same paged KV and recurrent-state interfaces, but it does not build
+WMMA, rocBLAS, or Flash Attention plans. The serving scheduler interleaves
+requests on one model stream. HIP Graph capture and replay are implemented per
+session but opt-in; the plain stream path is the default because the measured
+decode gain was within noise.
 
 The CPU reference also covers dense Llama, dense Qwen3, and `qwen3moe`. The HIP
 backend executes `qwen35` and `qwen3moe`; MoE uses top-k routing, assignment
@@ -212,10 +215,11 @@ Key rules:
 
 1. GGUF data is validated before any device allocation.
 2. Weights are loaded into a device-resident pool for the model lifetime.
-3. Prefill and decode share the KV cache but use different operator paths.
-   Prefill uses chunked batched plans; decode uses the single-token GEMV and
-   per-head attention graph. Dense models still use the decode graph for
-   prompts because their HIP execution path is not implemented.
+3. HIP prefill and decode share the KV cache but use different operator paths.
+   HIP prefill uses chunked batched plans; decode uses the single-token GEMV
+   and per-head attention graph. The CPU reference processes tokens one at a
+   time for both phases. Dense models have no HIP execution path and run on the
+   CPU reference.
 4. Sampling may run on the GPU or on the host through a low-overhead path; the
    choice is a plan decision, not a per-token branch in model code.
 5. Request cancellation releases KV blocks and scratch through the scheduler
