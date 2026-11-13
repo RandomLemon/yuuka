@@ -130,6 +130,15 @@ float max_diff(const std::vector<float> & a, const std::vector<float> & b) {
     return worst;
 }
 
+int expect_graph_rejected(context & ctx, yuuka_plan * plan, yuuka_buffer * dynamic) {
+    yuuka_graph * graph = nullptr;
+    const yuuka_status status = yuuka_graph_create(plan, ctx.stream, dynamic, 1, &graph);
+    CHECK(status == YUUKA_ERR_UNSUPPORTED);
+    CHECK(graph == nullptr);
+    CHECK(std::strstr(yuuka_last_error(), "position-dependent") != nullptr);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -301,6 +310,73 @@ int main() {
         CHECK(graph == nullptr);
         yuuka_buffer_free(dynamic);
         yuuka_plan_destroy(legacy);
+    }
+
+    // Batch and prefill ops that read the host position must also be rejected,
+    // not captured with a pinned position.
+    {
+        yuuka_buffer * dynamic = upload(ctx, nullptr, 2 * sizeof(int32_t));
+        CHECK(dynamic != nullptr);
+        CHECK(expect_graph_rejected(ctx, prefill, dynamic) == 0);
+
+        yuuka_plan * rope = nullptr;
+        CHECK_STATUS(yuuka_plan_create(ctx.device, &rope));
+        {
+            yuuka_op op{};
+            op.code = YUUKA_OP_ROPE_BATCH;
+            op.buf[0] = q_buf;
+            op.n[0] = kHeads;
+            op.n[1] = 2 * kHeadDim;
+            op.n[2] = kHeadDim;
+            op.n[3] = kHeadDim;
+            op.n[4] = kRows;
+            op.n[5] = kHeads * 2 * kHeadDim;
+            op.f[0] = 10000.0f;
+            CHECK_STATUS(yuuka_plan_add(rope, &op));
+        }
+        CHECK(expect_graph_rejected(ctx, rope, dynamic) == 0);
+
+        yuuka_plan * kv_write = nullptr;
+        CHECK_STATUS(yuuka_plan_create(ctx.device, &kv_write));
+        {
+            yuuka_op op{};
+            op.code = YUUKA_OP_KV_WRITE_BATCH;
+            op.buf[0] = k_src;
+            op.buf[1] = v_src;
+            op.buf[2] = k_pool;
+            op.buf[3] = v_pool;
+            op.n[0] = kKVDim;
+            op.n[1] = kRows;
+            op.u[0] = kCapacity;
+            CHECK_STATUS(yuuka_plan_add(kv_write, &op));
+        }
+        CHECK(expect_graph_rejected(ctx, kv_write, dynamic) == 0);
+
+        yuuka_plan * attention = nullptr;
+        CHECK_STATUS(yuuka_plan_create(ctx.device, &attention));
+        {
+            yuuka_op op{};
+            op.code = YUUKA_OP_ATTENTION_PREFILL;
+            op.buf[0] = q_buf;
+            op.buf[1] = k_pool;
+            op.buf[2] = v_pool;
+            op.buf[3] = out;
+            op.buf[4] = scores;
+            op.n[0] = kKVHeads;
+            op.n[1] = kHeads;
+            op.n[2] = kHeadDim;
+            op.n[3] = kKVDim;
+            op.n[4] = kRows;
+            op.u[0] = kCapacity;
+            op.f[0] = 1.0f / std::sqrt(float(kHeadDim));
+            CHECK_STATUS(yuuka_plan_add(attention, &op));
+        }
+        CHECK(expect_graph_rejected(ctx, attention, dynamic) == 0);
+
+        yuuka_plan_destroy(attention);
+        yuuka_plan_destroy(kv_write);
+        yuuka_plan_destroy(rope);
+        yuuka_buffer_free(dynamic);
     }
 
     // Device-to-device copy used for private prefix blocks.

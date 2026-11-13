@@ -295,9 +295,11 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   MOE_REDUCE_ADD: buf0 x, buf1 expert_out, buf2 weights;
  *                   n={hidden,rows,used}
  *
- * Graph capture executes a plan with device-resident dynamic parameters. Only
- * ops with dynamic-aware kernels may be captured; otherwise capture fails with
- * YUUKA_ERR_UNSUPPORTED and the caller falls back to normal submission. */
+ * Graph capture executes a plan with device-resident dynamic parameters.
+ * Position-dependent ops must have a dynamic-parameter kernel; plans containing
+ * any other position-dependent op are rejected with YUUKA_ERR_UNSUPPORTED and
+ * the caller falls back to normal submission. Ops whose arguments do not depend
+ * on the token or position are capturable as-is. */
 YUUKA_API yuuka_status yuuka_graph_create(yuuka_plan * plan, yuuka_stream * stream,
                                           yuuka_buffer * dynamic, int run_tail,
                                           yuuka_graph ** out);

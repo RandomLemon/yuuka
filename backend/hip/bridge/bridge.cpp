@@ -1380,17 +1380,25 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
 }
 
 
-bool op_supports_dynamic(const yuuka_op & op) {
+bool op_is_graph_capturable(const yuuka_op & op) {
     switch (op.code) {
+        // Position-dependent ops with a device-parameter kernel.
         case YUUKA_OP_EMBEDDING:
         case YUUKA_OP_ROPE:
         case YUUKA_OP_KV_WRITE_PAGED:
         case YUUKA_OP_KV_WRITE_BATCH_PAGED:
         case YUUKA_OP_ATTENTION_PAGED:
             return true;
+        // Position-dependent ops without a device-parameter kernel. Capturing
+        // any of these would pin the host token or position used at capture.
+        case YUUKA_OP_ROPE_BATCH:
+        case YUUKA_OP_KV_WRITE_BATCH:
+        case YUUKA_OP_ATTENTION_PREFILL:
+        case YUUKA_OP_ATTENTION_PREFILL_PAGED:
         case YUUKA_OP_ATTENTION:
         case YUUKA_OP_KV_WRITE:
             return false;
+        // Token- and position-independent ops are safe to replay as-is.
         default:
             return true;
     }
@@ -2137,9 +2145,10 @@ YUUKA_API yuuka_status yuuka_graph_create(yuuka_plan * plan, yuuka_stream * stre
             if ((op.flags & YUUKA_OP_FLAG_TAIL) != 0 && run_tail == 0) {
                 continue;
             }
-            if (!op_supports_dynamic(op)) {
+            if (!op_is_graph_capturable(op)) {
                 return fail(YUUKA_ERR_UNSUPPORTED,
-                            "plan op %u has no dynamic-parameter kernel", op.code);
+                            "plan op %u is position-dependent and has no "
+                            "dynamic-parameter kernel", op.code);
             }
         }
         hipError_t err = hipStreamSynchronize(stream->stream);

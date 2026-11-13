@@ -152,8 +152,9 @@ Paged KV and graph replay have dedicated native coverage in
 - device-to-device block copies used for private prefix blocks;
 - graph capture and replay with device-resident token/position updates across
   several positions;
-- rejection of plans containing position-dependent legacy ops, so the runtime
-  can fall back instead of replaying stale arguments.
+- rejection of plans containing position-dependent ops without a
+  dynamic-parameter kernel, so the runtime can fall back instead of replaying
+  stale arguments.
 
 Serving tests are split by layer:
 
