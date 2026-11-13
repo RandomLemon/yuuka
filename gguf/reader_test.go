@@ -126,8 +126,21 @@ func writeRawValue(buf *strings.Builder, v Value) {
 		}
 	case MetaString:
 		writeString(buf, v.String)
+	case MetaArray:
+		writeValue(buf, v)
 	default:
 		panic("unsupported test array element type")
+	}
+}
+
+func assertNoMapping(t *testing.T, path string) {
+	t.Helper()
+	maps, err := os.ReadFile("/proc/self/maps")
+	if err != nil {
+		t.Skipf("cannot inspect mappings: %v", err)
+	}
+	if strings.Contains(string(maps), path) {
+		t.Fatalf("mapping for %s leaked", path)
 	}
 }
 
@@ -241,6 +254,43 @@ func TestReaderValidF32(t *testing.T) {
 	}
 }
 
+func TestReaderNestedMetadataArray(t *testing.T) {
+	nested := Value{Type: MetaArray, ElemType: MetaArray, Array: []Value{
+		strArray([]string{"a", "b"}),
+		strArray([]string{"c"}),
+	}}
+	path := filepath.Join(t.TempDir(), "nested.gguf")
+	writeTestFile(t, path, testFile{
+		metadata: []testKV{{"nested", nested}},
+		tensors:  []testTensor{{"w", []uint64{4}, tensor.F32, 0}},
+		data:     make([]byte, 16),
+	})
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	value, ok := r.MetadataValue("nested")
+	if !ok {
+		t.Fatal("nested metadata is missing")
+	}
+	if value.Type != MetaArray || value.ElemType != MetaArray || len(value.Array) != 2 {
+		t.Fatalf("nested metadata = %+v", value)
+	}
+	first, err := value.Array[0].AsStrings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := value.Array[1].AsStrings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || first[0] != "a" || first[1] != "b" ||
+		len(second) != 1 || second[0] != "c" {
+		t.Fatalf("nested values = %v, %v", first, second)
+	}
+}
+
 func TestReaderRejectsMalformed(t *testing.T) {
 	tests := []struct {
 		name string
@@ -255,9 +305,23 @@ func TestReaderRejectsMalformed(t *testing.T) {
 			want: ErrMalformed,
 		},
 		{
+			name: "truncated header",
+			file: testFile{},
+			mut:  func(b []byte) []byte { return b[:8] },
+			want: ErrMalformed,
+		},
+		{
 			name: "unsupported version",
 			file: testFile{version: 1},
 			want: ErrUnsupported,
+		},
+		{
+			name: "tensor rank exceeds limit",
+			file: testFile{
+				tensors: []testTensor{{"w", make([]uint64, 9), tensor.F32, 0}},
+				data:    make([]byte, 64),
+			},
+			want: ErrMalformed,
 		},
 		{
 			name: "duplicate metadata",
@@ -342,6 +406,7 @@ func TestReaderRejectsMalformed(t *testing.T) {
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("error %v is not %v", err, tc.want)
 			}
+			assertNoMapping(t, path)
 		})
 	}
 }

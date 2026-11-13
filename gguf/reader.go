@@ -442,9 +442,6 @@ func readRawValue(c *cursor, typ MetadataType, depth int) (Value, error) {
 			return Value{}, err
 		}
 		elemType := MetadataType(elemRaw)
-		if elemType == MetaArray {
-			return Value{}, fmt.Errorf("nested arrays are not supported")
-		}
 		count, err := c.u64()
 		if err != nil {
 			return Value{}, err
@@ -461,6 +458,9 @@ func readRawValue(c *cursor, typ MetadataType, depth int) (Value, error) {
 			minSize = 8
 		case MetaString:
 			minSize = 8
+		case MetaArray:
+			// A nested array value repeats its own type and count.
+			minSize = 16
 		default:
 			return Value{}, fmt.Errorf("unknown array element type %s", elemType)
 		}
@@ -472,9 +472,18 @@ func readRawValue(c *cursor, typ MetadataType, depth int) (Value, error) {
 		}
 		items := make([]Value, count)
 		for i := range items {
-			item, err := readRawValue(c, elemType, depth+1)
+			var item Value
+			if elemType == MetaArray {
+				item, err = readValue(c, depth+1)
+			} else {
+				item, err = readRawValue(c, elemType, depth+1)
+			}
 			if err != nil {
 				return Value{}, eErrArrayElement(c, i, err)
+			}
+			if item.Type != elemType {
+				return Value{}, eErrArrayElement(c, i,
+					fmt.Errorf("element type %s does not match array type %s", item.Type, elemType))
 			}
 			items[i] = item
 		}
