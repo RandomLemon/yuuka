@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -278,6 +279,7 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	prefix := metrics.Prefix
 	fmt.Fprintf(w, "# HELP yuuka_requests_total Accepted submissions.\n")
 	fmt.Fprintf(w, "# TYPE yuuka_requests_total counter\nyuuka_requests_total %d\n", sched.Submissions)
+	fmt.Fprintf(w, "# TYPE yuuka_requests_admitted_total counter\nyuuka_requests_admitted_total %d\n", sched.Admitted)
 	fmt.Fprintf(w, "# TYPE yuuka_requests_completed_total counter\nyuuka_requests_completed_total %d\n", sched.Completed)
 	fmt.Fprintf(w, "# TYPE yuuka_requests_failed_total counter\nyuuka_requests_failed_total %d\n", sched.Failures)
 	fmt.Fprintf(w, "# TYPE yuuka_requests_cancelled_total counter\nyuuka_requests_cancelled_total %d\n", sched.Cancelled)
@@ -536,19 +538,38 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	stream := req.Stream
 	var flusher http.Flusher
 	if stream {
+		flusher, _ = w.(http.Flusher)
+	}
+	var streamMu sync.Mutex
+	streamStarted := false
+	startStream := func() {
+		if !stream {
+			return
+		}
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		if streamStarted {
+			return
+		}
+		streamStarted = true
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		flusher, _ = w.(http.Flusher)
 		writeChunk(w, id, time.Now().Unix(), s.modelName, map[string]string{"role": "assistant"}, "")
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
+	streamIsStarted := func() bool {
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		return streamStarted
+	}
 	sink := func(token int32, delta string) error {
 		if !stream || delta == "" {
 			return nil
 		}
+		startStream()
 		writeChunk(w, id, time.Now().Unix(), s.modelName, map[string]string{"content": delta}, "")
 		if flusher != nil {
 			flusher.Flush()
@@ -564,9 +585,10 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		StopTokens:  req.StopTokenIDs,
 		StopStrings: req.Stop,
 		Sink:        sink,
+		Submitted:   startStream,
 	})
 	if genErr != nil {
-		if stream {
+		if stream && streamIsStarted() {
 			code, message, status := classifyError(genErr)
 			if r.Context().Err() == nil {
 				writeSSEError(w, id, code, message, status)
@@ -588,6 +610,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	logRequest(id, result.PromptTokens, result.OutputTokens, nil, result)
 	if stream {
+		startStream()
 		writeChunk(w, id, time.Now().Unix(), s.modelName, nil, finishReason)
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		if flusher != nil {

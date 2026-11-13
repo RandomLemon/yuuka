@@ -64,18 +64,23 @@ func loadTiny(t *testing.T) (*gguf.Reader, *tokenizer.Tokenizer, *qwen35.Model) 
 
 func newTestServerWith(t *testing.T, backend serving.Backend, tok *tokenizer.Tokenizer, model *qwen35.Model) *server {
 	t.Helper()
+	return newTestServerWithConfig(t, backend, tok, model, scheduler.Config{
+		MaxActive:       2,
+		MaxQueue:        4,
+		MaxBatch:        2,
+		PrefillChunk:    16,
+		PrefillPerCycle: 1,
+		DecodePerCycle:  2,
+		RequestTimeout:  time.Minute,
+		QueueTimeout:    5 * time.Second,
+	})
+}
+
+func newTestServerWithConfig(t *testing.T, backend serving.Backend, tok *tokenizer.Tokenizer, model *qwen35.Model, cfg scheduler.Config) *server {
+	t.Helper()
 	manager, err := serving.NewManager(backend, tok, serving.Options{
 		ContextSize: 128,
-		Scheduler: scheduler.Config{
-			MaxActive:       2,
-			MaxQueue:        4,
-			MaxBatch:        2,
-			PrefillChunk:    16,
-			PrefillPerCycle: 1,
-			DecodePerCycle:  2,
-			RequestTimeout:  time.Minute,
-			QueueTimeout:    5 * time.Second,
-		},
+		Scheduler:   cfg,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -343,6 +348,7 @@ func TestHealthMetricsAndPprof(t *testing.T) {
 	metrics.Body.Close()
 	for _, name := range []string{
 		"yuuka_requests_total",
+		"yuuka_requests_admitted_total",
 		"yuuka_request_queue_depth",
 		"yuuka_ttft_seconds{quantile=\"0.95\"}",
 		"yuuka_kv_blocks_used",
@@ -394,6 +400,115 @@ func (s *slowSequence) Prefill(tokens []int32, final bool) ([]float32, error) {
 func (s *slowSequence) Decode(token int32) ([]float32, error) {
 	time.Sleep(s.delay)
 	return s.Sequence.Decode(token)
+}
+
+func waitForScheduler(t *testing.T, s *server, check func(scheduler.Metrics) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		metrics := s.manager.Metrics().Scheduler
+		if check(metrics) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scheduler state not reached: %+v", metrics)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestStreamQueueFullReturnsHTTP429(t *testing.T) {
+	_, tok, model := loadTiny(t)
+	base, err := serving.NewQwen35Backend(model, "tiny-queue-full-test", 64, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(t, slowBackend{Backend: base, delay: 50 * time.Millisecond}, tok, model,
+		scheduler.Config{
+			MaxActive:       1,
+			MaxQueue:        1,
+			MaxBatch:        1,
+			PrefillChunk:    16,
+			PrefillPerCycle: 1,
+			DecodePerCycle:  1,
+			RequestTimeout:  time.Minute,
+			QueueTimeout:    5 * time.Second,
+		})
+	httpServer := httptest.NewServer(testMux(s))
+	defer httpServer.Close()
+
+	var wg sync.WaitGroup
+	start := func(ctx context.Context) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+				httpServer.URL+"/v1/chat/completions", bytes.NewBufferString(
+					`{"messages":[{"role":"user","content":"hello"}],"max_tokens":32,"temperature":0,"stream":true}`))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+		}()
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	start(ctx1)
+	waitForScheduler(t, s, func(metrics scheduler.Metrics) bool {
+		return metrics.Admitted == 1
+	})
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	start(ctx2)
+	waitForScheduler(t, s, func(metrics scheduler.Metrics) bool {
+		return metrics.QueueDepth == 1
+	})
+
+	resp, err := http.Post(httpServer.URL+"/v1/chat/completions", "application/json",
+		bytes.NewBufferString(`{"messages":[{"role":"user","content":"hello"}],"max_tokens":4,"temperature":0,"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d, want 429: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Error.Code != "server_overloaded" {
+		t.Fatalf("error code = %q, want server_overloaded", payload.Error.Code)
+	}
+
+	cancel1()
+	cancel2()
+	stopped := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("streaming requests did not stop")
+	}
 }
 
 func TestStreamClientCancellationReleasesBlocks(t *testing.T) {

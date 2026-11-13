@@ -72,6 +72,11 @@ Implementation mapping:
 | CPU model execution | `model/qwen35`, `serving.Qwen35Backend` |
 | HIP model execution, paged kernels, graph replay | `engine/gpu`, `serving.Qwen35GPUBackend` |
 
+`serving.Request` carries an optional `Submitted` callback. It runs after the
+scheduler accepts the request into its queue and before generation waits. The
+HTTP layer uses it to start SSE only after the request is queued, so a queue-full
+rejection can still return HTTP `429` instead of a `200` SSE error.
+
 ## 3. Request lifecycle
 
 | State | Meaning | Exit conditions |
@@ -99,8 +104,11 @@ Admission prevents overcommit and keeps latency predictable. It accounts for:
   actual allocation but does not reduce the conservative admission estimate.
 - **Concurrency limit:** active requests (`--max-concurrency`) and queue depth
   (`--max-queue`).
-- **Scratch and graph workspace:** per-session prefill plans, trace buffers, and
-  graph executables.
+
+The admission estimate covers token and KV budgets plus the concurrency and
+queue limits. Scratch and graph workspace are allocated lazily per session after
+admission; their sizes are bounded by the model geometry and configured chunk
+size, not by a separate admission budget.
 
 Implementation policy:
 
@@ -109,6 +117,8 @@ Implementation policy:
 - A request that cannot fit the KV pool even with an empty queue is rejected
   with `insufficient_capacity`.
 - A full queue is rejected with `server_overloaded` and `Retry-After: 1`.
+  Streaming requests receive the HTTP error when rejection happens before the
+  first SSE event; errors after streaming starts use an SSE error event.
 - Output tokens are clamped to the remaining context, matching the CLI; the
   request is not rejected solely because the requested output budget exceeds
   the remaining positions.
@@ -172,9 +182,11 @@ latency/throughput mode switch is not exposed yet.
 
 Iteration-level continuous scheduling admits new requests between decode steps
 rather than waiting for the entire batch to finish. The active set is recomposed
-as requests arrive, complete, or cancel. Every iteration records its decode and
-prefill request IDs through the scheduler's `OnStep` hook. This is scheduler
-interleaving, not fused multi-request execution.
+as requests arrive, complete, or cancel. Every iteration can report its decode
+and prefill request IDs through the scheduler's `OnStep` hook; the server
+currently consumes only the aggregate last/max batch-size metrics and does not
+export per-iteration IDs. This is scheduler interleaving, not fused multi-request
+execution.
 
 Requirements and current behavior:
 
@@ -362,6 +374,7 @@ The KV allocator reports total, used, free, shared, and block size. The prefix
 cache reports entries, blocks, hits, misses, insertions, and evictions.
 
 `/metrics` exposes these as `yuuka_*` Prometheus counters and gauges, including
+`yuuka_requests_admitted_total`,
 `yuuka_ttft_seconds{quantile="0.5|0.95|0.99"}`, `yuuka_tpot_seconds`,
 `yuuka_queue_wait_seconds_total`, `yuuka_prefill_seconds_total`,
 `yuuka_decode_seconds_total`, and `yuuka_sampling_seconds_total`.

@@ -54,9 +54,13 @@ type Request struct {
 	StopStrings []string
 	IgnoreEOS   bool
 	// Sink receives emitted text deltas. Returning an error terminates the
-	// request with that error. The sink runs on the scheduler goroutine and must
+	// request with an error. The sink runs on the scheduler goroutine and must
 	// not block indefinitely.
 	Sink func(token int32, delta string) error
+	// Submitted is called after the scheduler accepts the request into its
+	// queue and before waiting for admission or completion. It may be nil. It
+	// runs on the Generate caller's goroutine and must not block indefinitely.
+	Submitted func()
 }
 
 // Result reports the terminal state and timings of one request.

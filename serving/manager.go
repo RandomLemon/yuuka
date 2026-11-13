@@ -216,6 +216,9 @@ func (m *Manager) Generate(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if req.Submitted != nil {
+		req.Submitted()
+	}
 	select {
 	case <-handle.Done():
 	case <-ctx.Done():
