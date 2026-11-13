@@ -20,9 +20,10 @@ type ChatOptions struct {
 	EnableThinking bool
 }
 
-// RenderChat renders the Qwen chat template stored in the GGUF metadata.
-// Unsupported message roles and non-Qwen templates are rejected rather than
-// approximated.
+// RenderChat renders the built-in Qwen chat format after checking that the
+// GGUF metadata declares a Qwen-style template. The stored template is not
+// executed. Unsupported message roles and non-Qwen templates are rejected
+// rather than approximated.
 func (t *Tokenizer) RenderChat(messages []Message, opts ChatOptions) (string, error) {
 	if !strings.Contains(t.template, "<|im_start|>") {
 		return "", fmt.Errorf("%w: chat template is not a Qwen-style template", ErrUnsupported)

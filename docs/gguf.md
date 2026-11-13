@@ -35,7 +35,7 @@ builders bind named tensors; kernels interpret the quantization layout.
 | 5. Layout | Resolve alignment, tensor byte ranges, shard assignment, and data-section bounds | Reject overlaps, out-of-range offsets, or incomplete shards |
 | 6. Model config | Map architecture metadata through an architecture adapter | Reject missing required fields or inconsistent head dimensions |
 | 7. Weight store | Build tensor descriptors and map weight bytes on demand | Reject missing required weights; unexpected extras are currently not rejected or warned about |
-| 8. Tokenizer | Build vocabulary, merges/scores, special tokens, and chat template | Reject invalid token IDs or unparsable templates |
+| 8. Tokenizer | Build vocabulary, merges/scores, special tokens, and read the chat-template metadata | Reject invalid token IDs or non-Qwen templates |
 | 9. Handoff | Expose `ModelConfig`, `Tokenizer`, and `WeightStore` to the planner | No device allocation before validation completes |
 
 The reader should use `mmap` or on-demand loading to avoid copying the entire
@@ -45,7 +45,7 @@ file into Go heap memory. Tensor data is read-only for the model lifetime.
 
 - **Magic and version.** Validate the GGUF magic and supported version range.
 - **Metadata value types.** Integers, floats, booleans, strings, and arrays,
-  including nested arrays where the format allows them.
+  including nested arrays within the reader's bounded depth limit.
 - **Alignment.** Respect the file alignment when computing tensor data offsets;
   do not assume a hard-coded alignment for every file.
 - **Tensor descriptors.** Rank, dimensions, `ggml_type`, and offset relative to
@@ -155,14 +155,15 @@ support the tokenizer families used by the target models:
 - byte-level BPE (GPT-2-style tokenizer metadata);
 - SentencePiece-style vocabularies and scores, as used by Llama-family models;
 - special tokens and added tokens;
-- chat template rendering from GGUF metadata;
+- Qwen chat rendering gated on the GGUF chat-template metadata; arbitrary
+  templates are validated for the Qwen marker, not executed;
 - BOS/EOS insertion rules and stop conditions.
 
 Current implementation: Qwen2/Qwen3.5 GPT-2 byte-level BPE and Llama-family
 SentencePiece vocabularies are implemented, including special-token matching,
 byte fallback, SentencePiece scores, dummy-prefix handling, and Qwen chat
-rendering. Non-Qwen chat templates are rejected explicitly and are not yet
-implemented.
+rendering gated on the metadata template. Non-Qwen chat templates are rejected
+explicitly and are not yet implemented.
 
 Correctness checks must compare **token IDs**, not only decoded text, against a
 trusted reference implementation. The comparison set must include:

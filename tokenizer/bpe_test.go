@@ -75,6 +75,14 @@ func TestDecodeGolden(t *testing.T) {
 	}
 }
 
+func TestRenderChatRejectsNonQwenTemplate(t *testing.T) {
+	tok := &Tokenizer{template: "{{ messages }}"}
+	if _, err := tok.RenderChat([]Message{{Role: "user", Content: "hi"}},
+		ChatOptions{AddGenerationPrompt: true}); err == nil {
+		t.Fatal("non-Qwen template was accepted")
+	}
+}
+
 func TestRenderChatPrompt(t *testing.T) {
 	tok := openTestTokenizer(t)
 	prompt, err := tok.RenderPrompt("You are helpful.", "Hi", ChatOptions{AddGenerationPrompt: true})

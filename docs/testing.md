@@ -81,10 +81,10 @@ Use synthetic and real fixtures to cover:
 - missing required tensors and unexpected extra tensors;
 - metadata inconsistency (heads, KV heads, head dimension, context length);
 - tokenizer metadata with invalid special token IDs;
-- chat templates that fail to parse.
+- missing or non-Qwen chat templates.
 
-Each rejection test asserts the error class and that no device allocation or
-mapping leak occurred.
+Each rejection test asserts the error class and that the failed file is not left
+mapped.
 
 ### 3.2 Tokenizer tests
 

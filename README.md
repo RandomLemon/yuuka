@@ -84,7 +84,7 @@ rejected because the CPU reference has no bias path.
 | C/C++ | C++17 compiler and CMake 3.20 or newer for the native library |
 | ROCm | HIP 7.16 on the ROCm 10.1 layout, validated on `gfx1151` |
 | GPU | AMD `gfx1151` (Radeon 8060S) for the validated HIP path |
-| Optional native tools | rocBLAS and rocWMMA development packages for the hardware probe |
+| Native libraries | rocBLAS and rocWMMA development packages; required by `libyuuka_hip` and the hardware probe |
 
 CMake searches `ROCM_PATH` and the usual `/opt/rocm` layout. Other ROCm and HIP
 versions may work, but they are not part of the recorded test environment.
@@ -119,8 +119,9 @@ go build -tags hip -o bin/yuuka-server-hip ./cmd/yuuka-server
 ```
 
 The default native build also compiles the C ABI tests, kernel tests, and the
-hardware probe. Disable the probe with `-DYUUKA_BUILD_BENCH=OFF` if rocBLAS or
-rocWMMA is unavailable.
+hardware probe. `-DYUUKA_BUILD_BENCH=OFF` skips the probe and sweep binaries,
+but `libyuuka_hip` still requires rocBLAS and rocWMMA; use the CPU-only Go build
+if those development packages are unavailable.
 
 The `-tags hip` binaries still default to the CPU backend. Select the GPU with
 `--backend hip`. A binary built without the tag rejects `--backend hip` with an
@@ -161,7 +162,8 @@ HIP backend:
   --max-tokens 32
 ```
 
-Chat mode applies the Qwen chat template stored in the GGUF metadata:
+Chat mode verifies that the GGUF metadata declares a Qwen-style template and
+renders the built-in Qwen message format:
 
 ```bash
 ./bin/yuuka-hip run \
@@ -185,7 +187,7 @@ When `--prompt` is empty, the prompt is read from standard input.
 | `--top-k` | `40` | Top-k cutoff |
 | `--top-p` | `0.95` | Nucleus cutoff |
 | `--seed` | `0` | Sampling seed |
-| `--chat` | `false` | Render the model chat template |
+| `--chat` | `false` | Render the built-in Qwen chat format; requires a Qwen-style GGUF template |
 | `--system` | empty | System message used with `--chat` |
 | `--thinking` | `false` | Leave an open reasoning block in chat mode |
 | `--chunk-size` | `512` | HIP prompt chunk size (max 4096) |
