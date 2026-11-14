@@ -386,6 +386,10 @@ yuuka_status validate_attention_prefill_plan_op(const yuuka_op & op) {
     if (head_dim > 256) {
         return fail(YUUKA_ERR_UNSUPPORTED, "prefill attention head dimension exceeds 256");
     }
+    if (op.u[3] != 0) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "contiguous prefill attention supports only the gated query layout");
+    }
     for (int i = 0; i < 4; ++i) {
         if (op.buf[i] == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "prefill attention buffer %d is null", i);

@@ -110,6 +110,20 @@ int main() {
         ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT, "KV_WRITE") && ok;
     }
     {
+        // Contiguous prefill attention has no dense query variant; rejecting
+        // u[3] here prevents a validation range smaller than the kernel reads.
+        yuuka_op op = make_op(YUUKA_OP_ATTENTION_PREFILL, roomy);
+        op.n[0] = 1;
+        op.n[1] = 1;
+        op.n[2] = 4;
+        op.n[3] = 4;
+        op.n[4] = 1;
+        op.u[0] = 1;
+        op.u[3] = 1;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_UNSUPPORTED,
+                    "ATTENTION_PREFILL dense") && ok;
+    }
+    {
         // The products rows*hidden and rows*used wrap to zero in 64 bits. The
         // validator must reject the dimensions before checking buffer ranges.
         yuuka_op op = make_op(YUUKA_OP_MOE_REDUCE_ADD, tiny);

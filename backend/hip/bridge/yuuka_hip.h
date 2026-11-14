@@ -251,7 +251,8 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   KV_WRITE_BATCH:      buf0 k, buf1 v, buf2 k_cache, buf3 v_cache;
  *                        n={kv_dim,rows}; u[0]=capacity
  *   ATTENTION_PREFILL:   buf0 q, buf1 k_cache, buf2 v_cache, buf3 out;
- *                        n={kv_heads,heads,head_dim,kv_dim,rows}; u[0]=capacity
+ *                        n={kv_heads,heads,head_dim,kv_dim,rows}; u[0]=capacity;
+ *                        u[3] must be zero (gated query layout only)
  *   RECURRENT_CHUNK:     buf0 conv_state, buf1 matrix_state, buf2 qkv, buf3 z,
  *                        buf4 alpha, buf5 beta, buf6 conv weights, buf7 dt,
  *                        buf8 a, buf9 norm, buf10 out, buf11 conv scratch;

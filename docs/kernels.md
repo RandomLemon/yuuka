@@ -275,7 +275,10 @@ row. A workgroup owns eight query rows for one head.
   `__syncthreads` convergent and mask keys beyond their own position.
 - GQA maps query head `h` to KV head `h / (heads/kv_heads)`.
 - The Qwen3.5 attention gate (the second half of each query vector) is applied
-  as `sigmoid(gate)` before the output write.
+  as `sigmoid(gate)` before the output write. The contiguous op implements only
+  this gated layout; `ATTENTION_PREFILL` rejects `u[3] != 0` with an unsupported
+  capability error. The dense flag applies to the paged variants in section
+  7.4.
 
 Supported prefill head dimensions are 1-256; the plane-stage kernel reports an
 unsupported capability error above 256. Decode attention remains the
