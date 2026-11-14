@@ -104,6 +104,30 @@ func samplerFor(t *testing.T, vocab int) *engine.Sampler {
 	return sampler
 }
 
+func TestPrefixCapacityRequiresEnable(t *testing.T) {
+	h := newTinyHarness(t)
+	backend, err := NewQwen35Backend(h.model, "tiny-qwen35-test", 8, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(backend, h.tok, Options{
+		ContextSize:          64,
+		PrefixEnabled:        false,
+		PrefixEntries:        4,
+		PrefixCapacityBlocks: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	if manager.Limits().PrefixEnabled {
+		t.Fatal("prefix capacity enabled the cache without PrefixEnabled")
+	}
+	if got := manager.Metrics().Prefix.MaxEntries; got != 0 {
+		t.Fatalf("prefix cache max entries = %d, want 0", got)
+	}
+}
+
 func TestConcurrentRequestsMatchIsolatedRuns(t *testing.T) {
 	h := newTinyHarness(t)
 	isolated := h.newManager(t, 32, 8, 96, false, scheduler.Config{MaxActive: 1, MaxQueue: 4, RequestTimeout: time.Minute})

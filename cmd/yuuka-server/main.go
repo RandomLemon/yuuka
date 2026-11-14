@@ -212,12 +212,17 @@ func main() {
 	go func() { serveErr <- httpServer.ListenAndServe() }()
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = httpServer.Shutdown(shutdownCtx)
-		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		httpDone := make(chan struct{})
+		go func() {
+			_ = httpServer.Shutdown(shutdownCtx)
+			close(httpDone)
+		}()
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		_ = manager.Shutdown(drainCtx)
 		drainCancel()
+		shutdownCancel()
+		<-httpDone
 		_ = httpServer.Close()
 		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("server stopped: %v", err)

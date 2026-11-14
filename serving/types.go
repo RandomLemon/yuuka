@@ -84,8 +84,8 @@ type Options struct {
 	// ContextSize is the maximum number of tokens, prompt plus output, admitted
 	// for one request. It must not exceed the backend KV capacity.
 	ContextSize int
-	// Prefix caching is enabled when PrefixCapacityBlocks is non-zero or
-	// PrefixEnabled is set.
+	// PrefixEnabled enables the prefix cache. PrefixCapacityBlocks only caps
+	// the cache when it is enabled.
 	PrefixEnabled        bool
 	PrefixEntries        int
 	PrefixCapacityBlocks int

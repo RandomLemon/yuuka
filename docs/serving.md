@@ -139,7 +139,7 @@ Implementation policy:
 | `--queue-timeout` | 30s | Maximum time a request may remain queued |
 | `--prefix-cache` | true | Enable prompt prefix caching |
 | `--prefix-entries` | 64 | Maximum cached prompt prefixes |
-| `--prefix-blocks` | 0 (pool bound) | Maximum blocks held by the prefix cache |
+| `--prefix-blocks` | 0 (pool bound) | Maximum blocks held by the prefix cache; only applies when `--prefix-cache` is enabled |
 | `--graph` | false | Enable HIP Graph capture/replay with fallback |
 | `--model-key` | file SHA-256 | Override the prefix-cache model identity |
 
@@ -281,7 +281,7 @@ host path was measured.
 
 Behavior:
 
-- The decode plan is captured after its first eligible decode step and
+- The decode plan is captured at its first eligible decode step and
   instantiated once per session.
 - The captured graph addresses weights, activations, KV pools, the session
   block table, and the dynamic parameter buffer, all of which have stable
@@ -397,8 +397,9 @@ and prefix hit; prompt contents are not logged.
 - The model stream is explicit; a device error fails the active request and is
   surfaced as `generation_error`. The server keeps running while the device
   remains usable.
-- On shutdown, HTTP stops accepting connections, the scheduler stops admission,
-  and active requests drain for up to 10 seconds before cancellation.
+- On shutdown, HTTP stops accepting connections while the scheduler stops
+  admission; active requests drain under one 10-second deadline before
+  cancellation.
 - A cancelled or failed request always releases its task, block table, and
   graph resources. The server never returns success for a failed generation.
 

@@ -67,7 +67,7 @@ func NewManager(backend Backend, tok *tokenizer.Tokenizer, opts Options) (*Manag
 		opts:    opts,
 		model:   backend.ModelKey(),
 	}
-	if opts.PrefixEnabled || opts.PrefixCapacityBlocks > 0 {
+	if opts.PrefixEnabled {
 		m.cache = memory.NewPrefixCache(m.alloc, memory.PrefixConfig{
 			Key:        backend.ModelKey(),
 			MaxEntries: opts.PrefixEntries,
