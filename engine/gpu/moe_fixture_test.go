@@ -42,11 +42,15 @@ func loadTinyMoEGPU(t *testing.T) (*gguf.Reader, *dense.Model, *tokenizer.Tokeni
 }
 
 func newTinyMoESession(t *testing.T, reader *gguf.Reader, model *dense.Model, format tensor.DType) (*MoEModel, *MoESession) {
+	return newTinyMoESessionWithChunk(t, reader, model, format, 8)
+}
+
+func newTinyMoESessionWithChunk(t *testing.T, reader *gguf.Reader, model *dense.Model, format tensor.DType, chunk int) (*MoEModel, *MoESession) {
 	t.Helper()
 	mo, err := OpenMoE(reader, model, Options{
 		Blocks:       2,
 		BlockSize:    16,
-		PrefillChunk: 8,
+		PrefillChunk: chunk,
 		KVType:       format,
 	})
 	if err != nil {
@@ -100,6 +104,56 @@ func TestTinyMoEGPUMatchesCPU(t *testing.T) {
 			t.Logf("%s prefill max logit diff %.6g", format, maxDiff)
 		})
 	}
+}
+
+func TestTinyMoEF32ChunkedPrefillAndDecode(t *testing.T) {
+	reader, model, _, ids := loadTinyMoEGPU(t)
+	seq := make([]int32, 0, 9)
+	for len(seq) < 9 {
+		seq = append(seq, ids...)
+	}
+	seq = seq[:9]
+
+	cpuState, err := dense.NewState(model.Config, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpuLogits, err := model.Forward(seq, cpuState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare := func(name string, got []float32) {
+		maxDiff := 0.0
+		for i := range cpuLogits {
+			maxDiff = math.Max(maxDiff, math.Abs(float64(cpuLogits[i]-got[i])))
+		}
+		if maxDiff > 2e-3 {
+			t.Fatalf("%s logits differ from CPU by %.6g", name, maxDiff)
+		}
+		if argmax(cpuLogits) != argmax(got) {
+			t.Fatalf("%s top-1 differs: cpu=%d gpu=%d", name, argmax(cpuLogits), argmax(got))
+		}
+		t.Logf("%s max logit diff %.6g", name, maxDiff)
+	}
+
+	_, session := newTinyMoESessionWithChunk(t, reader, model, tensor.F32, 3)
+	defer session.Close()
+	gpuLogits, err := session.Prefill(seq, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare("F32 chunked prefill", gpuLogits)
+
+	_, session = newTinyMoESessionWithChunk(t, reader, model, tensor.F32, 3)
+	defer session.Close()
+	if _, err := session.Prefill(seq[:8], false); err != nil {
+		t.Fatal(err)
+	}
+	gpuDecode, err := session.Decode(seq[8])
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare("F32 prefill plus decode", gpuDecode)
 }
 
 func TestTinyMoELayerTrace(t *testing.T) {
