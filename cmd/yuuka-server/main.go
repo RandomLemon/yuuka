@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -437,7 +438,9 @@ func (m chatMessage) text() (string, error) {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(m.Content, &parts); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(m.Content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&parts); err != nil {
 		return "", fmt.Errorf("message content must be a string or text parts")
 	}
 	var out strings.Builder

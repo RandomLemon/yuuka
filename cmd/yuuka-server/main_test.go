@@ -290,6 +290,7 @@ func TestServerRejectsUnsupportedAndBadRequests(t *testing.T) {
 	}{
 		{"empty messages", `{"messages":[]}`, http.StatusBadRequest, "invalid_request"},
 		{"unknown field", `{"messages":[{"role":"user","content":"hi"}],"banana":1}`, http.StatusBadRequest, "invalid_request"},
+		{"unknown content part field", `{"messages":[{"role":"user","content":[{"type":"text","text":"hi","banana":1}]}],"max_tokens":1}`, http.StatusBadRequest, "invalid_request"},
 		{"null content", `{"messages":[{"role":"user","content":null}]}`, http.StatusBadRequest, "invalid_request"},
 		{"null stop", `{"messages":[{"role":"user","content":"hi"}],"stop":null}`, http.StatusBadRequest, "invalid_request"},
 		{"empty stop", `{"messages":[{"role":"user","content":"hi"}],"stop":""}`, http.StatusBadRequest, "invalid_request"},
