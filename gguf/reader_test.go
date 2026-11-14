@@ -324,6 +324,19 @@ func TestReaderRejectsMalformed(t *testing.T) {
 			want: ErrMalformed,
 		},
 		{
+			name: "unknown metadata type",
+			file: testFile{metadata: []testKV{
+				{"a", u32Value(1)},
+			}},
+			mut: func(b []byte) []byte {
+				// magic(4)+version(4)+tensor count(8)+metadata count(8)
+				// +key length(8)+key(1) puts the value type at offset 33.
+				binary.LittleEndian.PutUint32(b[33:37], 99)
+				return b
+			},
+			want: ErrMalformed,
+		},
+		{
 			name: "duplicate metadata",
 			file: testFile{metadata: []testKV{
 				{"a", u32Value(1)},

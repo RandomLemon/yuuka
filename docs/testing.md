@@ -69,39 +69,41 @@ enough to accommodate legitimate floating-point reassociation.
 
 ### 3.1 GGUF reader tests
 
-Use synthetic and real fixtures to cover:
+Checked-in rejection tests use synthetic and real fixtures to cover:
 
 - valid single-file and split-file models;
-- bad magic, unsupported version, truncated header;
-- malformed metadata types and duplicate keys;
-- duplicate tensor names, zero dimensions, rank overflow;
+- bad magic, unsupported version, truncated header, unknown metadata type;
+- duplicate metadata keys and tensor names, zero dimensions, rank overflow;
 - offsets that overlap, exceed the data section, or violate alignment;
 - incomplete shards and tensors assigned to multiple shards;
-- quantization block sizes that do not divide the tensor dimensions;
-- missing required tensors; unexpected extra tensors are accepted and ignored,
-  except known dense bias tensors, which are rejected;
-- metadata inconsistency (heads, KV heads, head dimension, context length);
-- tokenizer metadata with invalid special token IDs;
-- missing or non-Qwen chat templates.
+- quantization block sizes that do not divide the tensor dimensions.
 
-Each rejection test asserts the error class and that the failed file is not left
-mapped.
+The loaders and config builders additionally enforce:
+
+- missing required tensors, and rejection of known dense bias tensors;
+- head/KV-head/head-dimension/context consistency and RoPE section consistency;
+- special-token ID range checks and non-Qwen chat-template rejection at render
+  time.
+
+Self-contained validation has model-config unit tests; missing-tensor and dense
+bias rejection do not yet have a dedicated end-to-end fixture test. Every
+checked-in rejection test asserts the error class and that the failed file is
+not left mapped.
 
 ### 3.2 Tokenizer tests
 
-Token IDs are the contract. Golden tests must include:
+Token IDs are the contract. Golden tests (opt-in through `YUUKA_TEST_MODEL` and
+`YUUKA_TEST_SPM_VOCAB`) cover:
 
 - English and Chinese text;
-- whitespace, newlines, tabs, and punctuation;
-- Unicode normalization edge cases and emoji;
-- special tokens and role markers;
-- BOS/EOS insertion and suppression;
-- multi-turn chat template rendering;
-- stop strings and maximum-token termination;
-- empty prompt and single-character prompt.
+- whitespace, newlines, punctuation, and emoji;
+- special tokens and role-marker fragments;
+- BOS/EOS insertion and suppression.
 
-Every golden case compares token IDs against the reference implementation, and
-decoded text as a secondary check.
+Multi-turn chat rendering and stop-string behavior are checked at the rendered
+text level. Tab and full multi-turn prompt token IDs are not yet part of the
+golden set. Every golden token-ID case compares against hardcoded reference IDs,
+and decoded text is checked as a secondary test.
 
 ### 3.3 Operator tests
 

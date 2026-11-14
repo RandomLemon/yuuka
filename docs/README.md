@@ -98,7 +98,8 @@ Implemented and tested:
   alignment, overlap, and byte-range validation.
 - Qwen3.5 byte-level BPE and Llama SentencePiece tokenizers, with golden token
   ID tests against llama.cpp for English, Chinese, whitespace, punctuation,
-  emoji, special tokens, and chat prompts.
+  emoji, special tokens, and chat-template fragments; multi-turn chat rendering
+  is checked at the text level.
 - CPU reference decoder for the `qwen35` hybrid architecture: full GQA
   attention, gated delta-net linear attention, convolution state, RMSNorm,
   RoPE, SwiGLU, tied LM head, and KV/recurrent caches.

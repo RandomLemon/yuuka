@@ -247,7 +247,9 @@ remain capability failures.
 ## 10. Validation checklist
 
 A model load must fail early, with a specific diagnostic, if any of the
-following checks fail:
+following checks fail. This is a requirements checklist, not a test-status
+report; [testing.md](testing.md) records which checks currently have dedicated
+rejection tests and which are enforced only in the reader or model loader.
 
 - [ ] Magic and version are supported.
 - [ ] Metadata counts and tensor counts are plausible for the file size.
