@@ -39,8 +39,8 @@ func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 			}
 			return PrefillWMMA
 		}
-		// Wide F16 projections keep batched GEMV through M=4: WMMA is 17%
-		// slower at 2560->9216 and only within noise at 8192->2560.
+		// Wide F16 projections keep batched GEMV below M=8: WMMA is 17%
+		// slower at 2560->9216 and only within noise at 2560->8192.
 		if rows < 8 {
 			return PrefillBatchedGemv
 		}

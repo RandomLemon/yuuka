@@ -221,7 +221,7 @@ includes the completion wait.
 fastest at `M = 1` (per-row GEMV for `Q8_0`, batched GEMV for `Q5_K`, and
 effectively tied for `Q4_K`); WMMA wins from `M = 4` for wide projections
 (`K <= N`) and from `M = 8` for tall projections (`K > N`). Rows 2560→9216 and
-8192→2560 were measured; the shorter `Q8_0` table is omitted because the
+2560→8192 were measured; the shorter `Q8_0` table is omitted because the
 selected path is identical. `SelectPrefillPath` uses batched GEMV below four
 rows for every dtype; at `M = 1` the sweep shows per-row submission is faster
 for `F16`, `Q8_0`, and `Q6_K` (about 20-30%), so the small-row dispatch remains
