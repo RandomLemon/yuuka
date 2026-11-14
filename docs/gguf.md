@@ -59,7 +59,9 @@ file into Go heap memory. Tensor data is read-only for the model lifetime.
 - **Duplicate and missing entries.** Duplicate metadata keys or tensor names are
   errors. Missing required tensors are errors. Extra tensors are currently not
   rejected or warned about; the HIP loader uploads every tensor in the
-  directory, while the CPU reference loader reads only named tensors.
+  directory, while the CPU reference loader reads only named tensors. The dense
+  CPU builder is the exception: it rejects known attention and FFN bias tensors
+  because it has no bias path.
 - **Read-only mapping.** The mapping must not be mutated. Device upload reads
   from the mapping; it does not modify the source file.
 

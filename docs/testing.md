@@ -78,7 +78,8 @@ Use synthetic and real fixtures to cover:
 - offsets that overlap, exceed the data section, or violate alignment;
 - incomplete shards and tensors assigned to multiple shards;
 - quantization block sizes that do not divide the tensor dimensions;
-- missing required tensors and unexpected extra tensors;
+- missing required tensors; unexpected extra tensors are accepted and ignored,
+  except known dense bias tensors, which are rejected;
 - metadata inconsistency (heads, KV heads, head dimension, context length);
 - tokenizer metadata with invalid special token IDs;
 - missing or non-Qwen chat templates.
@@ -382,7 +383,7 @@ default build does not require the native shared library.
 Real-model tests are opt-in and skip when the variable is absent:
 
 ```bash
-YUUKA_TEST_MODEL=/path/to/model.gguf go test ./...
+YUUKA_TEST_MODEL=/path/to/model.gguf go test -tags hip ./... -count=1
 ```
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
@@ -444,8 +445,8 @@ HIP-tagged Go tests in the exported tree.
 | **Compatibility** | gfx1151 runner | llama.cpp HIP/Vulkan comparison on the same GGUF |
 
 Current status: the CPU tier is checked in as `.github/workflows/ci.yml` and
-runs formatting, `go vet`, `go build`, and `go test -race` on every push and
-pull request. The gfx1151 tier is `.github/workflows/hip.yml`; it is manual and
+runs formatting, `go vet`, `go build`, and `go test -race` on pushes to `main`
+and on pull requests. The gfx1151 tier is `.github/workflows/hip.yml`; it is manual and
 nightly because it requires a self-hosted ROCm runner with rocBLAS and rocWMMA.
 The HIP workflow builds the native library, runs `ctest`, builds the `hip` Go
 tags, and runs the HIP-tagged tests. Set the `YUUKA_TEST_MODEL` repository

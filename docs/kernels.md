@@ -181,8 +181,8 @@ still capability failures.
 For FP16/BF16 inputs, accumulate in FP32 unless a measured, documented
 tradeoff justifies otherwise. Quantization scales and mins must be applied
 before the final rounding step; avoid double rounding between unpack and
-accumulate. The output dtype is part of the execution plan, not an implicit
-kernel default.
+accumulate. Current compute kernels write FP32 outputs. An output-dtype plan
+field must be added before FP16 outputs are exposed.
 
 ## 6. Prefill: WMMA and quantized GEMM
 
@@ -486,8 +486,9 @@ benchmarks.
 
 A kernel is not complete until:
 
-- [x] It matches the CPU reference on random shapes, non-aligned sizes, and
-      boundary cases.
+- [x] It matches the CPU reference on representative shapes and buffer-boundary
+      cases; randomized and non-aligned shape sweeps cover the GEMV, GEMM,
+      prefill, and MoE families.
 - [x] Its numerical tolerance is documented and tested.
 - [x] It has a benchmark across the relevant shape classes.
 - [x] Its VGPR, LDS, scratch, and occupancy figures are recorded for the Phase
