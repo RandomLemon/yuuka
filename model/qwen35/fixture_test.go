@@ -33,6 +33,29 @@ func openTinyFixture(t *testing.T) (*gguf.Reader, *tokenizer.Tokenizer, *Model) 
 	return reader, tok, model
 }
 
+func TestValidateRoPEScaling(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		wantErr bool
+	}{
+		{"", false},
+		{"none", false},
+		{"default", false},
+		{"linear", true},
+		{"yarn", true},
+	} {
+		err := validateRoPEScaling("qwen35.rope.scaling.type",
+			gguf.Value{Type: gguf.MetaString, String: tc.value})
+		if (err != nil) != tc.wantErr {
+			t.Errorf("scaling %q: error = %v, want error %v", tc.value, err, tc.wantErr)
+		}
+	}
+	if err := validateRoPEScaling("qwen35.rope.scaling.type",
+		gguf.Value{Type: gguf.MetaUint32, Uint: 1}); err == nil {
+		t.Fatal("non-string scaling type was accepted")
+	}
+}
+
 func TestTinyFixtureForward(t *testing.T) {
 	_, tok, model := openTinyFixture(t)
 	if model.Config.BlockCount != 2 {

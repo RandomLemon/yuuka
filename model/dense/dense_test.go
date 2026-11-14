@@ -33,6 +33,29 @@ func openTinyDense(t *testing.T, arch string) (*gguf.Reader, *tokenizer.Tokenize
 	return reader, tok, model
 }
 
+func TestValidateRoPEScaling(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		wantErr bool
+	}{
+		{"", false},
+		{"none", false},
+		{"default", false},
+		{"linear", true},
+		{"yarn", true},
+	} {
+		err := validateRoPEScaling("llama.rope.scaling.type",
+			gguf.Value{Type: gguf.MetaString, String: tc.value})
+		if (err != nil) != tc.wantErr {
+			t.Errorf("scaling %q: error = %v, want error %v", tc.value, err, tc.wantErr)
+		}
+	}
+	if err := validateRoPEScaling("llama.rope.scaling.type",
+		gguf.Value{Type: gguf.MetaUint32, Uint: 1}); err == nil {
+		t.Fatal("non-string scaling type was accepted")
+	}
+}
+
 func TestDenseForward(t *testing.T) {
 	for _, arch := range []string{Llama, Qwen3} {
 		t.Run(arch, func(t *testing.T) {

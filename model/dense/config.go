@@ -4,6 +4,7 @@ package dense
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/yuuka-ai/yuuka/gguf"
 )
@@ -49,6 +50,11 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 	if arch != Llama && arch != Qwen3 && arch != Qwen3MoE {
 		return nil, fmt.Errorf("model architecture %q is not %q, %q, or %q",
 			arch, Llama, Qwen3, Qwen3MoE)
+	}
+	if value, ok := r.MetadataValue(arch + ".rope.scaling.type"); ok {
+		if err := validateRoPEScaling(arch+".rope.scaling.type", value); err != nil {
+			return nil, err
+		}
 	}
 	cfg := &Config{Architecture: arch}
 	intKey := func(key string) (int, error) {
@@ -159,6 +165,21 @@ func LoadConfig(r *gguf.Reader) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// validateRoPEScaling rejects scaling types the runtime does not execute. The
+// default and explicit none/default values use the base RoPE table.
+func validateRoPEScaling(name string, value gguf.Value) error {
+	text, err := value.AsString()
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "", "none", "default":
+		return nil
+	default:
+		return fmt.Errorf("%s %q is not supported", name, text)
+	}
 }
 
 func (c *Config) validate() error {

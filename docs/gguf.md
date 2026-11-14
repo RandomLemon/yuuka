@@ -121,10 +121,14 @@ family, so each architecture adapter maps its metadata into a common
 | Quantization version | `general.quantization_version` |
 | File type | `general.file_type` |
 
-Validation must cover consistency between fields: head count times head
-dimension must agree with hidden size where the architecture requires it; KV
-head count must divide query head count for GQA; context length must be
-compatible with RoPE scaling; special token IDs must be within the vocabulary.
+Validation must cover consistency between fields: explicit key and value head
+dimensions must agree with each other and with the tensor shapes; a missing
+dense-Llama head dimension is derived from hidden size and head count. KV head
+count must divide query head count for GQA, and special token IDs must be within
+the vocabulary. RoPE scaling metadata is
+not executed in this release. The validated models use the base RoPE table, and
+a file that declares linear or YaRN scaling is rejected during configuration
+loading rather than executed with the wrong frequency table.
 
 ## 6. Weight store and mapping
 
@@ -187,7 +191,7 @@ same string while producing different model behavior.
 
 | Priority | Architecture | Key features |
 | --- | --- | --- |
-| P0 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, MRoPE, GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU |
+| P0 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, MRoPE (text-only position sections), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU |
 | P0 | Qwen3 Dense | RMSNorm, RoPE, GQA, Q/K norm, SwiGLU |
 | P0 | Llama Dense | RMSNorm, RoPE, GQA, SwiGLU |
 | P1 | Gemma | Architecture-specific norm, attention, and logit details |
