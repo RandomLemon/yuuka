@@ -446,6 +446,66 @@ func TestReaderSplitShards(t *testing.T) {
 	}
 }
 
+func TestReaderRejectsMissingShard(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model-00001-of-00002.gguf")
+	writeTestFile(t, path, testFile{
+		metadata: []testKV{
+			{"split.no", u32Value(0)},
+			{"split.count", u32Value(2)},
+		},
+		tensors: []testTensor{{
+			name:   "blk.0",
+			dims:   []uint64{2},
+			dtype:  tensor.F32,
+			offset: 0,
+		}},
+		data: make([]byte, 8),
+	})
+	r, err := Open(path)
+	if err == nil {
+		r.Close()
+		t.Fatal("missing split shard was accepted")
+	}
+	if !errors.Is(err, ErrMalformed) && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("error %v does not report a missing shard", err)
+	}
+	assertNoMapping(t, path)
+}
+
+func TestReaderRejectsDuplicateShardTensor(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{
+		filepath.Join(dir, "model-00001-of-00002.gguf"),
+		filepath.Join(dir, "model-00002-of-00002.gguf"),
+	}
+	for i, path := range paths {
+		writeTestFile(t, path, testFile{
+			metadata: []testKV{
+				{"split.no", u32Value(uint32(i))},
+				{"split.count", u32Value(2)},
+			},
+			tensors: []testTensor{{
+				name:   "blk.0",
+				dims:   []uint64{2},
+				dtype:  tensor.F32,
+				offset: 0,
+			}},
+			data: make([]byte, 8),
+		})
+	}
+	r, err := Open(paths[0])
+	if err == nil {
+		r.Close()
+		t.Fatal("duplicate tensor across shards was accepted")
+	}
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("error %v is not %v", err, ErrMalformed)
+	}
+	assertNoMapping(t, paths[0])
+	assertNoMapping(t, paths[1])
+}
+
 func TestReaderRejectsSplitCountMismatch(t *testing.T) {
 	dir := t.TempDir()
 	paths := []string{
