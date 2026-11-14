@@ -284,13 +284,120 @@ reloads each weight tile 16 times. llama.cpp's HIP and Vulkan kernels use
 larger tiles, matrix-core layouts, and pipelined loads. Closing the GEMM gap
 requires a larger M tile (with more accumulator fragments per wave) and
 double-buffered LDS; closing the long-context gap additionally requires a
-matrix-core or multi-query-tile attention kernel. These are recorded as
-follow-up work, not claimed here.
+matrix-core or multi-query-tile attention kernel. The measured attribution and
+ordered work are in [roadmap2.md](roadmap2.md); none of those optimizations is
+claimed here.
 
 The comparison uses different prompt tokenization only in the sense that each
 runner builds its own prompt from the same token count; both use the same GGUF
 tokenizer and greedy prompt processing. `llama-bench` reports prefill only, so
 these ratios are not end-to-end generation comparisons.
+
+### Prefill attribution diagnostic (2026-11-14)
+
+This section records a diagnostic attribution of one 512-token prefill chunk.
+It is event-instrumented evidence for planning, not a benchmark under the full
+[testing.md](testing.md) protocol.
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-11-14 |
+| Model | `Qwen3.5-4B-Q4_K_M.gguf`, SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4` |
+| Comparison model | `Qwen3.5-4B-Q8_0.gguf`, SHA-256 `dc3021458088a6fb0e8629c096ea7e95f743e434d96dc4351d2107c669be1fa9` |
+| Device | AMD Radeon 8060S Graphics, `gfx1151`, 40 CUs |
+| ROCm / HIP | ROCm 10.1 layout, HIP 7.16.26385 |
+| Host kernel | Linux 7.0.14-28-pve |
+| Backend / KV | HIP, F32 KV unless stated |
+| Chunk | 512 rows |
+| Method | `Plan.ExecuteProfiled` with HIP events around every operation |
+| Warmup | one plan execution before the measured executions |
+| Repetitions | one diagnostic execution per position and KV format |
+
+Event overhead is included. The profiled total for the position-0 chunk was
+1534 ms against a 1553 ms wall time in the same run. Clocks, power, and
+thermal state were not controlled. Run-to-run variation of a few percent was
+observed across repeated diagnostics.
+
+Q4_K_M, 512 rows at position 0:
+
+| Operation | Time | Share |
+| --- | ---: | ---: |
+| WMMA GEMM | 909 ms | 59.3% |
+| Gated delta-net chunk | 551 ms | 36.0% |
+| Prefill attention | 48 ms | 3.1% |
+| LM-head GEMV | 12 ms | 0.8% |
+| Other operations | 14 ms | 0.9% |
+
+The same 512-row chunk on Q8_0 measured 723 ms of GEMM, 551 ms of gated
+delta-net work, and 48 ms of attention.
+
+Attention scales with the chunk's absolute position; all other phases stay
+essentially constant:
+
+| Chunk start position | F32 KV attention | F16 KV attention |
+| ---: | ---: | ---: |
+| 0 | 48.7 ms | 45.3 ms |
+| 2048 | 421.5 ms | 388.3 ms |
+| 7680 | 2030.1 ms | 1475.1 ms |
+
+At position 7680 attention is about 58% of the chunk with F32 KV and about 50%
+with F16 KV. The F16 pool reduces attention time by about 27% at that position
+and is within noise at position 0.
+
+Chunk-size scaling, one measured execution per size:
+
+| Chunk rows | Time | Throughput |
+| ---: | ---: | ---: |
+| 128 | 392.5 ms | 326.2 tok/s |
+| 512 | 1505.4 ms | 340.1 tok/s |
+| 1024 | 3132.6 ms | 326.9 tok/s |
+| 2048 | 6812.6 ms | 300.6 tok/s |
+
+These are single diagnostic runs. The formal Phase 3 curve above remains the
+reference throughput table.
+
+Derived limits (from GGUF tensor sizes, model dimensions, and kernel loop
+counts; not hardware counters):
+
+- The prefill matmul weights total about 2.161 GB. A 32-row M tile reads every
+  weight once per group of 32 tokens, so the amortized traffic is about
+  67.5 MB per token and about 34.6 GB per 512-token chunk. 909 ms of GEMM
+  corresponds to roughly 38 GB/s, below the measured read bandwidth of about
+  221 GB/s.
+- The same chunk performs about 3.66 TFLOP of prefill matmul work; 909 ms
+  corresponds to about 4.0 TFLOP/s, or about 6.8% of the documented
+  59.4 TFLOP/s FP16 WMMA peak.
+- The gated delta-net kernel visits each head's 128x128 FP32 state four times
+  per token row, about 155 GB of state traffic for the chunk, and performs
+  about 51.5 GFLOP. 551 ms corresponds to roughly 280 GB/s of state traffic
+  and about 94 GFLOP/s.
+
+The attribution shows three distinct limits: GEMM is limited by tile reuse,
+unpacking, and unpipelined loads; the gated delta-net kernel is limited by
+repeated state traffic and a 32-workgroup grid; long-context attention is
+limited by V traffic, exposed load latency, and the lack of query tiling. The
+ordered optimization work is in [roadmap2.md](roadmap2.md).
+
+Reproduction:
+
+```bash
+# Q4_K_M, F32 KV, three positions and per-operation attribution.
+YUUKA_TEST_MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  go test -tags hip ./engine/gpu -run TestGPUProfilePrefill -v -count=1
+
+# Same diagnostic with F16 KV.
+YUUKA_TEST_MODEL=/path/to/Qwen3.5-4B-Q4_K_M.gguf \
+YUUKA_TEST_KV=f16 \
+  go test -tags hip ./engine/gpu -run TestGPUProfilePrefill -v -count=1
+
+# Q8_0 comparison.
+YUUKA_TEST_MODEL=/path/to/Qwen3.5-4B-Q8_0.gguf \
+  go test -tags hip ./engine/gpu -run TestGPUProfilePrefill -v -count=1
+```
+
+The test is opt-in because it loads the full model. It is a diagnostic path:
+do not use its numbers as release benchmarks without the metadata and
+repetition requirements in [testing.md](testing.md).
 
 ### Short-prompt latency and correctness
 

@@ -223,9 +223,10 @@ tile path; only the packed-load helper differs.
 
 Static shared memory is 14 KiB per workgroup: 2 KiB A tile, 4 KiB B tile, and
 8 KiB output staging. Compiler-reported usage is 39-47 VGPRs, 26-34 SGPRs, no
-spills, and a 16 waves/SIMD resource maximum. The kernel is not pipelined; LDS
-double-buffering and a larger M tile for weight reuse across workgroups are
-later optimizations.
+spills, and a 16 waves/SIMD resource maximum. The kernel is not pipelined in
+this release: LDS double-buffering, a wider K step, and a larger M tile for
+weight reuse across workgroups are planned under [roadmap2.md](roadmap2.md);
+they are not implemented and are not claimed in the benchmark results.
 
 ### 6.3 Dispatch
 
@@ -252,11 +253,11 @@ The isolated GEMM is weight-reuse limited: with a 32-row M tile, each
 workgroup reloads the weight tile, so a 512-row chunk reads every weight tile
 16 times. The end-to-end prompt path measured about 313 tok/s at 512 tokens
 after the recurrent-kernel fix, versus llama.cpp HIP at about 2163 tok/s on the
-same GGUF and device. That remaining gap is not fully attributed in this phase;
-the 32-row M tile, scalar prefill attention, and launch structure are
-candidates. A larger M tile with more accumulator fragments per wave and
-double-buffered LDS is the next GEMM optimization; it is not implemented and is
-not claimed in the benchmark results.
+same GGUF and device. A 2026-11-14 diagnostic attribution of a 512-token chunk
+measured GEMM at 59%, the gated delta-net chunk kernel at 36%, and prefill
+attention at 3% at position 0; attention grows with context and dominates at
+long positions. The ordered optimization plan is [roadmap2.md](roadmap2.md).
+None of its targets are implemented or claimed in the benchmark results.
 
 ## 7. Attention
 
@@ -268,7 +269,11 @@ row. A workgroup owns eight query rows for one head.
 - Q is read into registers, with each lane holding `ceil(head_dim/32)` values.
 - K is staged one 32-key block at a time in dynamic shared memory
   (`32 * head_dim * 4` bytes; 32 KiB for head_dim 256). V is read from global
-  memory with coalesced per-lane vectors.
+  memory with coalesced per-lane vectors. V is not staged in this release, so
+  the load is on the softmax dependency chain and the same V rows are read by
+  each query row in the workgroup and by each query head that shares a KV head.
+  Shared-memory V staging and query tiling are planned under
+  [roadmap2.md](roadmap2.md); they are not implemented.
 - Scores are reduced within the wave; online softmax keeps per-row max, sum,
   and FP32 value accumulators, so the full attention matrix is never
   materialized.
@@ -399,14 +404,20 @@ traffic without reducing occupancy:
 - Gated delta-net chunk: convolution state update, q/k L2 normalization, the
   128x128 recurrent update, and gated RMSNorm per head. It replaces five
   launches and one normalized intermediate per token with two launches per
-  layer. Each thread owns one 128x128 state column, and a barrier separates the
-  q and k block reductions because both reuse the same shared reduction
-  scratch. Both choices are required for deterministic multi-row execution;
-  the row-major state layout is unchanged and shared with the decode kernel.
+  layer. Each thread owns one state column for a token row, and a barrier
+  separates the q and k block reductions because both reuse the same shared
+  reduction scratch. Both choices are required for deterministic multi-row
+  execution; the row-major state layout is unchanged and shared with the decode
+  kernel. The column is read from and written back to the state buffer for
+  every row, so the kernel re-traverses the full state four times per row. That
+  traffic and the 32-workgroup grid are the measured bottleneck; register
+  residency, column-block splitting, and shuffle reductions are planned under
+  [roadmap2.md](roadmap2.md) and are not implemented.
 
-SwiGLU remains an elementwise pass over the chunk; fusing it into the GEMM
-epilogue was not attempted because the measured prefill bottleneck is the
-weight-streaming GEMM. Every fusion must be evaluated on all of:
+SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
+epilogue, together with fusing the gate/up GEMMs themselves, is a candidate
+under [roadmap2.md](roadmap2.md); no fused implementation is claimed. Every
+fusion must be evaluated on all of:
 
 - kernel launch count;
 - VGPR usage and occupancy;

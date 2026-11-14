@@ -87,6 +87,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, reporting, regression gates | All contributors |
 | [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [roadmap.md](roadmap.md) | Phase-by-phase plan, deliverables, exit criteria, risks, dependencies | Maintainers and reviewers |
+| [roadmap2.md](roadmap2.md) | Ordered prefill optimization plan: measured attribution, workstreams, gates, and references | Kernel and performance contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
 
@@ -124,6 +125,8 @@ Implemented and tested:
   `-tags hip`.
 - Batched quantized GEMV with measured dispatch thresholds, a per-operation HIP
   event profile path, and per-quantization/per-batch decode baselines.
+- An opt-in prefill attribution profile (`TestGPUProfilePrefill`) that records
+  per-operation time for a 512-token chunk at positions 0, 2048, and 7680.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
   match. The decode path's recorded first-step maximum absolute logit
   difference is `4.58e-5` (`TestGPUDecodePathMatchesCPU`); the chunked prefill
@@ -182,7 +185,8 @@ HIP support, and dense `llama`/`qwen3` remain CPU reference paths.
   the document for your area → [roadmap](roadmap.md).
 - **Hardware bring-up:** [hardware](hardware.md) → [roadmap Phase 0](roadmap.md#3-phase-0--bootstrap-and-hardware-validation).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
-  [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode).
+  [roadmap Phase 2–3](roadmap.md#5-phase-2--quantized-decode) →
+  [prefill optimization plan](roadmap2.md).
 - **Runtime/service work:** [architecture](architecture.md) →
   [serving](serving.md) → [roadmap Phase 4](roadmap.md#7-phase-4--multi-request-serving).
 - **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →

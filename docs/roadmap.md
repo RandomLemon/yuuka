@@ -56,9 +56,11 @@ tests at chunk sizes 1-64 and completes a 32768-token prompt. The recorded
 logit difference.
 VGPR, LDS, scratch, and occupancy are recorded. The prompt path remains 5-16x
 behind llama.cpp HIP and 7-18x behind llama.cpp Vulkan across the measured
-prompt lengths; the remaining gap has not been fully attributed, and the 32-row
-M tile plus scalar attention are follow-up optimizations rather than exit
-criteria.
+prompt lengths. A 2026-11-14 diagnostic profile attributes the 512-token
+prefill chunk to GEMM (59%), the gated delta-net chunk kernel (36%), and
+attention (3% at position 0, dominant at longer positions). These are follow-up
+optimizations under the ordered plan in [roadmap2.md](roadmap2.md), not Phase 3
+exit criteria.
 
 Phase 4 exit criteria are met: paged KV with a block allocator and immutable
 per-request block tables, iteration-level continuous scheduling with explicit
@@ -253,6 +255,20 @@ performance.
 - Custom GEMM may not win for all shapes; dispatch tables must reflect measured
   reality.
 - Benchmark noise and thermal throttling can obscure small improvements.
+
+### Follow-up optimization work
+
+The Phase 3 exit criteria do not require closing the gap to llama.cpp. The
+ordered follow-up plan is [roadmap2.md](roadmap2.md); it covers:
+
+- gated delta-net state residency, grid parallelism, and barrier reduction;
+- larger GEMM tiles, a wider K step, LDS double buffering, CTA ordering, and an
+  optional int8 tensor-core path;
+- shared-memory V staging, query tiling, GQA reuse, and F16 KV for long-context
+  attention.
+
+Each workstream has its own correctness, resource, and benchmark gates. None of
+its predicted gains are claims until measured under [testing.md](testing.md).
 
 ## 7. Phase 4 — Multi-Request Serving
 

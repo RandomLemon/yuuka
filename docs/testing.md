@@ -299,6 +299,14 @@ or background load without labeling the difference.
 Isolated kernel benchmarks are necessary but not sufficient. A kernel that wins
 in isolation can lose end-to-end because of launch overhead or occupancy.
 
+Per-operation attribution is a diagnostic step, not a benchmark result.
+`TestGPUProfilePrefill` runs a 512-row chunk at positions 0, 2048, and 7680
+with HIP events around every plan operation. It is opt-in through
+`YUUKA_TEST_MODEL`, and `YUUKA_TEST_KV=f16` selects the F16 KV pool. Use it to
+rank work; confirm any accepted change with the protocol above and report it in
+[benchmarks.md](benchmarks.md). The current attribution is recorded in the
+prefill diagnostic section of that document.
+
 ## 7. Metric definitions
 
 | Metric | Definition |
