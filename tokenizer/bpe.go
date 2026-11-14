@@ -38,6 +38,7 @@ type Tokenizer struct {
 	spm            bool
 	addSpacePrefix bool
 	addBOS         bool
+	addEOS         bool
 }
 
 type special struct {
@@ -169,6 +170,13 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 			return nil, fmt.Errorf("tokenizer.ggml.add_bos_token: %w", err)
 		}
 		t.addBOS = add
+	}
+	if value, ok := r.MetadataValue("tokenizer.ggml.add_eos_token"); ok {
+		add, err := value.AsBool()
+		if err != nil {
+			return nil, fmt.Errorf("tokenizer.ggml.add_eos_token: %w", err)
+		}
+		t.addEOS = add
 	}
 	if value, ok := r.MetadataValue("tokenizer.ggml.add_space_prefix"); ok {
 		add, err := value.AsBool()
@@ -331,24 +339,32 @@ func (t *Tokenizer) Encode(text string) ([]int32, error) {
 }
 
 // EncodePrompt converts a generation prompt to token IDs. When the GGUF
-// metadata requests add_bos_token, it prepends the BOS token unless the encoded
-// sequence already starts with it. Raw Encode calls remain free of implicit BOS
-// insertion for tokenizer and cross-framework comparisons.
+// metadata requests add_bos_token or add_eos_token, it prepends BOS or appends
+// EOS unless the encoded sequence already has that token at the corresponding
+// end. Raw Encode calls remain free of implicit insertion for tokenizer and
+// cross-framework comparisons.
 func (t *Tokenizer) EncodePrompt(text string) ([]int32, error) {
 	ids, err := t.Encode(text)
 	if err != nil {
 		return nil, err
 	}
-	if !t.addBOS {
-		return ids, nil
+	if t.addBOS {
+		if t.bos < 0 {
+			return nil, fmt.Errorf("tokenizer: add_bos_token is set but bos_token_id is missing")
+		}
+		if len(ids) == 0 || ids[0] != t.bos {
+			ids = append([]int32{t.bos}, ids...)
+		}
 	}
-	if t.bos < 0 {
-		return nil, fmt.Errorf("tokenizer: add_bos_token is set but bos_token_id is missing")
+	if t.addEOS {
+		if t.eos < 0 {
+			return nil, fmt.Errorf("tokenizer: add_eos_token is set but eos_token_id is missing")
+		}
+		if len(ids) == 0 || ids[len(ids)-1] != t.eos {
+			ids = append(ids, t.eos)
+		}
 	}
-	if len(ids) > 0 && ids[0] == t.bos {
-		return ids, nil
-	}
-	return append([]int32{t.bos}, ids...), nil
+	return ids, nil
 }
 
 func (t *Tokenizer) matchSpecial(s string) (int32, int, bool) {

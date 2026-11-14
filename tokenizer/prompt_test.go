@@ -61,6 +61,54 @@ func TestEncodePromptInsertsBOS(t *testing.T) {
 	}
 }
 
+func TestEncodePromptAppendsEOS(t *testing.T) {
+	tok := openFixtureTokenizer(t, fixture.WriteTinyQwen35)
+	if tok.AddBOS() {
+		t.Fatal("Qwen fixture unexpectedly requests BOS insertion")
+	}
+	eos := tok.EOSToken()
+	if eos < 0 {
+		t.Fatal("fixture has no EOS token")
+	}
+	tok.addEOS = true
+
+	raw, err := tok.Encode("Hello world")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := tok.EncodePrompt("Hello world")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := append(append([]int32(nil), raw...), eos); !reflect.DeepEqual(got, want) {
+		t.Fatalf("EncodePrompt = %v, want %v", got, want)
+	}
+
+	// An encoded trailing EOS is not duplicated.
+	text, err := tok.DecodeToken(eos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withEOS, err := tok.Encode(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withEOS) > 0 && withEOS[len(withEOS)-1] == eos {
+		got, err = tok.EncodePrompt(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := len(got); n == 0 || got[n-1] != eos || (n > 1 && got[n-2] == eos) {
+			t.Fatalf("EncodePrompt(%q) duplicated EOS: %v", text, got)
+		}
+	}
+
+	tok.eos = -1
+	if _, err := tok.EncodePrompt("Hello"); err == nil {
+		t.Fatal("add_eos_token without eos_token_id was accepted")
+	}
+}
+
 func TestEncodePromptRespectsBOSSuppression(t *testing.T) {
 	tok := openFixtureTokenizer(t, fixture.WriteTinyQwen35)
 	if tok.AddBOS() {

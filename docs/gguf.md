@@ -169,8 +169,9 @@ SentencePiece vocabularies are implemented, including special-token matching,
 byte fallback, SentencePiece scores, dummy-prefix handling, and Qwen chat
 rendering gated on the metadata template. Generation prompts use
 `Tokenizer.EncodePrompt`, which inserts BOS when `tokenizer.ggml.add_bos_token`
-is true and the encoded sequence does not already start with it; raw `Encode`
-remains BOS-free for tokenizer and cross-framework comparisons. Non-Qwen chat
+is true and appends EOS when `tokenizer.ggml.add_eos_token` is true; an already
+present token is not duplicated. Raw `Encode` remains free of implicit
+insertion for tokenizer and cross-framework comparisons. Non-Qwen chat
 templates are rejected explicitly when chat rendering is requested, and
 arbitrary templates are not executed.
 
