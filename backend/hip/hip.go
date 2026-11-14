@@ -21,6 +21,10 @@ import (
 	"github.com/yuuka-ai/yuuka/tensor"
 )
 
+// ErrUnsupported reports a capability limit in a plan operation. Callers can
+// distinguish it from malformed dimensions or buffer ranges with errors.Is.
+var ErrUnsupported = errors.New("hip: unsupported")
+
 // DeviceInfo describes the opened HIP device.
 type DeviceInfo struct {
 	Name         string
@@ -882,8 +886,11 @@ func (p *Plan) AddKVWriteBatchAt(k *Buffer, kOff uint64, v *Buffer, vOff uint64,
 
 // AddAttentionPrefillAt appends causal tiled attention for a prompt chunk.
 func (p *Plan) AddAttentionPrefillAt(q *Buffer, qOff uint64, kCache, vCache, out *Buffer, outOff uint64, kvHeads, heads, headDim, kvDim, rows, capacity int, scale float32) error {
-	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 || kvDim != kvHeads*headDim || capacity < rows || headDim > 256 {
+	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 || kvDim != kvHeads*headDim || capacity < rows {
 		return errors.New("hip: invalid prefill attention dimensions")
+	}
+	if headDim > 256 {
+		return fmt.Errorf("hip: prefill attention head dimension %d exceeds 256: %w", headDim, ErrUnsupported)
 	}
 	if err := p.check(q, kCache, vCache, out); err != nil {
 		return err
@@ -1006,9 +1013,12 @@ func (p *Plan) AddAttentionPagedDenseFormatAt(q, kPool, vPool, out, scores, tabl
 
 func (p *Plan) addAttentionPaged(q, kPool, vPool, out, scores, table *Buffer, kvHeads, heads, headDim, kvDim, scoreStride, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
 	if heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
-		kvDim != kvHeads*headDim || headDim > 256 || capacity <= 0 ||
+		kvDim != kvHeads*headDim || capacity <= 0 ||
 		blockSize <= 0 || blockSize > capacity || scoreStride < capacity {
 		return errors.New("hip: invalid paged attention dimensions")
+	}
+	if headDim > 256 {
+		return fmt.Errorf("hip: paged attention head dimension %d exceeds 256: %w", headDim, ErrUnsupported)
 	}
 	if err := checkKVDType(dtype, int64(kvDim)); err != nil {
 		return err
@@ -1164,9 +1174,12 @@ func (p *Plan) AddAttentionPrefillPagedDenseFormatAt(q *Buffer, qOff uint64, kPo
 
 func (p *Plan) addAttentionPrefillPaged(q *Buffer, qOff uint64, kPool, vPool, out *Buffer, outOff uint64, table *Buffer, kvHeads, heads, headDim, kvDim, rows, capacity, blockSize int, scale float32, dtype tensor.DType, dense bool) error {
 	if rows <= 0 || heads <= 0 || kvHeads <= 0 || headDim <= 0 || heads%kvHeads != 0 ||
-		kvDim != kvHeads*headDim || headDim > 256 || capacity < rows ||
+		kvDim != kvHeads*headDim || capacity < rows ||
 		blockSize <= 0 || blockSize > capacity {
 		return errors.New("hip: invalid paged prefill attention dimensions")
+	}
+	if headDim > 256 {
+		return fmt.Errorf("hip: paged prefill attention head dimension %d exceeds 256: %w", headDim, ErrUnsupported)
 	}
 	if err := checkKVDType(dtype, int64(kvDim)); err != nil {
 		return err

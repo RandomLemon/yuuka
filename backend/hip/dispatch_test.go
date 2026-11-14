@@ -3,6 +3,7 @@
 package hip
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/yuuka-ai/yuuka/tensor"
@@ -176,6 +177,32 @@ func TestAddGemvRejectsUndersizedBuffer(t *testing.T) {
 	}
 	if plan.Ops() != 0 {
 		t.Fatalf("rejected operation was added: %d", plan.Ops())
+	}
+}
+
+func TestAttentionHeadDimUnsupported(t *testing.T) {
+	var plan Plan
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "prefill",
+			err:  plan.AddAttentionPrefillAt(nil, 0, nil, nil, nil, 0, 1, 1, 257, 257, 1, 1, 1),
+		},
+		{
+			name: "paged decode",
+			err:  plan.AddAttentionPagedAt(nil, nil, nil, nil, nil, nil, 1, 1, 257, 257, 1, 1, 1, 1),
+		},
+		{
+			name: "paged prefill",
+			err:  plan.AddAttentionPrefillPagedAt(nil, 0, nil, nil, nil, 0, nil, 1, 1, 257, 257, 1, 1, 1, 1),
+		},
+	}
+	for _, tc := range cases {
+		if !errors.Is(tc.err, ErrUnsupported) {
+			t.Errorf("%s: error = %v, want ErrUnsupported", tc.name, tc.err)
+		}
 	}
 }
 
