@@ -119,15 +119,6 @@ func (d *Device) Alloc(bytes uint64) (*Buffer, error) {
 // Bytes returns the allocation size.
 func (b *Buffer) Bytes() uint64 { return b.bytes }
 
-// Pointer returns the raw device pointer. The caller must not use it after
-// Close.
-func (b *Buffer) Pointer() unsafe.Pointer {
-	if b == nil || b.closed || b.ptr == nil {
-		return nil
-	}
-	return C.yuuka_buffer_ptr(b.ptr)
-}
-
 // Close releases the allocation exactly once.
 func (b *Buffer) Close() error {
 	if b == nil || b.closed {
