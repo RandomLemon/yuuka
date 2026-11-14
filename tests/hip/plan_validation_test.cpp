@@ -109,6 +109,16 @@ int main() {
         op.n[0] = 8;
         ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT, "KV_WRITE") && ok;
     }
+    {
+        // The products rows*hidden and rows*used wrap to zero in 64 bits. The
+        // validator must reject the dimensions before checking buffer ranges.
+        yuuka_op op = make_op(YUUKA_OP_MOE_REDUCE_ADD, tiny);
+        op.n[0] = uint64_t{1} << 32;
+        op.n[1] = uint64_t{1} << 32;
+        op.n[2] = uint64_t{1} << 32;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "MOE_REDUCE_ADD overflow") && ok;
+    }
 
     // The same shapes with roomy buffers must still be accepted.
     {

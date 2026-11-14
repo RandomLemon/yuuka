@@ -1079,26 +1079,33 @@ yuuka_status validate_moe_gate_up_plan_op(const yuuka_op & op) {
     uint64_t hidden_row = 0;
     uint64_t weight_rows = 0;
     uint64_t weight_bytes = 0;
+    uint64_t norm_elements = 0;
     uint64_t norm_bytes = 0;
+    uint64_t row_used = 0;
     uint64_t out_elems = 0;
     uint64_t out_bytes = 0;
-    uint64_t buckets = 0;
+    uint64_t bucket_rows = 0;
+    uint64_t bucket_bytes = 0;
+    uint64_t count_bytes = 0;
     if (!checked_row_bytes(hidden, dtype, &hidden_row) ||
         __builtin_mul_overflow(ffn, experts, &weight_rows) ||
         __builtin_mul_overflow(weight_rows, hidden_row, &weight_bytes) ||
-        __builtin_mul_overflow(rows, hidden, &norm_bytes) ||
-        __builtin_mul_overflow(norm_bytes, uint64_t(4), &norm_bytes) ||
-        __builtin_mul_overflow(rows * used, ffn, &out_elems) ||
-        __builtin_mul_overflow(out_elems, uint64_t(4), &out_bytes) ||
-        __builtin_mul_overflow(experts * rows * used, uint64_t(4), &buckets)) {
+        __builtin_mul_overflow(rows, hidden, &norm_elements) ||
+        !checked_float_bytes(norm_elements, &norm_bytes) ||
+        __builtin_mul_overflow(rows, used, &row_used) ||
+        __builtin_mul_overflow(row_used, ffn, &out_elems) ||
+        !checked_float_bytes(out_elems, &out_bytes) ||
+        __builtin_mul_overflow(row_used, experts, &bucket_rows) ||
+        !checked_float_bytes(bucket_rows, &bucket_bytes) ||
+        !checked_float_bytes(experts, &count_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE gate/up dimensions overflow");
     }
     if (!buffer_range_ok(op.buf[0], 0, norm_bytes) ||
         !buffer_range_ok(op.buf[1], 0, weight_bytes) ||
         !buffer_range_ok(op.buf[2], 0, weight_bytes) ||
-        !buffer_range_ok(op.buf[3], 0, experts * 4) ||
-        !buffer_range_ok(op.buf[4], 0, buckets) ||
-        !buffer_range_ok(op.buf[5], 0, buckets) ||
+        !buffer_range_ok(op.buf[3], 0, count_bytes) ||
+        !buffer_range_ok(op.buf[4], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[5], 0, bucket_bytes) ||
         !buffer_range_ok(op.buf[6], 0, out_bytes) ||
         !buffer_range_ok(op.buf[7], 0, out_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE gate/up buffer is too small");
@@ -1125,26 +1132,32 @@ yuuka_status validate_moe_down_plan_op(const yuuka_op & op) {
     uint64_t ffn_row = 0;
     uint64_t weight_rows = 0;
     uint64_t weight_bytes = 0;
+    uint64_t row_used = 0;
     uint64_t act_elems = 0;
     uint64_t act_bytes = 0;
     uint64_t out_elems = 0;
     uint64_t out_bytes = 0;
-    uint64_t buckets = 0;
+    uint64_t bucket_rows = 0;
+    uint64_t bucket_bytes = 0;
+    uint64_t count_bytes = 0;
     if (!checked_row_bytes(ffn, dtype, &ffn_row) ||
         __builtin_mul_overflow(hidden, experts, &weight_rows) ||
         __builtin_mul_overflow(weight_rows, ffn_row, &weight_bytes) ||
-        __builtin_mul_overflow(rows * used, ffn, &act_elems) ||
-        __builtin_mul_overflow(act_elems, uint64_t(4), &act_bytes) ||
-        __builtin_mul_overflow(rows * used, hidden, &out_elems) ||
-        __builtin_mul_overflow(out_elems, uint64_t(4), &out_bytes) ||
-        __builtin_mul_overflow(experts * rows * used, uint64_t(4), &buckets)) {
+        __builtin_mul_overflow(rows, used, &row_used) ||
+        __builtin_mul_overflow(row_used, ffn, &act_elems) ||
+        !checked_float_bytes(act_elems, &act_bytes) ||
+        __builtin_mul_overflow(row_used, hidden, &out_elems) ||
+        !checked_float_bytes(out_elems, &out_bytes) ||
+        __builtin_mul_overflow(row_used, experts, &bucket_rows) ||
+        !checked_float_bytes(bucket_rows, &bucket_bytes) ||
+        !checked_float_bytes(experts, &count_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE down dimensions overflow");
     }
     if (!buffer_range_ok(op.buf[0], 0, act_bytes) ||
         !buffer_range_ok(op.buf[1], 0, weight_bytes) ||
-        !buffer_range_ok(op.buf[2], 0, experts * 4) ||
-        !buffer_range_ok(op.buf[3], 0, buckets) ||
-        !buffer_range_ok(op.buf[4], 0, buckets) ||
+        !buffer_range_ok(op.buf[2], 0, count_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[4], 0, bucket_bytes) ||
         !buffer_range_ok(op.buf[5], 0, out_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE down buffer is too small");
     }
@@ -1163,12 +1176,18 @@ yuuka_status validate_moe_reduce_plan_op(const yuuka_op & op) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE reduce buffer %d is null", i);
         }
     }
+    uint64_t row_hidden = 0;
+    uint64_t row_used = 0;
+    uint64_t out_elems = 0;
     uint64_t x_bytes = 0;
     uint64_t out_bytes = 0;
     uint64_t weight_bytes = 0;
-    if (__builtin_mul_overflow(rows * hidden, uint64_t(4), &x_bytes) ||
-        __builtin_mul_overflow(rows * used * hidden, uint64_t(4), &out_bytes) ||
-        __builtin_mul_overflow(rows * used, uint64_t(4), &weight_bytes)) {
+    if (__builtin_mul_overflow(rows, hidden, &row_hidden) ||
+        __builtin_mul_overflow(rows, used, &row_used) ||
+        __builtin_mul_overflow(row_used, hidden, &out_elems) ||
+        !checked_float_bytes(row_hidden, &x_bytes) ||
+        !checked_float_bytes(out_elems, &out_bytes) ||
+        !checked_float_bytes(row_used, &weight_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE reduce dimensions overflow");
     }
     if (!buffer_range_ok(op.buf[0], 0, x_bytes) ||
