@@ -207,7 +207,7 @@ func TestGPURepeatedRequestsDoNotGrowMemory(t *testing.T) {
 		MaxActive: 2, MaxQueue: 4, RequestTimeout: time.Minute,
 	})
 	ids := h.prompt(t, "Once upon a time")
-	for i := range 6 {
+	for i := range 12 {
 		_, err := manager.Generate(context.Background(), Request{
 			ID: "cycle", Prompt: ids, MaxTokens: 4,
 			Sampler: samplerFor(t, h.tok.VocabSize()), IgnoreEOS: true,
