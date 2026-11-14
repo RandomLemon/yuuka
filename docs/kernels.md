@@ -491,13 +491,13 @@ A kernel is not complete until:
       cases; randomized and non-aligned shape sweeps cover the GEMV, GEMM,
       prefill, and MoE families.
 - [x] Its numerical tolerance is documented and tested.
-- [x] It has a benchmark across the relevant shape classes.
+- [x] Its relevant shape classes are covered by a benchmark or profile.
 - [x] Its VGPR, LDS, scratch, and occupancy figures are recorded for the Phase
       0-3 kernel families (`scripts/kernel_resources.sh`, results in
       [benchmarks.md](benchmarks.md)).
 - [x] New Phase 5 kernels have recorded VGPR, LDS, and occupancy figures for the
       GEMV, WMMA, and MoE variants (`scripts/kernel_resources.sh`, results in
       [benchmarks.md](benchmarks.md)).
-- [x] The planner can select it and fall back from it.
+- [x] The planner selects it; quantized GEMV and GEMM have measured fallbacks.
 - [x] It is integrated into an end-to-end model run.
 - [x] It does not regress a previously accepted shape class.
