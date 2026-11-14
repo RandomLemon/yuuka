@@ -35,7 +35,7 @@ builders bind named tensors; kernels interpret the quantization layout.
 | 5. Layout | Resolve alignment, tensor byte ranges, shard assignment, and data-section bounds | Reject overlaps, out-of-range offsets, or incomplete shards |
 | 6. Model config | Map architecture metadata through an architecture adapter | Reject missing required fields or inconsistent head dimensions |
 | 7. Weight store | Build tensor descriptors and map weight bytes on demand | Reject missing required weights; unexpected extras are currently not rejected or warned about |
-| 8. Tokenizer | Build vocabulary, merges/scores, special tokens, and read the chat-template metadata | Reject invalid token IDs or non-Qwen templates |
+| 8. Tokenizer | Build vocabulary, merges/scores, special tokens, and read the chat-template metadata | Reject invalid token IDs or malformed metadata types; non-Qwen templates are rejected when chat rendering is requested |
 | 9. Handoff | Expose `ModelConfig`, `Tokenizer`, and `WeightStore` to the planner | No device allocation before validation completes |
 
 The reader should use `mmap` or on-demand loading to avoid copying the entire
@@ -166,7 +166,8 @@ rendering gated on the metadata template. Generation prompts use
 `Tokenizer.EncodePrompt`, which inserts BOS when `tokenizer.ggml.add_bos_token`
 is true and the encoded sequence does not already start with it; raw `Encode`
 remains BOS-free for tokenizer and cross-framework comparisons. Non-Qwen chat
-templates are rejected explicitly and are not yet implemented.
+templates are rejected explicitly when chat rendering is requested, and
+arbitrary templates are not executed.
 
 Correctness checks must compare **token IDs**, not only decoded text, against a
 trusted reference implementation. The comparison set must include:

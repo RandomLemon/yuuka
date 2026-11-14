@@ -55,7 +55,13 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 	if model != "gpt2" && !spm {
 		return nil, fmt.Errorf("%w: tokenizer model %q", ErrUnsupported, model)
 	}
-	pre, _ := r.String("tokenizer.ggml.pre")
+	var pre string
+	if value, ok := r.MetadataValue("tokenizer.ggml.pre"); ok {
+		pre, err = value.AsString()
+		if err != nil {
+			return nil, fmt.Errorf("tokenizer.ggml.pre: %w", err)
+		}
+	}
 	if pre == "" {
 		if spm {
 			pre = "default"
@@ -159,21 +165,24 @@ func NewFromGGUF(r *gguf.Reader) (*Tokenizer, error) {
 	}
 	if value, ok := r.MetadataValue("tokenizer.ggml.add_bos_token"); ok {
 		add, err := value.AsBool()
-		if err == nil {
-			t.addBOS = add
+		if err != nil {
+			return nil, fmt.Errorf("tokenizer.ggml.add_bos_token: %w", err)
 		}
+		t.addBOS = add
 	}
 	if value, ok := r.MetadataValue("tokenizer.ggml.add_space_prefix"); ok {
 		add, err := value.AsBool()
-		if err == nil {
-			t.addSpacePrefix = add
+		if err != nil {
+			return nil, fmt.Errorf("tokenizer.ggml.add_space_prefix: %w", err)
 		}
+		t.addSpacePrefix = add
 	}
 	if value, ok := r.MetadataValue("tokenizer.chat_template"); ok {
 		text, err := value.AsString()
-		if err == nil {
-			t.template = text
+		if err != nil {
+			return nil, fmt.Errorf("tokenizer.chat_template: %w", err)
 		}
+		t.template = text
 	}
 	if value, ok := r.MetadataValue("tokenizer.ggml.scores"); ok {
 		scores, err := value.AsFloats()
