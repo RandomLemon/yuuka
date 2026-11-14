@@ -72,10 +72,6 @@ void launch_cast_f32_to_f16(void * dst, const float * src, uint64_t n,
 
 void launch_rmsnorm_f32(float * dst, const float * src, const float * weight,
                         int64_t n, float eps, hipStream_t stream);
-void launch_l2norm_f32(float * dst, const float * src, int64_t n, float eps,
-                       float extra_scale, hipStream_t stream);
-void launch_gated_rmsnorm_f32(float * dst, const float * src, const float * weight,
-                              const float * gate, int64_t n, float eps, hipStream_t stream);
 void launch_rmsnorm_heads_f32(float * dst, const float * src, const float * weight,
                               int heads, int64_t n, int64_t stride, float eps,
                               hipStream_t stream);

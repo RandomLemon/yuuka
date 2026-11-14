@@ -23,44 +23,6 @@ __global__ void rmsnorm_f32_kernel(float * dst, const float * src, const float *
     }
 }
 
-__global__ void l2norm_f32_kernel(float * dst, const float * src, int64_t n,
-                                  float eps, float extra_scale) {
-    __shared__ float scratch[kThreads];
-    float sum = 0.0f;
-    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
-        sum += src[i] * src[i];
-    }
-    sum = block_reduce_sum<kThreads>(sum, scratch);
-    if (threadIdx.x == 0) {
-        scratch[0] = rsqrtf(sum + eps) * extra_scale;
-    }
-    __syncthreads();
-    const float scale = scratch[0];
-    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
-        dst[i] = src[i] * scale;
-    }
-}
-
-__global__ void gated_rmsnorm_f32_kernel(float * dst, const float * src, const float * weight,
-                                         const float * gate, int64_t n, float eps) {
-    __shared__ float scratch[kThreads];
-    float sum = 0.0f;
-    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
-        sum += src[i] * src[i];
-    }
-    sum = block_reduce_sum<kThreads>(sum, scratch);
-    if (threadIdx.x == 0) {
-        scratch[0] = rsqrtf(sum / static_cast<float>(n) + eps);
-    }
-    __syncthreads();
-    const float scale = scratch[0];
-    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float g = gate[i];
-        const float silu = g / (1.0f + expf(-g));
-        dst[i] = src[i] * scale * weight[i] * silu;
-    }
-}
-
 __global__ void rmsnorm_heads_f32_kernel(float * dst, const float * src, const float * weight,
                                          int64_t heads, int64_t n, int64_t stride, float eps) {
     const int64_t head = blockIdx.x;
@@ -168,16 +130,6 @@ namespace yuuka {
 void launch_rmsnorm_f32(float * dst, const float * src, const float * weight,
                         int64_t n, float eps, hipStream_t stream) {
     rmsnorm_f32_kernel<<<1, kThreads, 0, stream>>>(dst, src, weight, n, eps);
-}
-
-void launch_l2norm_f32(float * dst, const float * src, int64_t n, float eps,
-                       float extra_scale, hipStream_t stream) {
-    l2norm_f32_kernel<<<1, kThreads, 0, stream>>>(dst, src, n, eps, extra_scale);
-}
-
-void launch_gated_rmsnorm_f32(float * dst, const float * src, const float * weight,
-                              const float * gate, int64_t n, float eps, hipStream_t stream) {
-    gated_rmsnorm_f32_kernel<<<1, kThreads, 0, stream>>>(dst, src, weight, gate, n, eps);
 }
 
 void launch_rmsnorm_heads_f32(float * dst, const float * src, const float * weight,
