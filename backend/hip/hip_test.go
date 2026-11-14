@@ -4,6 +4,7 @@ package hip
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
 	"testing"
 
@@ -65,6 +66,57 @@ func TestAddEmbeddingValidation(t *testing.T) {
 	}
 	if err := plan.AddEmbedding(weights, out, 64, 35, tensor.Q4_0); err == nil {
 		t.Fatal("embedding row-byte mismatch was accepted")
+	}
+}
+
+func TestCaptureGraphUnsupportedError(t *testing.T) {
+	dev := openTestDevice(t)
+	stream, err := dev.NewStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	plan, err := dev.NewPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	q, err := dev.Alloc(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	k, err := dev.Alloc(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	v, err := dev.Alloc(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+	out, err := dev.Alloc(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	scores, err := dev.Alloc(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scores.Close()
+	dynamic, err := dev.Alloc(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dynamic.Close()
+
+	if err := plan.AddAttention(q, k, v, out, scores, 1, 1, 4, 4, 8, 0.5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.CaptureGraph(stream, dynamic, true); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("CaptureGraph error = %v, want ErrUnsupported", err)
 	}
 }
 

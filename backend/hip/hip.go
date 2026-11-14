@@ -351,7 +351,11 @@ func statusError(st C.yuuka_status, what string) error {
 	if st == C.YUUKA_OK {
 		return nil
 	}
-	return fmt.Errorf("hip: %s: %s", what, C.GoString(C.yuuka_last_error()))
+	message := C.GoString(C.yuuka_last_error())
+	if st == C.YUUKA_ERR_UNSUPPORTED {
+		return fmt.Errorf("%w: hip: %s: %s", ErrUnsupported, what, message)
+	}
+	return fmt.Errorf("hip: %s: %s", what, message)
 }
 
 // Plan batches generic device operations into one submission.
