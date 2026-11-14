@@ -321,11 +321,12 @@ eviction are specified in [serving.md](serving.md).
 | CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35`, dense Llama/Qwen3, and `qwen3moe`; default backend; concurrent paged serving for `qwen35` |
 | XDNA NPU | Optional heterogeneous acceleration | Diagnostic capability probe and explicit GPU fallback only; execution is a future task; see [npu.md](npu.md) |
 
-The planner queries backend capabilities, including supported dtypes,
-quantization types, maximum batch, graph support, and memory properties. If a
-kernel or dtype is unsupported, the planner must either select a supported
-fallback or fail during planning with a precise diagnostic. Silent numerical
-substitution is not allowed.
+The concrete planners validate supported dtypes, quantization types, batch
+limits, graph eligibility, and buffer shapes per operation. The generic
+`backend.Backend.Capabilities` seam remains the target negotiation interface
+and is not wired yet (see section 6.3). If a kernel or dtype is unsupported, the
+planner either selects a measured dispatch path or fails during planning with a
+precise diagnostic. Silent numerical substitution is not allowed.
 
 Plan construction applies the same rule to every GEMV, batched GEMV, and GEMM
 operation. An unsupported dtype or a width that violates the quantization

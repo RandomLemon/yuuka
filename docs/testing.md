@@ -181,10 +181,10 @@ Serving tests are split by layer:
 - Verify streaming deltas reconstruct the non-streaming response.
 - Verify cancellation stops generation and releases resources.
 - Verify concurrent requests do not affect each other's output.
-- Verify prefix-cache reuse produces identical logits and tokens, including a
+- Verify prefix-cache reuse produces identical tokens and text, including a
   longer prompt that reuses a shorter cached prefix.
-- Verify a fully cached prompt samples from cached logits and matches a fresh
-  run.
+- Verify a fully cached prompt takes the cached-prefix path and matches a fresh
+  run's tokens and text.
 - Verify graph replay and fallback produce the same token sequence as a plain
   session, including an intentionally invalidated dynamic parameter buffer.
 - Verify HTTP API tests remain independent of the real-model environment by

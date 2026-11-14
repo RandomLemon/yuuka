@@ -84,7 +84,7 @@ rejected because the CPU reference has no bias path.
 | C/C++ | C++17 compiler and CMake 3.20 or newer for the native library |
 | ROCm | HIP 7.16 on the ROCm 10.1 layout, validated on `gfx1151` |
 | GPU | AMD `gfx1151` (Radeon 8060S) for the validated HIP path |
-| Native libraries | rocBLAS and rocWMMA development packages; required by `libyuuka_hip` and the hardware probe |
+| Native libraries | rocBLAS and rocWMMA development packages plus OpenMP support; required by the native CMake configuration |
 
 CMake searches `ROCM_PATH` and the usual `/opt/rocm` layout. Other ROCm and HIP
 versions may work, but they are not part of the recorded test environment.

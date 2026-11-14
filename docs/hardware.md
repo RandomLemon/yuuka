@@ -101,7 +101,7 @@ hardware counters. `D2D` counts both read and write traffic as the buffer size.
 | `hipMemcpy` device-to-host, pinned destination | 65.9 GB/s |
 | `hipMemset` device memory | 230.1 GB/s |
 | `hipMemcpy` device-to-device | 105.6 GB/s |
-| Mapped host memory written by the GPU (`hipMemcpy` semantics) | 178.6 GB/s |
+| Mapped host memory written by the GPU (`hipMemset` semantics) | 178.6 GB/s |
 | `hipMalloc` 16 MiB, 64 allocations | 46.9 ms total |
 
 Run-to-run variation: a later probe on the same machine measured `hipMemset`

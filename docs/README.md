@@ -111,8 +111,9 @@ Implemented and tested:
   health, metrics, cancellation, and explicit busy rejection.
 - HIP C ABI for devices, buffers, streams, events, transfers, planned
   operations, quantized GEMV, a batched F32/F16 GEMM baseline, and the chunked
-  prefill operator family; validated `F16`, `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`,
-  `Q5_K`, and `Q6_K` GEMV kernels, embeddings, and WMMA GEMM.
+  prefill operator family. GEMV and WMMA GEMM are validated for `F32`, `F16`,
+  `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, and `Q6_K`; direct embedding tests
+  cover `F32`, `Q4_0`, `Q5_0`, and `Q6_K`.
 - rocWMMA FP16 and quantized prefill GEMM, a rocBLAS FP16 baseline, causal GQA
   Flash Attention, chunked prefill with per-chunk KV writes, and the measured
   `SelectPrefillPath` dispatch table.
