@@ -16,13 +16,13 @@ reuses each packed weight element across up to 16 rows; its measured thresholds
 are encoded in `backend/hip.SelectGemvPath`.
 
 Phase 3 adds the prefill family: rocWMMA FP16 and quantized GEMM for `F16`,
-`F32`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K`; a rocBLAS FP16 baseline with an
-explicit FP32-to-FP16 cast; causal GQA Flash Attention over prompt chunks;
-chunked prefill with per-chunk KV writes; row-batched RMSNorm, head RMSNorm,
-RoPE, embedding, and KV-write kernels; and a fused gated delta-net chunk kernel
-that performs convolution, L2 normalization, state update, and gated RMSNorm in
-two launches per layer. `backend/hip.SelectPrefillPath` is the measured dispatch
-table described in section 9.
+`F32`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K`; a rocBLAS FP16
+baseline with an explicit FP32-to-FP16 cast; causal GQA Flash Attention over
+prompt chunks; chunked prefill with per-chunk KV writes; row-batched RMSNorm,
+head RMSNorm, RoPE, embedding, and KV-write kernels; and a fused gated delta-net
+chunk kernel that performs convolution, L2 normalization, state update, and
+gated RMSNorm in two launches per layer. `backend/hip.SelectPrefillPath` is the
+measured dispatch table described in section 9.
 
 Phase 4 adds the paged KV family: decode and prefill attention kernels that
 resolve every key/value position through an int32 block table, paged KV-write
@@ -279,7 +279,8 @@ row. A workgroup owns eight query rows for one head.
 
 Supported prefill head dimensions are 1-256; the plane-stage kernel reports an
 unsupported capability error above 256. Decode attention remains the
-per-head kernel described in section 5. Flash Attention is not used for decode.
+per-head kernel described in section 7.2. Flash Attention is not used for
+decode.
 
 Chunked prefill splits a prompt into at most `chunk-size` rows (default 512,
 maximum 4096). KV writes for a chunk happen before its attention, so later

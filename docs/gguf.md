@@ -260,7 +260,8 @@ following checks fail:
 - [ ] Quantization block sizes divide the tensor dimensions they require.
 - [ ] Head counts, KV head counts, and head dimensions are mutually consistent.
 - [ ] Vocabulary size and special token IDs are consistent.
-- [ ] The tokenizer and chat template can be constructed.
+- [ ] The tokenizer can be constructed; non-Qwen chat templates are rejected at
+      render time, not load time.
 - [ ] The architecture adapter accepts every required metadata field.
 - [ ] The selected backend reports support for every required dtype and shape
       class, or the planner selects a documented fallback.
