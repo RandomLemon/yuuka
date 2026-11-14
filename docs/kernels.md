@@ -13,7 +13,9 @@ decode attention, convolution state, gated delta-net recurrence, embedding,
 SwiGLU, residual add, and copy are implemented and validated against CPU
 references. Batched GEMV
 reuses each packed weight element across up to 16 rows; its measured thresholds
-are encoded in `backend/hip.SelectGemvPath`.
+are recorded in [benchmarks.md](benchmarks.md), and
+`backend/hip.SelectPrefillPath` chooses the batched path for the small row
+classes it covers.
 
 Phase 3 adds the prefill family: rocWMMA FP16 and quantized GEMM for `F16`,
 `F32`, `Q4_0`, `Q5_0`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K`; a rocBLAS FP16
@@ -433,12 +435,11 @@ per plan, not per tensor per token.
 
 ### 9.2 Dispatch selection and validation
 
-Dispatch is recorded in two explicit Go selectors:
-
-- `backend/hip.SelectGemvPath` chooses per-row or batched GEMV from dtype and
-  batch size;
-- `backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
-  rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
+Dispatch is recorded in one explicit Go selector:
+`backend/hip.SelectPrefillPath` chooses batched GEMV, custom rocWMMA, or the
+rocBLAS FP16 baseline from dtype, rows, and the input/output widths.
+Single-token decode submits one GEMV per matrix; there is no separate runtime
+GEMV batch selector.
 
 Each plan addition validates the dtype, quantization row layout, shape
 constraints, and buffer ranges. Unsupported combinations fail during planning;
@@ -448,11 +449,10 @@ registry to consult at runtime.
 ### 9.3 Offline tuning
 
 Dispatch decisions are offline. Thresholds measured on gfx1151 are encoded in
-`backend/hip.SelectGemvPath` and `backend/hip.SelectPrefillPath`, keyed by
-operator family, dtype, shape class, and batch class, and recorded with the
-measurement environment in [benchmarks.md](benchmarks.md). There is no runtime
-autotuner. Adding a device requires re-running the sweeps and updating the
-selectors and tests.
+`backend/hip.SelectPrefillPath`, keyed by dtype, shape class, and row class, and
+recorded with the measurement environment in [benchmarks.md](benchmarks.md).
+There is no runtime autotuner. Adding a device requires re-running the sweeps
+and updating the selector and tests.
 
 ### 9.4 Fallback
 

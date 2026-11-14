@@ -270,7 +270,7 @@ Event -> Go completion -> sampling/streaming
 | `HostPinnedBuffer`, `MappedBuffer` | Allocation classes with different performance and lifetime rules | Not implemented as general types; pinned staging is used only for graph dynamic parameters |
 | `GraphExecutable`, `GraphReplay` | Cached launch graphs for stable shapes | Implemented as `hip.Graph` |
 | `ScratchAllocator`, `WeightAllocator`, `KVAllocator` | Pool-specific allocation policies | KV allocator implemented in `memory`; dedicated scratch and weight allocators are not |
-| Shape signature and dispatch selectors | Dispatch and tuning lookup | Implemented by `SelectGemvPath` and `SelectPrefillPath`; no generic kernel registry |
+| Shape signature and dispatch selectors | Dispatch and tuning lookup | Implemented by `SelectPrefillPath`; decode GEMV is fixed at one row; no generic kernel registry |
 | Backend capabilities | Capability negotiation and unsupported-operation fallback | Implemented per operator in plan validation; the generic `backend` seam is not wired |
 
 ## 7. Memory model
@@ -447,10 +447,9 @@ decision and the phase that may reopen it are recorded below.
    and falls back to stream submission on any failure. The measured decode gain
    on the validated model was within noise, so the plain stream path is the
    default.
-4. **Dispatch decisions.** Measured thresholds are encoded in explicit Go
-   selectors (`backend/hip.SelectGemvPath` and `SelectPrefillPath`) keyed by
-   operator family, dtype, shape class, and batch class. They are derived from
-   the checked-in sweep harness and recorded in
+4. **Dispatch decisions.** Measured thresholds are encoded in the explicit Go
+   selector `SelectPrefillPath`, keyed by dtype, shape class, and row class. They
+   are derived from the checked-in sweep harness and recorded in
    [benchmarks.md](benchmarks.md), and they are gated by dispatch tests. There is
    no runtime autotuner or device table registry; adding a device requires
    re-running the sweeps and updating the selectors and tests. Values from other

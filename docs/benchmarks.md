@@ -125,9 +125,12 @@ completion wait for both paths.
 | Q8_0 | 0.61 | 0.86 | 1.26 | 1.59 | 1.71 | batch 4 |
 | F16 | 0.81 | 0.94 | 1.22 | 1.37 | 1.51 | batch 4 |
 
-`backend/hip.SelectGemvPath` encodes these thresholds; batches above 16 fall
-back to per-row submission. The current single-token decode path always uses
-batch 1, so the batched path is a prefill/batching building block.
+The table is the measured record behind the batched-GEMV path;
+`backend/hip.SelectPrefillPath` selects that path for the small row classes it
+covers, and batches above 16 fall back to per-row submission. The current
+single-token decode path always uses batch 1, so the batched path is a
+prefill/batching building block. There is no separate runtime GEMV batch
+selector.
 `tests/hip/gemv_test.cpp` checks the batched kernel against the reference for
 F32, F16, Q8_0, Q4_K, Q5_K, and Q6_K at batch sizes 1, 2, 3, 4, 8, and 16.
 
