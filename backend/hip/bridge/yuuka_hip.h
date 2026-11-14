@@ -269,12 +269,14 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   KV_WRITE_PAGED:         buf0 k, buf1 v, buf2 k_pool, buf3 v_pool,
  *                           buf4 block table; n[0]=kv_dim; u[0]=block_size;
  *                           u[1]=capacity; u[2]=pool dtype
- *   KV_WRITE_BATCH_PAGED:   same buffers; n={kv_dim,rows,capacity};
- *                           u[0]=block_size; u[2]=pool dtype
+ *   KV_WRITE_BATCH_PAGED:   same buffers; n={kv_dim,rows};
+ *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype
  *   ATTENTION_PAGED:        buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
  *                           buf4 scores, buf5 block table;
  *                           n={kv_heads,heads,head_dim,kv_dim,score_stride};
- *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype
+ *                           u[0]=block_size; u[1]=capacity; u[2]=pool dtype;
+ *                           u[3]=1 selects the dense query layout (no output
+ *                           gate), u[3]=0 selects the gated Qwen3.5 layout
  *   ATTENTION_PREFILL_PAGED: buf0 q, buf1 k_pool, buf2 v_pool, buf3 out,
  *                           buf4 block table;
  *                           n={kv_heads,heads,head_dim,kv_dim,rows};
