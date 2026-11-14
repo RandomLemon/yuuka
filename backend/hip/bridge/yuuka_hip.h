@@ -226,7 +226,9 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
 
 /* Plans batch generic device operations into one submission.
  *
- * GEMV, GEMM, GEMV_BATCH, and the chunked prefill family are validated when
+ * GEMV, GEMM, GEMV_BATCH, the legacy single-token family (RMSNORM, L2NORM,
+ * GATED_RMSNORM, RMSNORM_HEADS, ROPE, ATTENTION, CONV1D, GDN, SILU_MUL, ADD,
+ * COPY, SCALE, and KV_WRITE), and the chunked prefill family are validated when
  * added: RMSNORM_BATCH, RMSNORM_HEADS_BATCH, ROPE_BATCH, KV_WRITE_BATCH,
  * ATTENTION_PREFILL, RECURRENT_CHUNK, EMBEDDING_BATCH, and CAST_F16. Unsupported
  * dtypes and widths that violate the quantization block layout fail with

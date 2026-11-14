@@ -736,6 +736,288 @@ yuuka_status validate_attention_prefill_paged_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// Legacy single-token operators share the plan ABI with the chunked and paged
+// families. Validate their dimensions and buffer ranges before append so an
+// undersized plan cannot reach execution.
+yuuka_status validate_rmsnorm_plan_op(const yuuka_op & op) {
+    const uint64_t count = op.n[0];
+    if (count == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid RMSNorm size");
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "RMSNorm buffer %d is null", i);
+        }
+    }
+    uint64_t bytes = 0;
+    if (!checked_float_bytes(count, &bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], bytes) ||
+        !buffer_range_ok(op.buf[1], 0, bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "RMSNorm buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_l2norm_plan_op(const yuuka_op & op) {
+    const uint64_t heads = op.n[0];
+    const uint64_t size = op.n[1];
+    if (heads == 0 || size == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid L2Norm dimensions");
+    }
+    if (op.buf[0] == nullptr || op.buf[2] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "L2Norm buffer is null");
+    }
+    uint64_t elements = 0;
+    uint64_t bytes = 0;
+    if (__builtin_mul_overflow(heads, size, &elements) ||
+        !checked_float_bytes(elements, &bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "L2Norm buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_gated_rmsnorm_plan_op(const yuuka_op & op) {
+    const uint64_t size = op.n[0];
+    const uint64_t heads = op.n[1];
+    if (size == 0 || heads == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid gated RMSNorm dimensions");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "gated RMSNorm buffer %d is null", i);
+        }
+    }
+    uint64_t elements = 0;
+    uint64_t bytes = 0;
+    uint64_t weight_bytes = 0;
+    if (__builtin_mul_overflow(heads, size, &elements) ||
+        !checked_float_bytes(elements, &bytes) ||
+        !checked_float_bytes(size, &weight_bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], bytes) ||
+        !buffer_range_ok(op.buf[1], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "gated RMSNorm buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_rmsnorm_heads_plan_op(const yuuka_op & op) {
+    const uint64_t size = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t stride = op.n[2];
+    if (size == 0 || heads == 0 || stride < size) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid head RMSNorm dimensions");
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "head RMSNorm buffer %d is null", i);
+        }
+    }
+    uint64_t elements = 0;
+    uint64_t bytes = 0;
+    uint64_t weight_bytes = 0;
+    if (__builtin_mul_overflow(heads, stride, &elements) ||
+        !checked_float_bytes(elements, &bytes) ||
+        !checked_float_bytes(size, &weight_bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], bytes) ||
+        !buffer_range_ok(op.buf[1], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "head RMSNorm buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_rope_plan_op(const yuuka_op & op) {
+    const uint64_t heads = op.n[0];
+    const uint64_t stride = op.n[1];
+    const uint64_t head_dim = op.n[2];
+    const uint64_t rot_dim = op.n[3];
+    if (heads == 0 || rot_dim == 0 || rot_dim % 2 != 0 || rot_dim > head_dim ||
+        stride < head_dim) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid RoPE dimensions");
+    }
+    if (rot_dim / 2 > 1024) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "RoPE rotation dimension is too large");
+    }
+    if (op.buf[0] == nullptr) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "RoPE buffer is null");
+    }
+    uint64_t elements = 0;
+    uint64_t bytes = 0;
+    if (__builtin_mul_overflow(heads, stride, &elements) ||
+        !checked_float_bytes(elements, &bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "RoPE buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_attention_plan_op(const yuuka_op & op) {
+    const uint64_t kv_heads = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t head_dim = op.n[2];
+    const uint64_t kv_dim = op.n[3];
+    const uint64_t capacity = op.u[0];
+    if (kv_heads == 0 || heads == 0 || head_dim == 0 || kv_dim == 0 ||
+        capacity == 0 || heads % kv_heads != 0 || kv_dim != kv_heads * head_dim) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid attention dimensions");
+    }
+    if (head_dim > 256) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "attention head dimension exceeds 256");
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "attention buffer %d is null", i);
+        }
+    }
+    uint64_t q_elements = 0;
+    uint64_t out_elements = 0;
+    uint64_t kv_elements = 0;
+    uint64_t score_elements = 0;
+    uint64_t q_bytes = 0;
+    uint64_t out_bytes = 0;
+    uint64_t kv_bytes = 0;
+    uint64_t score_bytes = 0;
+    if (__builtin_mul_overflow(heads, 2 * head_dim, &q_elements) ||
+        __builtin_mul_overflow(heads, head_dim, &out_elements) ||
+        __builtin_mul_overflow(capacity, kv_dim, &kv_elements) ||
+        __builtin_mul_overflow(heads, capacity, &score_elements) ||
+        !checked_float_bytes(q_elements, &q_bytes) ||
+        !checked_float_bytes(out_elements, &out_bytes) ||
+        !checked_float_bytes(kv_elements, &kv_bytes) ||
+        !checked_float_bytes(score_elements, &score_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "attention dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], q_bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], kv_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], kv_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], out_bytes) ||
+        !buffer_range_ok(op.buf[4], op.off[4], score_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "attention buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_conv1d_plan_op(const yuuka_op & op) {
+    const uint64_t channels = op.n[0];
+    const uint64_t kernel = op.n[1];
+    if (channels == 0 || kernel < 2) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid convolution dimensions");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "convolution buffer %d is null", i);
+        }
+    }
+    uint64_t state_elements = 0;
+    uint64_t weight_elements = 0;
+    uint64_t state_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t channel_bytes = 0;
+    if (__builtin_mul_overflow(channels, kernel - 1, &state_elements) ||
+        __builtin_mul_overflow(channels, kernel, &weight_elements) ||
+        !checked_float_bytes(state_elements, &state_bytes) ||
+        !checked_float_bytes(weight_elements, &weight_bytes) ||
+        !checked_float_bytes(channels, &channel_bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], state_bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], weight_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], channel_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], channel_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "convolution buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_gdn_plan_op(const yuuka_op & op) {
+    const uint64_t groups = op.n[0];
+    const uint64_t heads = op.n[1];
+    const uint64_t state_size = op.n[2];
+    if (groups == 0 || heads == 0 || state_size == 0 || groups > heads) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid GDN dimensions");
+    }
+    for (int i = 0; i < 9; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "GDN buffer %d is null", i);
+        }
+    }
+    uint64_t state_elements = 0;
+    uint64_t q_elements = 0;
+    uint64_t value_elements = 0;
+    uint64_t state_bytes = 0;
+    uint64_t q_bytes = 0;
+    uint64_t value_bytes = 0;
+    uint64_t head_bytes = 0;
+    if (__builtin_mul_overflow(heads, state_size, &state_elements) ||
+        __builtin_mul_overflow(state_elements, state_size, &state_elements) ||
+        __builtin_mul_overflow(groups, state_size, &q_elements) ||
+        __builtin_mul_overflow(heads, state_size, &value_elements) ||
+        !checked_float_bytes(state_elements, &state_bytes) ||
+        !checked_float_bytes(q_elements, &q_bytes) ||
+        !checked_float_bytes(value_elements, &value_bytes) ||
+        !checked_float_bytes(heads, &head_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "GDN dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], op.off[0], state_bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], q_bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], q_bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], value_bytes) ||
+        !buffer_range_ok(op.buf[4], op.off[4], head_bytes) ||
+        !buffer_range_ok(op.buf[5], op.off[5], head_bytes) ||
+        !buffer_range_ok(op.buf[6], op.off[6], head_bytes) ||
+        !buffer_range_ok(op.buf[7], op.off[7], head_bytes) ||
+        !buffer_range_ok(op.buf[8], op.off[8], value_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "GDN buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_elementwise_plan_op(const yuuka_op & op, int buffers) {
+    const uint64_t count = op.n[0];
+    if (count == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid elementwise size");
+    }
+    for (int i = 0; i < buffers; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "elementwise buffer %d is null", i);
+        }
+    }
+    uint64_t bytes = 0;
+    if (!checked_float_bytes(count, &bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "elementwise dimensions overflow");
+    }
+    for (int i = 0; i < buffers; ++i) {
+        if (!buffer_range_ok(op.buf[i], op.off[i], bytes)) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "elementwise buffer %d is too small", i);
+        }
+    }
+    return YUUKA_OK;
+}
+
+yuuka_status validate_kv_write_plan_op(const yuuka_op & op) {
+    const uint64_t kv_dim = op.n[0];
+    if (kv_dim == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid KV write width");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "KV write buffer %d is null", i);
+        }
+    }
+    uint64_t bytes = 0;
+    if (!checked_float_bytes(kv_dim, &bytes) ||
+        !buffer_range_ok(op.buf[0], op.off[0], bytes) ||
+        !buffer_range_ok(op.buf[1], op.off[1], bytes) ||
+        !buffer_range_ok(op.buf[2], op.off[2], bytes) ||
+        !buffer_range_ok(op.buf[3], op.off[3], bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "KV write buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 yuuka_status validate_moe_route_plan_op(const yuuka_op & op) {
     const uint64_t rows = op.n[0];
     const uint64_t experts = op.n[1];
@@ -2323,6 +2605,43 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_MOE_REDUCE_ADD:
                 status = validate_moe_reduce_plan_op(*op);
+                break;
+            case YUUKA_OP_RMSNORM:
+                status = validate_rmsnorm_plan_op(*op);
+                break;
+            case YUUKA_OP_L2NORM:
+                status = validate_l2norm_plan_op(*op);
+                break;
+            case YUUKA_OP_GATED_RMSNORM:
+                status = validate_gated_rmsnorm_plan_op(*op);
+                break;
+            case YUUKA_OP_RMSNORM_HEADS:
+                status = validate_rmsnorm_heads_plan_op(*op);
+                break;
+            case YUUKA_OP_ROPE:
+                status = validate_rope_plan_op(*op);
+                break;
+            case YUUKA_OP_ATTENTION:
+                status = validate_attention_plan_op(*op);
+                break;
+            case YUUKA_OP_CONV1D:
+                status = validate_conv1d_plan_op(*op);
+                break;
+            case YUUKA_OP_GDN:
+                status = validate_gdn_plan_op(*op);
+                break;
+            case YUUKA_OP_SILU_MUL:
+                status = validate_elementwise_plan_op(*op, 3);
+                break;
+            case YUUKA_OP_ADD:
+            case YUUKA_OP_COPY:
+                status = validate_elementwise_plan_op(*op, 2);
+                break;
+            case YUUKA_OP_SCALE:
+                status = validate_elementwise_plan_op(*op, 1);
+                break;
+            case YUUKA_OP_KV_WRITE:
+                status = validate_kv_write_plan_op(*op);
                 break;
             default:
                 break;
