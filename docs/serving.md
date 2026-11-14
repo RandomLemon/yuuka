@@ -100,8 +100,12 @@ Admission prevents overcommit and keeps latency predictable. It accounts for:
 - **Token budget:** prompt plus requested output tokens, bounded by the
   configured context length.
 - **KV budget:** blocks required for prompt plus output positions, checked
-  against the allocator total before queueing. A prefix hit can reduce the
-  actual allocation but does not reduce the conservative admission estimate.
+  against the configured context before queueing. The context is clamped to the
+  allocator capacity when the manager is constructed, so requests that fit the
+  context fit the pool in isolation; task construction still allocates the
+  table and can fail under concurrent-request or prefix-cache pressure. A
+  prefix hit can reduce the actual allocation but does not reduce the
+  conservative estimate.
 - **Concurrency limit:** active requests (`--max-concurrency`) and queue depth
   (`--max-queue`).
 
@@ -114,8 +118,9 @@ Implementation policy:
 
 - A request whose prompt alone consumes the whole context is rejected with
   `context_length_exceeded`.
-- A request that cannot fit the KV pool even with an empty queue is rejected
-  with `insufficient_capacity`.
+- A request whose block table cannot be allocated, including a pool exhausted
+  by concurrent requests or retained prefix entries, is rejected with
+  `insufficient_capacity` when its task is built.
 - A full queue is rejected with `server_overloaded` and `Retry-After: 1`.
   Streaming requests receive the HTTP error when rejection happens before the
   first SSE event; errors after streaming starts use an SSE error event.
