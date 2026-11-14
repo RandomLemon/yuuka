@@ -53,8 +53,9 @@ file into Go heap memory. Tensor data is read-only for the model lifetime.
 - **Byte ranges.** Compute element counts and byte sizes with overflow checks;
   validate `offset + bytes` against the shard or file size.
 - **Split files.** Handle multi-shard models, including split metadata, shard
-  ordering, and tensor-to-shard assignment. A model is usable only when every
-  required tensor is present exactly once.
+  ordering, and tensor-to-shard assignment. Every shard must repeat the split
+  count declared by shard 0 and carry the expected shard index. A model is
+  usable only when every required tensor is present exactly once.
 - **Duplicate and missing entries.** Duplicate metadata keys or tensor names are
   errors. Missing required tensors are errors. Extra tensors are currently not
   rejected or warned about; the HIP loader uploads every tensor in the

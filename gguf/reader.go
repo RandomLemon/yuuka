@@ -629,6 +629,17 @@ func Open(path string) (*Reader, error) {
 				cleanup()
 				return nil, fmt.Errorf("%w: split shard %d has split.no=%v", ErrMalformed, i, noValue)
 			}
+			count, ok := shardMeta.metadata["split.count"]
+			if !ok {
+				cleanup()
+				return nil, fmt.Errorf("%w: split shard %d has no split.count", ErrMalformed, i)
+			}
+			countValue, err := count.AsUint()
+			if err != nil || countValue != shardCount {
+				cleanup()
+				return nil, fmt.Errorf("%w: split shard %d has split.count=%v, want %d",
+					ErrMalformed, i, countValue, shardCount)
+			}
 		}
 		sh := &shard{path: shardPath, data: shardData, dataOffset: shardMeta.dataStart}
 		r.shards = append(r.shards, sh)

@@ -446,6 +446,43 @@ func TestReaderSplitShards(t *testing.T) {
 	}
 }
 
+func TestReaderRejectsSplitCountMismatch(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{
+		filepath.Join(dir, "model-00001-of-00002.gguf"),
+		filepath.Join(dir, "model-00002-of-00002.gguf"),
+	}
+	for i, path := range paths {
+		count := uint32(2)
+		if i == 1 {
+			count = 3
+		}
+		writeTestFile(t, path, testFile{
+			metadata: []testKV{
+				{"split.no", u32Value(uint32(i))},
+				{"split.count", u32Value(count)},
+			},
+			tensors: []testTensor{{
+				name:   "blk." + string(rune('0'+i)),
+				dims:   []uint64{2},
+				dtype:  tensor.F32,
+				offset: 0,
+			}},
+			data: make([]byte, 8),
+		})
+	}
+	r, err := Open(paths[0])
+	if err == nil {
+		r.Close()
+		t.Fatal("split.count mismatch was accepted")
+	}
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("error %v is not %v", err, ErrMalformed)
+	}
+	assertNoMapping(t, paths[0])
+	assertNoMapping(t, paths[1])
+}
+
 func TestReaderRealModel(t *testing.T) {
 	path := os.Getenv("YUUKA_TEST_MODEL")
 	if path == "" {
