@@ -29,7 +29,7 @@ builders bind named tensors; kernels interpret the quantization layout.
 | Step | Work | Failure behavior |
 | --- | --- | --- |
 | 1. Open | Open the GGUF file and any split shards; establish read-only access | Return a path-qualified error |
-| 2. Header | Validate magic, version, tensor count, and metadata count | Reject unsupported version or implausible counts |
+| 2. Header | Validate magic, version, tensor count, and metadata count | Reject unsupported version or counts above the fixed reader caps; truncation is caught while parsing |
 | 3. Metadata | Parse typed key/value entries, including architecture and tokenizer metadata | Reject malformed types, duplicate keys, or oversized values |
 | 4. Tensor directory | Read each tensor name, rank, dimensions, `ggml_type`, and data offset | Reject duplicate names, invalid ranks, zero dimensions, or overflow |
 | 5. Layout | Resolve alignment, tensor byte ranges, shard assignment, and data-section bounds | Reject overlaps, out-of-range offsets, or incomplete shards |
@@ -115,7 +115,7 @@ family, so each architecture adapter maps its metadata into a common
 | RoPE frequency base | `<arch>.rope.freq_base` |
 | RMS norm epsilon | `<arch>.attention.layer_norm_rms_epsilon` |
 | Context length | `<arch>.context_length` |
-| Vocabulary size | Token array length, or `<arch>.vocab_size` when present |
+| Vocabulary size | Token array length; `<arch>.vocab_size` only when the token array is absent |
 | BOS / EOS token IDs | `tokenizer.ggml.bos_token_id`, `tokenizer.ggml.eos_token_id` |
 | Tokenizer model | `tokenizer.ggml.model` |
 | Token list / merges / scores | `tokenizer.ggml.tokens`, `tokenizer.ggml.merges`, `tokenizer.ggml.scores` |
@@ -194,7 +194,7 @@ same string while producing different model behavior.
 
 | Priority | Architecture | Key features |
 | --- | --- | --- |
-| P0 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, MRoPE (text-only position sections), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU |
+| P0 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, RoPE over validated MRoPE sections (text-only path), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU |
 | P0 | Qwen3 Dense | RMSNorm, RoPE, GQA, Q/K norm, SwiGLU |
 | P0 | Llama Dense | RMSNorm, RoPE, GQA, SwiGLU |
 | P1 | Gemma | Architecture-specific norm, attention, and logit details |
@@ -207,7 +207,9 @@ The current implementation target is **Qwen3.5-4B with a Q4_K_M GGUF**
 gated delta-net linear attention in the remaining layers. The CPU reference path
 and the native HIP execution path are both implemented and tested for this
 architecture. The HIP path keeps GGUF weights packed and executes the full
-decoder.
+decoder. `qwen35.rope.dimension_sections` is validated for the text-only
+configuration; because every position component is equal, the forward pass
+applies standard RoPE over the full RoPE dimension.
 
 Dense Llama and Qwen3 CPU reference paths are implemented with generated
 fixtures. The Llama fixture is cross-checked against llama.cpp greedy tokens;
@@ -252,7 +254,7 @@ report; [testing.md](testing.md) records which checks currently have dedicated
 rejection tests and which are enforced only in the reader or model loader.
 
 - [ ] Magic and version are supported.
-- [ ] Metadata counts and tensor counts are plausible for the file size.
+- [ ] Metadata counts and tensor counts are bounded and parse within the file size.
 - [ ] Every metadata value has a known type and a valid length.
 - [ ] Every tensor name is unique and every required tensor is present.
 - [ ] Tensor rank is valid and every dimension is greater than zero.
@@ -261,7 +263,7 @@ rejection tests and which are enforced only in the reader or model loader.
 - [ ] Split shards are complete and no tensor is assigned twice.
 - [ ] Quantization block sizes divide the tensor dimensions they require.
 - [ ] Head counts, KV head counts, and head dimensions are mutually consistent.
-- [ ] Vocabulary size and special token IDs are consistent.
+- [ ] Special token IDs are within the token vocabulary.
 - [ ] The tokenizer can be constructed; non-Qwen chat templates are rejected at
       render time, not load time.
 - [ ] The architecture adapter accepts every required metadata field.

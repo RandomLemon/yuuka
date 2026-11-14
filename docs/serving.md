@@ -26,8 +26,9 @@ Current implementation:
 - HIP Graph capture and replay for decode, using device-resident token and
   position parameters. Graph capture is opt-in because the Phase 4
   measurements on Qwen3.5-4B Q4_K_M showed no material decode gain at 256
-  context; the plain stream path is the default and capture/replay falls back
-  to it on any failure.
+  context; the plain stream path is the default. Capture, dynamic-parameter
+  upload, and replay failures fall back to it; a wait or logits-download
+  failure after a successful launch is reported as a request error.
 - OpenAI-compatible `POST /v1/chat/completions` with SSE streaming, structured
   errors, stop strings, and a strict supported-parameter subset.
 - `/healthz`, `/metrics`, `/v1/models`, and `/debug/pprof/` endpoints.
