@@ -521,6 +521,9 @@ func (m *Model) addRecurrent(plan *hip.Plan, s *Session, layerIndex int, attnNor
 
 func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	cfg := m.config
+	if cfg.IsMoE() {
+		return m.addMoEDecodeFFN(plan, prefix, postNorm)
+	}
 	gate, err := m.weight(prefix + "ffn_gate.weight")
 	if err != nil {
 		return err
@@ -550,6 +553,99 @@ func (m *Model) addFFN(plan *hip.Plan, prefix string, postNorm weight) error {
 	}
 	// The projection that ends the sub-layer adds the residual itself.
 	return m.decodeMatmulResidual(plan, down, m.act.ffnGate, m.act.x, m.act.x, ffn, hidden)
+}
+
+// addMoEDecodeFFN builds one MoE sub-layer for a single token. The router picks
+// cfg.ExpertUsedCount experts, the selected-expert kernels compute only those
+// expert rows, the routing weights accumulate into the residual stream, and the
+// shared expert adds its sigmoid-gated result. The grouped kernels stay on the
+// prefill path: their grid is (experts, ffn) blocks, which would schedule every
+// unselected expert row for one token.
+func (m *Model) addMoEDecodeFFN(plan *hip.Plan, prefix string, postNorm weight) error {
+	cfg := m.config
+	router, err := m.weight(prefix + "ffn_gate_inp.weight")
+	if err != nil {
+		return err
+	}
+	sharedGateVec, err := m.weight(prefix + "ffn_gate_inp_shexp.weight")
+	if err != nil {
+		return err
+	}
+	sharedGate, err := m.weight(prefix + "ffn_gate_shexp.weight")
+	if err != nil {
+		return err
+	}
+	sharedUp, err := m.weight(prefix + "ffn_up_shexp.weight")
+	if err != nil {
+		return err
+	}
+	sharedDown, err := m.weight(prefix + "ffn_down_shexp.weight")
+	if err != nil {
+		return err
+	}
+	gate, err := m.weight(prefix + "ffn_gate_exps.weight")
+	if err != nil {
+		return err
+	}
+	up, err := m.weight(prefix + "ffn_up_exps.weight")
+	if err != nil {
+		return err
+	}
+	down, err := m.weight(prefix + "ffn_down_exps.weight")
+	if err != nil {
+		return err
+	}
+	hidden := int64(cfg.HiddenSize)
+	experts := int64(cfg.ExpertCount)
+	used := int64(cfg.ExpertUsedCount)
+	ffn := int64(cfg.ExpertFFNSize)
+	sharedFFN := int64(cfg.SharedFFNSize)
+	// One selected-expert launch decodes the gate and the up matrix with the
+	// same dtype instantiation; a mixed pair would need two grids per row.
+	if gate.dtype != up.dtype {
+		return fmt.Errorf("gpu: %s expert gate dtype %s differs from up dtype %s",
+			prefix, gate.dtype, up.dtype)
+	}
+	if err := plan.AddRMSNorm(m.act.x, postNorm.buf, m.act.norm, hidden, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	if err := m.decodeActGroup(plan, m.act.norm, hidden, router.dtype,
+		sharedGate.dtype, sharedUp.dtype); err != nil {
+		return err
+	}
+	// The router is one dense row over the experts; every MoE model in the
+	// supported set stores it as F32, which keeps the per-row GEMV.
+	if err := m.decodeMatmul(plan, router, m.act.norm, m.act.moeLogits, hidden, experts); err != nil {
+		return err
+	}
+	if err := plan.AddMoERoute(m.act.moeLogits, m.act.moeIDs, m.act.moeWeights,
+		m.act.moeCounts, m.act.moeAssignRows, m.act.moeAssignSlots,
+		m.act.moeAssignWeights, 1, experts, used); err != nil {
+		return err
+	}
+	if err := plan.AddMoEGateUpSelected(m.act.norm, m.act.moeIDs, gate.buf, up.buf,
+		m.act.moeAct, hidden, ffn, 1, used, experts, gate.dtype); err != nil {
+		return err
+	}
+	if err := plan.AddMoEDownSelected(m.act.moeAct, m.act.moeIDs, down.buf,
+		m.act.moeOut, ffn, hidden, 1, used, experts, down.dtype); err != nil {
+		return err
+	}
+	if err := plan.AddMoEReduceAdd(m.act.x, m.act.moeOut, m.act.moeWeights,
+		hidden, 1, used); err != nil {
+		return err
+	}
+	// The shared expert is a dense SwiGLU FFN over the same normalized row.
+	if err := m.decodeMatmulSwiglu(plan, sharedGate, sharedUp, m.act.norm,
+		m.act.ffnGate, hidden, sharedFFN); err != nil {
+		return err
+	}
+	if err := m.decodeMatmul(plan, sharedDown, m.act.ffnGate, m.act.tmp,
+		sharedFFN, hidden); err != nil {
+		return err
+	}
+	return plan.AddMoESharedAdd(m.act.x, m.act.tmp, sharedGateVec.buf, m.act.norm,
+		hidden, 1)
 }
 
 type prefillOutput uint8
@@ -897,6 +993,9 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 
 func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows, dispatchRows int64) error {
 	cfg := m.config
+	if cfg.IsMoE() {
+		return m.addMoEPrefillFFN(plan, prefix, postNorm, rows, dispatchRows)
+	}
 	p := &m.prefill
 	gate, err := m.weight(prefix + "ffn_gate.weight")
 	if err != nil {
@@ -916,6 +1015,20 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
+	if err := m.addPrefillSwiGLU(plan, gate, up, down, p.norm, rows, dispatchRows,
+		hidden, ffn); err != nil {
+		return err
+	}
+	return plan.Add(p.x, p.tmp, rows*hidden)
+}
+
+// addPrefillSwiGLU runs one gate/up/down feed-forward block over the activation
+// tile norm and leaves the result in m.prefill.tmp. It does not touch the
+// residual stream, so both the dense FFN and the MoE shared expert call it
+// before adding their own contributions.
+func (m *Model) addPrefillSwiGLU(plan *hip.Plan, gate, up, down weight, norm *hip.Buffer,
+	rows, dispatchRows, hidden, ffn int64) error {
+	p := &m.prefill
 	// Fuse the gate/up pair when both matmuls select the custom WMMA path.
 	// The fused kernel shares one activation tile and applies SwiGLU in the
 	// epilogue, so neither intermediate is written.
@@ -924,14 +1037,14 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 	downPath := hip.SelectPrefillPath(down.dtype, dispatchRows, ffn, hidden)
 	fused := gate.dtype == up.dtype && gatePath == hip.PrefillWMMA
 	if fused {
-		if err := plan.AddGemmSwigluAt(gate.buf, 0, up.buf, 0, p.norm, 0,
+		if err := plan.AddGemmSwigluAt(gate.buf, 0, up.buf, 0, norm, 0,
 			p.ffnGate, 0, hidden, ffn, rows, gate.dtype); err != nil {
 			return err
 		}
 	} else if gatePath == hip.PrefillMMQ && upPath == hip.PrefillMMQ {
-		// The two projections read exactly the same normalized activation, so
-		// the Q8_1 quantization runs once for the pair.
-		if err := plan.AddQuantizeQ8_1At(p.norm, 0, p.xQ8, p.xDS, hidden, rows); err != nil {
+		// The two projections read exactly the same activation tile, so the
+		// Q8_1 quantization runs once for the pair.
+		if err := plan.AddQuantizeQ8_1At(norm, 0, p.xQ8, p.xDS, hidden, rows); err != nil {
 			return err
 		}
 		if err := plan.AddGemmMmqAt(gate.buf, 0, p.xQ8, p.xDS, p.ffnGate, 0, hidden, ffn, rows, gate.dtype); err != nil {
@@ -941,21 +1054,18 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 			return err
 		}
 		if downPath == hip.PrefillMMQ {
-			// Both projections have consumed the normalized input. Reuse its
+			// Both projections have consumed the activation tile. Reuse its
 			// Q8_1 scratch for the down projection on the same stream.
 			if err := plan.AddSiluMulQuantQ8_1At(p.ffnGate, 0, p.ffnUp, 0, p.xQ8, 0, p.xDS, 0, ffn, rows); err != nil {
 				return err
 			}
-			if err := plan.AddGemmMmqAt(down.buf, 0, p.xQ8, p.xDS, p.tmp, 0, ffn, hidden, rows, down.dtype); err != nil {
-				return err
-			}
-			return plan.Add(p.x, p.tmp, rows*hidden)
+			return plan.AddGemmMmqAt(down.buf, 0, p.xQ8, p.xDS, p.tmp, 0, ffn, hidden, rows, down.dtype)
 		}
 	} else {
-		if err := m.prefillMatmulPath(plan, gate, p.norm, 0, p.ffnGate, 0, hidden, ffn, rows, gatePath); err != nil {
+		if err := m.prefillMatmulPath(plan, gate, norm, 0, p.ffnGate, 0, hidden, ffn, rows, gatePath); err != nil {
 			return err
 		}
-		if err := m.prefillMatmulPath(plan, up, p.norm, 0, p.ffnUp, 0, hidden, ffn, rows, upPath); err != nil {
+		if err := m.prefillMatmulPath(plan, up, norm, 0, p.ffnUp, 0, hidden, ffn, rows, upPath); err != nil {
 			return err
 		}
 	}
@@ -964,8 +1074,103 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 			return err
 		}
 	}
-	if err := m.prefillMatmulPath(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows, downPath); err != nil {
+	return m.prefillMatmulPath(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows, downPath)
+}
+
+// addMoEPrefillFFN builds one MoE sub-layer for a prompt chunk. The routed
+// experts use the grouped kernels, which schedule one grid over all experts and
+// let each expert read its binned assignment range; the shared expert reuses the
+// dense prefill SwiGLU and its sigmoid gate.
+func (m *Model) addMoEPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows, dispatchRows int64) error {
+	cfg := m.config
+	p := &m.prefill
+	router, err := m.weight(prefix + "ffn_gate_inp.weight")
+	if err != nil {
 		return err
 	}
-	return plan.Add(p.x, p.tmp, rows*hidden)
+	sharedGateVec, err := m.weight(prefix + "ffn_gate_inp_shexp.weight")
+	if err != nil {
+		return err
+	}
+	sharedGate, err := m.weight(prefix + "ffn_gate_shexp.weight")
+	if err != nil {
+		return err
+	}
+	sharedUp, err := m.weight(prefix + "ffn_up_shexp.weight")
+	if err != nil {
+		return err
+	}
+	sharedDown, err := m.weight(prefix + "ffn_down_shexp.weight")
+	if err != nil {
+		return err
+	}
+	gate, err := m.weight(prefix + "ffn_gate_exps.weight")
+	if err != nil {
+		return err
+	}
+	up, err := m.weight(prefix + "ffn_up_exps.weight")
+	if err != nil {
+		return err
+	}
+	down, err := m.weight(prefix + "ffn_down_exps.weight")
+	if err != nil {
+		return err
+	}
+	hidden := int64(cfg.HiddenSize)
+	experts := int64(cfg.ExpertCount)
+	used := int64(cfg.ExpertUsedCount)
+	ffn := int64(cfg.ExpertFFNSize)
+	sharedFFN := int64(cfg.SharedFFNSize)
+	if gate.dtype != up.dtype {
+		return fmt.Errorf("gpu: %s expert gate dtype %s differs from up dtype %s",
+			prefix, gate.dtype, up.dtype)
+	}
+	if err := plan.AddRMSNormBatchAt(p.x, 0, postNorm.buf, p.norm, 0,
+		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
+		return err
+	}
+	routerPath := hip.SelectPrefillPath(router.dtype, dispatchRows, hidden, experts)
+	if router.dtype == tensor.F32 {
+		// The router decides which experts run, and this model is routing
+		// sensitive: perturbing its router weights by 1e-4 relative moves the
+		// first-token logits by 0.6, because a perturbation flips near-tie
+		// expert selections. The FP16 activation staging of the WMMA tile is
+		// that much noise, so an F32 router takes the FP32 batched GEMM, which
+		// keeps the activations at full width. Other router dtypes keep the
+		// measured prefill dispatch.
+		if err := plan.AddGemmPathAt(router.buf, 0, p.norm, 0, p.moeLogits, 0,
+			hidden, experts, rows, tensor.F32, hip.GemmAuto); err != nil {
+			return err
+		}
+	} else if err := m.prefillMatmulPath(plan, router, p.norm, 0, p.moeLogits, 0,
+		hidden, experts, rows, routerPath); err != nil {
+		return err
+	}
+	if err := plan.AddMoERoute(p.moeLogits, p.moeIDs, p.moeWeights, p.moeCounts,
+		p.moeAssignRows, p.moeAssignSlots, p.moeAssignWeights, rows, experts, used); err != nil {
+		return err
+	}
+	if err := plan.AddMoEGateUpGrouped(p.norm, gate.buf, up.buf, p.moeCounts,
+		p.moeAssignRows, p.moeAssignSlots, p.moeGate, p.moeUp, hidden, ffn, rows,
+		experts, used, gate.dtype); err != nil {
+		return err
+	}
+	if err := plan.AddSiluMul(p.moeGate, p.moeUp, p.moeGate, rows*used*ffn); err != nil {
+		return err
+	}
+	if err := plan.AddMoEDownGrouped(p.moeGate, down.buf, p.moeCounts,
+		p.moeAssignRows, p.moeAssignSlots, p.moeOut, ffn, hidden, rows, experts,
+		used, down.dtype); err != nil {
+		return err
+	}
+	if err := plan.AddMoEReduceAdd(p.x, p.moeOut, p.moeWeights, hidden, rows, used); err != nil {
+		return err
+	}
+	// The shared expert reads the normalized tile, which none of the routed
+	// expert operations write.
+	if err := m.addPrefillSwiGLU(plan, sharedGate, sharedUp, sharedDown, p.norm,
+		rows, dispatchRows, hidden, sharedFFN); err != nil {
+		return err
+	}
+	return plan.AddMoESharedAdd(p.x, p.tmp, sharedGateVec.buf, p.norm, hidden, rows)
 }

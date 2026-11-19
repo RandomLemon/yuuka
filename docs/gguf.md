@@ -84,9 +84,9 @@ Initial native kernel coverage targets:
 | `Q6_K` | K-quant superblock layout | Decode and prefill |
 | `Q4_K` | 256-weight superblock with scale/min encoding | Primary decode target |
 | `Q5_K` | K-quant layout related to Q4_K/Q6_K | Decode and prefill |
-| `IQ2_XXS` | 256-weight codebook block, 66 bytes | CPU reference only |
-| `IQ2_S` | 256-weight codebook block with 8-bit scales, 82 bytes | CPU reference only |
-| `IQ3_S` | 256-weight codebook block, 110 bytes | CPU reference only |
+| `IQ2_XXS` | 256-weight codebook block, 66 bytes | CPU reference and HIP MoE expert / dequantization |
+| `IQ2_S` | 256-weight codebook block with 8-bit scales, 82 bytes | CPU reference and HIP MoE expert / dequantization |
+| `IQ3_S` | 256-weight codebook block, 110 bytes | CPU reference and HIP MoE expert / dequantization |
 
 The reader validates block-size divisibility where the format requires it, but
 must not reject a tensor merely because a particular kernel does not support its
@@ -200,7 +200,7 @@ same string while producing different model behavior.
 | Architecture | Key features | Execution paths | Status |
 | --- | --- | --- | --- |
 | Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, RoPE over validated MRoPE sections (text-only path), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU | CPU reference, HIP | Adapted and validated on a real Qwen3.5-4B Q4_K_M GGUF |
-| Qwen3.6 MoE hybrid (`qwen35moe`) | The `qwen35` hybrid attention and recurrent state with top-k routed experts and a sigmoid-gated shared expert | CPU reference | Adapted and validated on a real Qwen3.6-35B-A3B IQ2_XXS GGUF; HIP pending |
+| Qwen3.6 MoE hybrid (`qwen35moe`) | The `qwen35` hybrid attention and recurrent state with top-k routed experts and a sigmoid-gated shared expert | CPU reference, HIP | Adapted and validated on a real Qwen3.6-35B-A3B IQ2_XXS GGUF on both paths |
 
 `qwen35` and `qwen35moe` have been adapted and validated on real models. An
 architecture must not be treated as supported merely because an adapter exists
@@ -222,9 +222,11 @@ applies standard RoPE over the full RoPE dimension.
 dense FFN with 256 routed experts, top-8 routing, and one shared expert. The
 adapter requires scalar or equal-width `expert_feed_forward_length` metadata and
 loads the rank-3 `ffn_{gate,up,down}_exps` tensors as packed expert slices.
-Greedy CPU output on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf matches the llama.cpp
-reference for the tested prompts. The current Qwen3.6 path is CPU-only; the HIP
-planner rejects `qwen35moe` instead of falling back silently.
+Greedy output on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf matches the llama.cpp reference
+for the tested prompts on the CPU reference, and the HIP decoder reproduces the
+CPU greedy tokens and logits for the same GGUF. The HIP planner accepts an
+expert tensor only when the MoE kernels decode its dtype; every other dtype is
+rejected during planning instead of falling back silently.
 
 Architectures other than `qwen35` and `qwen35moe` have no adapter. Llama, dense
 Qwen3, Qwen3 MoE, Gemma, and DeepSeek-style models fail at load time with an
@@ -236,7 +238,11 @@ GGUF layout `[columns, rows_per_expert, experts]` and a `ffn_gate_inp` router.
 The adapter requires a scalar `expert_feed_forward_length` or a layer array
 whose entries are all equal; per-layer expert widths are rejected explicitly.
 The routed experts use top-k routing and the shared expert is sigmoid-gated. The
-HIP planner rejects `qwen35moe`; only the CPU reference executes it.
+HIP planner accepts expert dtypes in F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K,
+Q6_K, IQ2_XXS, IQ2_S, and IQ3_S, and rejects every other dtype during planning.
+The router and the shared expert use the dense matrix dtypes, so a model whose
+router is F32 and whose shared expert is a K-quant runs unmodified; the selected
+gate and up expert matrices must share one dtype.
 
 ## 9. Quantization support by phase
 
@@ -253,8 +259,10 @@ a correct reference path, a GPU kernel, and a benchmark entry.
 Current status: fused GEMV decode for `F16`, `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`,
 `Q5_K`, and `Q6_K` and quantized WMMA prefill GEMM for `F16`, `F32`, `Q4_0`,
 `Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_0` are implemented. The CPU reference
-additionally dequantizes and multiplies `IQ2_XXS`, `IQ2_S`, and `IQ3_S` blocks;
-there are no HIP kernels for those IQ types yet. The prefill dispatch table and
+additionally dequantizes and multiplies `IQ2_XXS`, `IQ2_S`, and `IQ3_S` blocks,
+and the HIP MoE expert kernels plus `yuuka_dequant_f16` decode the same three
+codebooks on the device. No HIP GEMV, GEMM, or LM-head kernel accepts them, so
+using an IQ tensor outside those two paths is a planning error. The prefill dispatch table and
 benchmark evidence are in [kernels.md](kernels.md) and
 [benchmarks.md](benchmarks.md). Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, IQ1, IQ2_XS,
 IQ3_XXS, IQ4_NL, and IQ4_XS remain capability failures.

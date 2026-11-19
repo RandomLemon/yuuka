@@ -306,19 +306,20 @@ model output. A text-only comparison is insufficient.
 
 | Dimension | Values |
 | --- | --- |
-| Model | Qwen3.5-4B hybrid (primary), Qwen3.6-35B-A3B MoE CPU, tiny `qwen35` and `qwen35moe` fixtures |
+| Model | Qwen3.5-4B hybrid (primary), Qwen3.6-35B-A3B MoE (CPU and HIP), tiny `qwen35` and `qwen35moe` fixtures |
 | Quantization | F16, Q8_0, Q6_K, Q5_K, Q4_K, Q5_0, Q4_0, IQ2_XXS, IQ2_S, IQ3_S |
 | KV format | F32, F16, Q8_0 |
 | Context | short, medium, maximum supported |
 | Prompt language | English, Chinese, mixed |
 | Batch | 1, small batch, continuous batch |
 | Concurrency | 1, 2, 4 |
-| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding including partial-accept rollback, shared MoE expert, native grouped-MoE kernel tests |
+| Features | no cache, prefix cache, chunked prefill, graph replay, cancellation, speculative decoding including partial-accept rollback, routed and shared MoE experts, selected and grouped MoE kernels, native IQ codebook pinning |
 | Backends | CPU reference, HIP GPU, library fallback |
 
-`qwen35moe` currently runs on the CPU reference only; the HIP planner rejects it
-explicitly. Architectures other than `qwen35` and `qwen35moe` are rejected at
-load time and have no test matrix entry.
+`qwen35moe` runs on the CPU reference and the HIP executor; the HIP planner
+rejects an expert dtype the MoE kernels cannot decode and any expert tensor
+whose row width violates the block layout. Architectures other than `qwen35` and
+`qwen35moe` are rejected at load time and have no test matrix entry.
 
 NPU support is a future task and is not part of Phase 5 acceptance. The
 `npu-probe` command remains a diagnostic check only.
@@ -591,18 +592,41 @@ Real-model tests are opt-in and skip when the variable is absent:
 YUUKA_TEST_MODEL=/path/to/model.gguf go test -tags hip ./... -count=1
 YUUKA_TEST_MOE_MODEL=/path/to/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf \
   go test ./model/qwen35 -run Qwen35MoE -count=1
+YUUKA_TEST_MOE_MODEL=/path/to/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf \
+  go test -tags hip ./engine/gpu -run TestGPUMoE -count=1 -timeout 60m
 ```
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
 reference, layer-by-layer hidden-state comparison, the paged HIP executor, KV
 formats, and speculative decoding against the plain greedy path. The
-`qwen35moe` CPU reference is validated on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf by
-greedy token comparison with llama.cpp; IQ block dequantization has separate
-reference tests for `IQ2_XXS`, `IQ2_S`, and `IQ3_S`. Synthetic coverage includes
-a tiny F32 `qwen35moe` fixture and a scripted partial-accept speculative
-rollback test. Native grouped-MoE kernels retain direct F32 and Q4_K tests, but
-no model runtime executes them.
+`qwen35moe` CPU reference and HIP decoder are both validated on
+Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf by greedy token comparison with llama.cpp; IQ
+block dequantization has separate reference tests for `IQ2_XXS`, `IQ2_S`, and
+`IQ3_S` on both backends. Synthetic coverage includes a tiny F32 `qwen35moe`
+fixture on the CPU and HIP paths and a scripted partial-accept speculative
+rollback test. Native coverage includes the grouped MoE kernels for F32 and
+Q4_K, the selected and grouped pipelines for IQ2_XXS/IQ2_S/IQ3_S expert
+matrices, and the shared-expert accumulation. The real-model HIP tests use an
+F32 KV pool so the expert arithmetic is compared without KV storage rounding.
+
+Real-model chunked prefill is gated on token behavior, not on a tight logit
+bound. Against the CPU reference the recorded maximum absolute logit difference
+grows with the prefix: Qwen3.5-4B reports 0.006 at 8 tokens, 0.022 at 64, and
+0.57 at 128, and Qwen3.6-35B-A3B reports 0.009 at 8 tokens, 1.1 at 128, and 0.96
+and 1.04 at 64- and 256-row chunks of a 256-token prompt.
+Two effects produce that drift, and neither is an MoE plan defect. First, the
+device prefill uses the chunkwise delta-net form and FP16-staged GEMM tiles while
+the reference runs the per-token scan in FP32, so the two paths separate as the
+prefix grows; the dense model shows it without any routing. Second, this MoE
+model is routing sensitive: perturbing its router weights by 1e-4 relative moves
+its own logits by 0.64, so a hidden-state difference of that size can flip a
+near-tie expert selection. `TestGPUMoEChunkedPrefill` therefore asserts the CPU
+top-1 token, a 2.0 logit bound, and the four greedy continuation tokens, which
+are the behavior the engine promises. Chunk sizes of one and two rows differ
+more from the CPU reference (recorded 2.31 and 0.33 on Qwen3.5-4B, unchanged by
+the MoE work), so they are not a coverage or tolerance point for either model;
+the synthetic tiny fixtures retain chunk sizes 1 and 2 as plan-shape coverage.
 HTTP API contract tests use the deterministic tiny fixture so they cover
 streaming, errors, stops, and cancellation independently of the optional model
 environment. SentencePiece golden IDs additionally accept

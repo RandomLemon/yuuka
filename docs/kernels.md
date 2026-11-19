@@ -132,7 +132,8 @@ hard-coded from another GPU.
 | `attention_paged` (serial) | Decode fallback and reference | One block per query head, sequential positions, per-head score workspace |
 | `rmsnorm` / `rope` | All stages | Minimize memory traffic and launches |
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
-| `moe_route` / `moe_expert_*` | Sparse MoE | Top-k routing, per-expert assignment bins, packed expert reads |
+| `moe_route` / `moe_gate_up_grouped` / `moe_down_grouped` | Sparse MoE prefill | Top-k routing, per-expert assignment bins, packed expert reads |
+| `moe_gate_up_selected` / `moe_down_selected` / `moe_shared_add` | Sparse MoE decode | One grid per routing slot, no binning, sigmoid-gated shared expert |
 | `sampling` | Output | GPU sampling or a low-cost host path |
 
 ## 5. Decode: quantized GEMV
@@ -326,8 +327,12 @@ The CPU reference dequantizes `IQ2_XXS`, `IQ2_S`, and `IQ3_S` blocks with the
 ggml codebooks and sign tables. `IQ2_XXS` and `IQ3_S` derive sub-block scales
 from packed auxiliary words; `IQ2_S` uses one 4-bit scale pair per 32 values.
 `tensor.DequantizeRow` and `tensor.Matrix.MatVec` use the same block decoders,
-so the reference path never expands a whole model to FP16. These types are not
-implemented in HIP kernels yet; a HIP plan rejects them during validation.
+so the reference path never expands a whole model to FP16. On the device the
+same three codebooks live in `kernels/hip/iq_decode.cuh` as `__constant__`
+tables and per-value decoders. Only two kernel families read them: the MoE
+expert kernels, and `dequant_span_kernel`, which backs `yuuka_dequant_f16`.
+General GEMV, GEMM, and LM-head validation still rejects these dtypes, so an IQ
+tensor outside the MoE family is a planning error rather than a silent zero.
 `Q4_1`, `Q5_1`, `Q2_K`, `Q3_K`, `Q8_K`, `IQ1`, `IQ2_XS`, `IQ3_XXS`, `IQ4_NL`,
 and `IQ4_XS` remain capability failures.
 
@@ -1039,10 +1044,38 @@ expert's assignment list:
 
 The routing and assignment buffers are sized `experts * rows * used`, which is
 safe because one row contributes exactly `used` assignments. A malformed plan
-that would exceed a bucket is rejected at plan construction. The grouped kernels
-remain covered by native F32 and Q4_K kernel tests, but no supported model
-runtime executes them: `qwen35moe` is CPU-only and the removed Qwen3 MoE adapter
-is not reachable.
+that would exceed a bucket is rejected at plan construction.
+
+The grouped grid is the prefill form. At one token it would launch
+`experts * ffn` blocks, of which only `used * ffn` correspond to selected
+experts, so the decode plan uses a second family indexed by
+`(output row, routing slot)`:
+
+- `moe_gate_up_selected` reads the routing id of the slot, decodes the gate and
+  up rows of that expert, and writes `silu(gate) * up` for the slot.
+- `moe_down_selected` reads the same routing id and forms the down projection of
+  the slot's activation row.
+- `moe_shared_add` computes `sigmoid(dot(gate, norm[row]))` and adds
+  `s * src[row]` to the residual stream, which is the shared expert's gate in
+  both the CPU reference and the HIP plan.
+
+Both families decode expert weights with `moe_packed_value`, which accepts the
+eight general matvec dtypes plus IQ2_XXS, IQ2_S, and IQ3_S. That helper is local
+to the MoE kernels so `quant.cuh`'s `packed_value` keeps rejecting the IQ types.
+`tests/hip/iq_moe_test.cpp` pins the three codebooks against the CPU reference
+values and requires the grouped and selected pipelines to agree with a host
+computation over the same decoded expert matrices. The per-value decode is the
+correctness implementation; no throughput claim is made for it.
+
+The prefill router projection is the one MoE matmul that does not follow the
+measured prefill dispatch table: an F32 router takes the FP32 batched GEMM
+(`launch_gemm_f32`) instead of the WMMA tile. Routing is a selection, so an
+FP16-staged activation tile is enough noise to flip near-tie experts.
+Perturbing the reference model's router weights by 1e-4 relative moves its
+first-token logits by 0.64, and the WMMA router left the chunked prefill at
+0.77 against the CPU reference where the FP32 route holds it at 0.009. The
+projection is 2048x256 per row, so the accuracy costs nothing measurable. Every
+other prefill matmul, including the shared expert, keeps the measured dispatch.
 
 ### 8.2 Speculative verification
 

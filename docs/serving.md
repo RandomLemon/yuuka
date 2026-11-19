@@ -217,9 +217,9 @@ Requirements and current behavior:
 ### 7.1 Configuration
 
 - F16 keys and values by default. `--kv-type f32` and `--kv-type q8_0` select
-  opt-in F32 and Q8_0 pools for the `qwen35` CPU and HIP backends and the
-  `qwen35moe` CPU backend. The prefix-cache model key includes the format, and
-  the F32 path remains the numerical baseline.
+  opt-in F32 and Q8_0 pools for the `qwen35` and `qwen35moe` CPU and HIP
+  backends. The prefix-cache model key includes the format, and the F32 path
+  remains the numerical baseline.
 - HIP paged prefill attention runs the FP16 MMA kernel for F32 and F16 pools
   once the chunk has 64 rows or the context reaches 256 tokens; Q8_0 pools,
   other head widths, and shorter chunks use the tiled kernel. Both read the
@@ -320,7 +320,7 @@ shapes where host launch overhead is measured to matter.
 The CLI supports loading a GGUF model, single-prompt generation (including
 stdin input), inspection, benchmark, and a diagnostic NPU-probe mode.
 `yuuka run` and `yuuka bench` accept
-`--kv-type f32|f16|q8_0` for `qwen35` CPU/HIP and `qwen35moe` CPU. They also
+`--kv-type f32|f16|q8_0` for `qwen35` and `qwen35moe` on both backends. They also
 accept `--speculative`,
 `--spec-max-draft`, and `--spec-min-match`. `--npu` records the NPU capability
 result and falls back to the selected backend; it is diagnostic only, and NPU

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 9
+#define YUUKA_HIP_ABI_VERSION 10
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -144,7 +144,10 @@ typedef enum yuuka_op_code {
     YUUKA_OP_CONV_L2NORM = 40,
     YUUKA_OP_GEMV_RESIDUAL = 41,
     YUUKA_OP_GEMV_PAIR = 42,
-    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 43
+    YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 43,
+    YUUKA_OP_MOE_GATE_UP_SELECTED = 44,
+    YUUKA_OP_MOE_DOWN_SELECTED = 45,
+    YUUKA_OP_MOE_SHARED_ADD = 46
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -202,7 +205,13 @@ typedef enum yuuka_dtype {
     YUUKA_DTYPE_Q8_0 = 8,
     YUUKA_DTYPE_Q4_K = 12,
     YUUKA_DTYPE_Q5_K = 13,
-    YUUKA_DTYPE_Q6_K = 14
+    YUUKA_DTYPE_Q6_K = 14,
+    /* IQ2_XXS, IQ2_S, and IQ3_S are decode-supported only by the MoE expert
+     * kernels and by yuuka_dequant_f16; every other kernel family rejects
+     * them so a general matvec cannot read them as zero. */
+    YUUKA_DTYPE_IQ2_XXS = 16,
+    YUUKA_DTYPE_IQ3_S = 21,
+    YUUKA_DTYPE_IQ2_S = 22
 } yuuka_dtype;
 
 YUUKA_API yuuka_status yuuka_gemv(yuuka_stream * stream, yuuka_buffer * out,
@@ -287,14 +296,15 @@ YUUKA_API yuuka_status yuuka_lm_head(yuuka_stream * stream, yuuka_buffer * out,
                         uint64_t n_in, uint64_t n_out, uint64_t rows,
                         uint32_t dtype, yuuka_event * completion);
 
-/* Dequantizes a packed K-quant weight matrix into an FP16 scratch:
+/* Dequantizes a packed quantized weight matrix into an FP16 scratch:
  *
  * dst[n_out, n_in] = dequant(src[n_out, n_in])
  *
- * src is a packed Q4_K, Q5_K, or Q6_K matrix with dtype row strides; dst must
- * hold n_in*n_out*2 bytes. The decoded values are the FP16 values the rocWMMA
- * prefill path stages, so feeding dst to yuuka_gemm_blas isolates the
- * accumulation from the dequantization.
+ * src is a packed Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, or IQ3_S matrix with dtype
+ * row strides; n_in must be a multiple of 256 and dst must hold n_in*n_out*2
+ * bytes. The decoded values are the FP16 values the prefill and MoE paths
+ * decode, so feeding dst to yuuka_gemm_blas isolates the accumulation from the
+ * dequantization.
  */
 YUUKA_API yuuka_status yuuka_dequant_f16(yuuka_stream * stream, yuuka_buffer * dst,
                         const yuuka_buffer * src, uint64_t n_in, uint64_t n_out,
@@ -445,7 +455,12 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *
  * MoE family. ids and weights are [rows, used]. counts is [experts] and each of
  * the three assignment buffers is [experts, rows*used]. The grouped kernels bin
- * assignments by expert at runtime.
+ * assignments by expert at runtime and are the prefill form; the selected
+ * kernels launch one grid over the rows*used routing slots and are the decode
+ * form, which must not schedule the grouped experts-by-FFN grid for one token.
+ * Expert tensors accept the eight packed dtypes of the general matvec families
+ * plus IQ2_XXS, IQ2_S, and IQ3_S, whose 256-value blocks the MoE kernels decode
+ * on the device.
  *   MOE_ROUTE:      buf0 logits [rows,experts], buf1 ids, buf2 weights,
  *                   buf3 counts, buf4 assign_rows, buf5 assign_slots,
  *                   buf6 assign_weights; n={rows,experts,used}
@@ -457,6 +472,17 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                   u[0]=dtype
  *   MOE_REDUCE_ADD: buf0 x, buf1 expert_out, buf2 weights;
  *                   n={hidden,rows,used}
+ *   MOE_GATE_UP_SELECTED: buf0 norm [rows,hidden], buf1 ids int32[rows*used],
+ *                   buf2 gate_exps, buf3 up_exps, buf4 act [rows*used,ffn]
+ *                   holding silu(gate)*up; n={hidden,ffn,rows,used,experts};
+ *                   u[0] is the single dtype of both expert matrices
+ *   MOE_DOWN_SELECTED:    buf0 act [rows*used,ffn], buf1 ids int32[rows*used],
+ *                   buf2 down_exps, buf3 out [rows*used,hidden];
+ *                   n={ffn,hidden,rows,used,experts}; u[0]=dtype
+ *   MOE_SHARED_ADD: buf0 x [rows,hidden], buf1 src [rows,hidden], buf2 gate
+ *                   weight [hidden] F32, buf3 norm [rows,hidden];
+ *                   n={hidden,rows}. Computes s = sigmoid(dot(gate, norm[row]))
+ *                   and x[row,i] += s * src[row,i].
  *
  * Graph capture executes a plan with device-resident dynamic parameters.
  * Position-dependent ops must have a dynamic-parameter kernel; plans containing

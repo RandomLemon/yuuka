@@ -1,10 +1,30 @@
 #include "../common.cuh"
+#include "../iq_decode.cuh"
 #include "../quant.cuh"
 #include "../yuuka_kernels.h"
 
 namespace {
 
 constexpr int kThreads = 256;
+
+// moe_packed_value decodes element index of one packed expert weight row. The
+// MoE kernels are the only family that decodes the IQ2/IQ3 codebooks; every
+// other kernel keeps packed_value, which rejects those dtypes so a GEMV or GEMM
+// on an IQ tensor still fails instead of reading it as zero.
+__device__ __forceinline__ float moe_packed_value(uint32_t dtype,
+                                                  const uint8_t * row,
+                                                  int64_t index) {
+    switch (dtype) {
+    case YUUKA_DTYPE_IQ2_XXS:
+        return iq2xxs_value(row + (index / 256) * 66, static_cast<int>(index % 256));
+    case YUUKA_DTYPE_IQ2_S:
+        return iq2s_value(row + (index / 256) * 82, static_cast<int>(index % 256));
+    case YUUKA_DTYPE_IQ3_S:
+        return iq3s_value(row + (index / 256) * 110, static_cast<int>(index % 256));
+    default:
+        return packed_value(dtype, row, index);
+    }
+}
 
 // moe_route_kernel selects the top-k experts for every row, normalizes the
 // selected softmax weights, and bins assignments by expert. Binning makes the
@@ -93,8 +113,8 @@ __global__ void moe_gate_up_grouped_kernel(
         float up_sum = 0.0f;
         for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
             const float value = x[i];
-            gate_sum += value * packed_value(dtype, gate_row, i);
-            up_sum += value * packed_value(dtype, up_row, i);
+            gate_sum += value * moe_packed_value(dtype, gate_row, i);
+            up_sum += value * moe_packed_value(dtype, up_row, i);
         }
         gate_sum = block_reduce_sum<kThreads>(gate_sum, scratch);
         up_sum = block_reduce_sum<kThreads>(up_sum, scratch);
@@ -132,7 +152,7 @@ __global__ void moe_down_grouped_kernel(
             act + (static_cast<int64_t>(row) * used + slot) * ffn;
         float sum = 0.0f;
         for (int i = threadIdx.x; i < ffn; i += blockDim.x) {
-            sum += x[i] * packed_value(dtype, weight_row, i);
+            sum += x[i] * moe_packed_value(dtype, weight_row, i);
         }
         sum = block_reduce_sum<kThreads>(sum, scratch);
         if (threadIdx.x == 0) {
@@ -161,6 +181,93 @@ __global__ void moe_reduce_add_kernel(float * x, const float * expert_out,
             sum += weight_row[slot] * out_row[slot * hidden + i];
         }
         x[static_cast<int64_t>(row) * hidden + i] += sum;
+    }
+}
+
+// moe_gate_up_selected_kernel computes one expert-FFN row for one selected
+// expert of one token. Blocks are indexed by (expert-FFN row, token slot), so
+// the decode path launches one grid over the used experts only instead of the
+// grouped kernel's experts-by-FFN grid, which would schedule every unselected
+// expert row.
+__global__ void moe_gate_up_selected_kernel(
+    const float * norm, const int32_t * ids, const uint8_t * gate_exps,
+    const uint8_t * up_exps, float * act, int rows, int used, int hidden,
+    int ffn, uint64_t hidden_row_bytes, uint32_t dtype) {
+    const int out_row = blockIdx.x;
+    const int slot_index = blockIdx.y;
+    if (out_row >= ffn || slot_index >= rows * used) {
+        return;
+    }
+    const int expert = ids[slot_index];
+    const int row = slot_index / used;
+    const uint8_t * gate_row =
+        gate_exps + static_cast<int64_t>(expert * ffn + out_row) * hidden_row_bytes;
+    const uint8_t * up_row =
+        up_exps + static_cast<int64_t>(expert * ffn + out_row) * hidden_row_bytes;
+    const float * x = norm + static_cast<int64_t>(row) * hidden;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        const float value = x[i];
+        gate_sum += value * moe_packed_value(dtype, gate_row, i);
+        up_sum += value * moe_packed_value(dtype, up_row, i);
+    }
+    __shared__ float scratch[kThreads];
+    gate_sum = block_reduce_sum<kThreads>(gate_sum, scratch);
+    up_sum = block_reduce_sum<kThreads>(up_sum, scratch);
+    if (threadIdx.x == 0) {
+        act[static_cast<int64_t>(slot_index) * ffn + out_row] =
+            (gate_sum / (1.0f + expf(-gate_sum))) * up_sum;
+    }
+}
+
+// moe_down_selected_kernel computes one down-projection row for one selected
+// expert of one token.
+__global__ void moe_down_selected_kernel(
+    const float * act, const int32_t * ids, const uint8_t * down_exps, float * out,
+    int rows, int used, int hidden, int ffn, uint64_t ffn_row_bytes,
+    uint32_t dtype) {
+    const int out_row = blockIdx.x;
+    const int slot_index = blockIdx.y;
+    if (out_row >= hidden || slot_index >= rows * used) {
+        return;
+    }
+    const int expert = ids[slot_index];
+    const uint8_t * weight_row =
+        down_exps + static_cast<int64_t>(expert * hidden + out_row) * ffn_row_bytes;
+    const float * x = act + static_cast<int64_t>(slot_index) * ffn;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < ffn; i += blockDim.x) {
+        sum += x[i] * moe_packed_value(dtype, weight_row, i);
+    }
+    __shared__ float scratch[kThreads];
+    sum = block_reduce_sum<kThreads>(sum, scratch);
+    if (threadIdx.x == 0) {
+        out[static_cast<int64_t>(slot_index) * hidden + out_row] = sum;
+    }
+}
+
+// moe_shared_add_kernel adds the sigmoid-gated shared expert output to the
+// residual stream. The gate is one dot product of the per-layer gate vector
+// with the normalized row.
+__global__ void moe_shared_add_kernel(float * x, const float * src,
+                                      const float * gate, const float * norm,
+                                      int rows, int hidden) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const float * n = norm + static_cast<int64_t>(row) * hidden;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        sum += gate[i] * n[i];
+    }
+    __shared__ float scratch[kThreads];
+    sum = block_reduce_sum<kThreads>(sum, scratch);
+    const float weight = 1.0f / (1.0f + expf(-sum));
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        const int64_t index = static_cast<int64_t>(row) * hidden + i;
+        x[index] += weight * src[index];
     }
 }
 
@@ -231,6 +338,47 @@ void launch_moe_reduce_add(float * x, const float * expert_out,
     }
     moe_reduce_add_kernel<<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
         x, expert_out, weights, rows, used, hidden);
+}
+
+void launch_moe_gate_up_selected(const float * norm, const int32_t * ids,
+                                 const void * gate_exps, const void * up_exps,
+                                 float * act, int rows, int used, int hidden,
+                                 int ffn, uint64_t hidden_row_bytes,
+                                 uint32_t dtype, hipStream_t stream) {
+    if (rows <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(ffn),
+                    static_cast<unsigned>(rows * used));
+    moe_gate_up_selected_kernel<<<grid, kThreads, 0, stream>>>(
+        norm, ids, static_cast<const uint8_t *>(gate_exps),
+        static_cast<const uint8_t *>(up_exps), act, rows, used, hidden, ffn,
+        hidden_row_bytes, dtype);
+}
+
+void launch_moe_down_selected(const float * act, const int32_t * ids,
+                              const void * down_exps, float * out, int rows,
+                              int used, int hidden, int ffn,
+                              uint64_t ffn_row_bytes, uint32_t dtype,
+                              hipStream_t stream) {
+    if (rows <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(hidden),
+                    static_cast<unsigned>(rows * used));
+    moe_down_selected_kernel<<<grid, kThreads, 0, stream>>>(
+        act, ids, static_cast<const uint8_t *>(down_exps), out, rows, used,
+        hidden, ffn, ffn_row_bytes, dtype);
+}
+
+void launch_moe_shared_add(float * x, const float * src, const float * gate,
+                           const float * norm, int rows, int hidden,
+                           hipStream_t stream) {
+    if (rows <= 0 || hidden <= 0) {
+        return;
+    }
+    moe_shared_add_kernel<<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
+        x, src, gate, norm, rows, hidden);
 }
 
 } // namespace yuuka

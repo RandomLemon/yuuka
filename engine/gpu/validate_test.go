@@ -25,18 +25,26 @@ func TestValidateModelSupportRejectsUnsupportedDType(t *testing.T) {
 	}
 }
 
-func TestValidateModelSupportRejectsQwen35MoE(t *testing.T) {
-	model := &qwen35.Model{
-		Config: &qwen35.Config{
-			Architecture: qwen35.MoEArchitecture,
-			ExpertCount:  4,
-		},
+func TestValidateModelSupportAcceptsQwen35MoE(t *testing.T) {
+	_, model, _ := tinyMoEFixture(t)
+	if err := validateModelSupport(model); err != nil {
+		t.Fatalf("qwen35moe fixture was rejected: %v", err)
 	}
+	for i := range model.Layers {
+		if model.Layers[i].MoE == nil {
+			t.Fatalf("layer %d has no MoE tensors", i)
+		}
+	}
+}
+
+func TestValidateModelSupportRejectsMoEExpertDType(t *testing.T) {
+	_, model, _ := tinyMoEFixture(t)
+	model.Layers[0].MoE.GateExps.DType = tensor.Q2_K
 	err := validateModelSupport(model)
 	if err == nil {
-		t.Fatal("qwen35moe was accepted by the HIP validator")
+		t.Fatal("unsupported expert dtype was accepted")
 	}
-	if !strings.Contains(err.Error(), "does not implement") {
+	if !strings.Contains(err.Error(), "ffn_gate_exps.weight") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

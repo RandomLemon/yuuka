@@ -179,6 +179,9 @@ func TestIQDTypeCapabilities(t *testing.T) {
 		if dtype.HIPSupported() {
 			t.Fatalf("%s incorrectly reports a HIP kernel", dtype)
 		}
+		if !dtype.HIPMoESupported() {
+			t.Fatalf("%s has no HIP MoE kernel", dtype)
+		}
 		if _, err := dtype.BlockLayout(); err != nil {
 			t.Fatalf("%s block layout: %v", dtype, err)
 		}
@@ -186,6 +189,14 @@ func TestIQDTypeCapabilities(t *testing.T) {
 	for _, dtype := range []DType{F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K} {
 		if !dtype.HIPSupported() {
 			t.Fatalf("%s lost HIP support", dtype)
+		}
+		if !dtype.HIPMoESupported() {
+			t.Fatalf("%s lost HIP MoE support", dtype)
+		}
+	}
+	for _, dtype := range []DType{Q2_K, Q3_K, Q8_K, IQ2XS, IQ3XXS, IQ1S, IQ4NL, IQ4XS} {
+		if dtype.HIPMoESupported() {
+			t.Fatalf("%s incorrectly reports a HIP MoE kernel", dtype)
 		}
 	}
 }

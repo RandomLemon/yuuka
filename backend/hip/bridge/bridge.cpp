@@ -107,6 +107,40 @@ bool checked_row_bytes(uint64_t n_in, uint32_t dtype, uint64_t * out) {
     }
 }
 
+// check_moe_dtype reports whether the MoE expert kernels decode a dtype. It
+// accepts the general matvec dtypes plus the IQ2/IQ3 codebooks, which only the
+// MoE kernels and yuuka_dequant_f16 read; general GEMV, GEMM, and LM-head
+// validation keeps using check_gemv_shapes so those paths stay closed.
+bool check_moe_dtype(uint64_t n_in, uint32_t dtype) {
+    switch (dtype) {
+        case YUUKA_DTYPE_IQ2_XXS:
+        case YUUKA_DTYPE_IQ2_S:
+        case YUUKA_DTYPE_IQ3_S:
+            return n_in % 256 == 0;
+        default:
+            return check_gemv_shapes(n_in, dtype);
+    }
+}
+
+// moe_row_bytes returns the packed byte stride of one expert weight row. It
+// mirrors checked_row_bytes and adds the 66, 82, and 110 byte IQ blocks.
+bool moe_row_bytes(uint64_t n_in, uint32_t dtype, uint64_t * out) {
+    uint64_t blocks = 0;
+    switch (dtype) {
+        case YUUKA_DTYPE_IQ2_XXS:
+            blocks = n_in / 256;
+            return !__builtin_mul_overflow(blocks, uint64_t(66), out);
+        case YUUKA_DTYPE_IQ2_S:
+            blocks = n_in / 256;
+            return !__builtin_mul_overflow(blocks, uint64_t(82), out);
+        case YUUKA_DTYPE_IQ3_S:
+            blocks = n_in / 256;
+            return !__builtin_mul_overflow(blocks, uint64_t(110), out);
+        default:
+            return checked_row_bytes(n_in, dtype, out);
+    }
+}
+
 bool kv_dtype_ok(uint32_t dtype) {
     return dtype == YUUKA_DTYPE_F32 || dtype == YUUKA_DTYPE_F16 ||
            dtype == YUUKA_DTYPE_Q8_0;
@@ -1031,8 +1065,8 @@ yuuka_status validate_cast_plan_op(const yuuka_op & op) {
 }
 
 // validate_dequant_plan_op checks an FP16 weight dequantization. Only the
-// K-quant dtypes with a dequant kernel are accepted; the destination is an FP16
-// scratch sized from the unpacked shape.
+// K-quant and IQ2/IQ3 dtypes with a dequant kernel are accepted; the
+// destination is an FP16 scratch sized from the unpacked shape.
 yuuka_status validate_dequant_plan_op(const yuuka_op & op) {
     if (op.buf[0] == nullptr || op.buf[1] == nullptr) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "dequant op buffers are null");
@@ -1040,15 +1074,17 @@ yuuka_status validate_dequant_plan_op(const yuuka_op & op) {
     const uint64_t n_in = op.n[0];
     const uint64_t n_out = op.n[1];
     const uint32_t dtype = op.u[0];
-    if (dtype != YUUKA_DTYPE_Q4_K && dtype != YUUKA_DTYPE_Q5_K &&
+    const bool iq = dtype == YUUKA_DTYPE_IQ2_XXS || dtype == YUUKA_DTYPE_IQ2_S ||
+                    dtype == YUUKA_DTYPE_IQ3_S;
+    if (!iq && dtype != YUUKA_DTYPE_Q4_K && dtype != YUUKA_DTYPE_Q5_K &&
         dtype != YUUKA_DTYPE_Q6_K) {
-        return fail(YUUKA_ERR_UNSUPPORTED, "dequant supports K-quants only, got %u",
-                    dtype);
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "dequant supports K-quants and IQ2/IQ3 only, got %u", dtype);
     }
     if (n_in == 0 || n_out == 0) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "dequant dimensions must be positive");
     }
-    if (!check_gemv_shapes(n_in, dtype)) {
+    if (!check_moe_dtype(n_in, dtype)) {
         return fail(YUUKA_ERR_UNSUPPORTED,
                     "dequant input width %llu is not a multiple of 256",
                     static_cast<unsigned long long>(n_in));
@@ -1057,7 +1093,7 @@ yuuka_status validate_dequant_plan_op(const yuuka_op & op) {
     uint64_t src_bytes = 0;
     uint64_t elements = 0;
     uint64_t dst_bytes = 0;
-    if (!checked_row_bytes(n_in, dtype, &row_bytes) ||
+    if (!moe_row_bytes(n_in, dtype, &row_bytes) ||
         __builtin_mul_overflow(row_bytes, n_out, &src_bytes) ||
         __builtin_mul_overflow(n_in, n_out, &elements) ||
         __builtin_mul_overflow(elements, uint64_t(2), &dst_bytes)) {
@@ -1721,7 +1757,7 @@ yuuka_status validate_moe_gate_up_plan_op(const yuuka_op & op) {
     const uint64_t used = op.n[4];
     const uint32_t dtype = op.u[0];
     if (hidden == 0 || ffn == 0 || rows == 0 || experts == 0 || used == 0 ||
-        used > experts || !check_gemv_shapes(hidden, dtype)) {
+        used > experts || !check_moe_dtype(hidden, dtype)) {
         return fail(YUUKA_ERR_UNSUPPORTED, "invalid MoE gate/up dimensions or dtype");
     }
     for (int i = 0; i < 8; ++i) {
@@ -1740,7 +1776,7 @@ yuuka_status validate_moe_gate_up_plan_op(const yuuka_op & op) {
     uint64_t bucket_rows = 0;
     uint64_t bucket_bytes = 0;
     uint64_t count_bytes = 0;
-    if (!checked_row_bytes(hidden, dtype, &hidden_row) ||
+    if (!moe_row_bytes(hidden, dtype, &hidden_row) ||
         __builtin_mul_overflow(ffn, experts, &weight_rows) ||
         __builtin_mul_overflow(weight_rows, hidden_row, &weight_bytes) ||
         __builtin_mul_overflow(rows, hidden, &norm_elements) ||
@@ -1774,7 +1810,7 @@ yuuka_status validate_moe_down_plan_op(const yuuka_op & op) {
     const uint64_t used = op.n[4];
     const uint32_t dtype = op.u[0];
     if (ffn == 0 || hidden == 0 || rows == 0 || experts == 0 || used == 0 ||
-        used > experts || !check_gemv_shapes(ffn, dtype)) {
+        used > experts || !check_moe_dtype(ffn, dtype)) {
         return fail(YUUKA_ERR_UNSUPPORTED, "invalid MoE down dimensions or dtype");
     }
     for (int i = 0; i < 6; ++i) {
@@ -1793,7 +1829,7 @@ yuuka_status validate_moe_down_plan_op(const yuuka_op & op) {
     uint64_t bucket_rows = 0;
     uint64_t bucket_bytes = 0;
     uint64_t count_bytes = 0;
-    if (!checked_row_bytes(ffn, dtype, &ffn_row) ||
+    if (!moe_row_bytes(ffn, dtype, &ffn_row) ||
         __builtin_mul_overflow(hidden, experts, &weight_rows) ||
         __builtin_mul_overflow(weight_rows, ffn_row, &weight_bytes) ||
         __builtin_mul_overflow(rows, used, &row_used) ||
@@ -1847,6 +1883,144 @@ yuuka_status validate_moe_reduce_plan_op(const yuuka_op & op) {
         !buffer_range_ok(op.buf[1], 0, out_bytes) ||
         !buffer_range_ok(op.buf[2], 0, weight_bytes)) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE reduce buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_moe_gate_up_selected_plan_op checks the decode-form expert gate and
+// up projections. Blocks are indexed by (expert-FFN row, routing slot), so the
+// act buffer is [rows*used, ffn] and ids is [rows*used].
+yuuka_status validate_moe_gate_up_selected_plan_op(const yuuka_op & op) {
+    const uint64_t hidden = op.n[0];
+    const uint64_t ffn = op.n[1];
+    const uint64_t rows = op.n[2];
+    const uint64_t used = op.n[3];
+    const uint64_t experts = op.n[4];
+    const uint32_t dtype = op.u[0];
+    if (hidden == 0 || ffn == 0 || rows == 0 || experts == 0 || used == 0 ||
+        used > experts || !check_moe_dtype(hidden, dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "invalid MoE selected gate/up dimensions or dtype");
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "MoE selected gate/up buffer %d is null", i);
+        }
+    }
+    uint64_t hidden_row = 0;
+    uint64_t weight_rows = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t norm_elements = 0;
+    uint64_t norm_bytes = 0;
+    uint64_t slots = 0;
+    uint64_t ids_bytes = 0;
+    uint64_t act_elements = 0;
+    uint64_t act_bytes = 0;
+    if (!moe_row_bytes(hidden, dtype, &hidden_row) ||
+        __builtin_mul_overflow(ffn, experts, &weight_rows) ||
+        __builtin_mul_overflow(weight_rows, hidden_row, &weight_bytes) ||
+        __builtin_mul_overflow(rows, hidden, &norm_elements) ||
+        !checked_float_bytes(norm_elements, &norm_bytes) ||
+        __builtin_mul_overflow(rows, used, &slots) ||
+        !checked_float_bytes(slots, &ids_bytes) ||
+        __builtin_mul_overflow(slots, ffn, &act_elements) ||
+        !checked_float_bytes(act_elements, &act_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "MoE selected gate/up dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, norm_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, ids_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[4], 0, act_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "MoE selected gate/up buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_moe_down_selected_plan_op checks the decode-form expert down
+// projection.
+yuuka_status validate_moe_down_selected_plan_op(const yuuka_op & op) {
+    const uint64_t ffn = op.n[0];
+    const uint64_t hidden = op.n[1];
+    const uint64_t rows = op.n[2];
+    const uint64_t used = op.n[3];
+    const uint64_t experts = op.n[4];
+    const uint32_t dtype = op.u[0];
+    if (ffn == 0 || hidden == 0 || rows == 0 || experts == 0 || used == 0 ||
+        used > experts || !check_moe_dtype(ffn, dtype)) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "invalid MoE selected down dimensions or dtype");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "MoE selected down buffer %d is null", i);
+        }
+    }
+    uint64_t ffn_row = 0;
+    uint64_t weight_rows = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t slots = 0;
+    uint64_t ids_bytes = 0;
+    uint64_t act_elements = 0;
+    uint64_t act_bytes = 0;
+    uint64_t out_elements = 0;
+    uint64_t out_bytes = 0;
+    if (!moe_row_bytes(ffn, dtype, &ffn_row) ||
+        __builtin_mul_overflow(hidden, experts, &weight_rows) ||
+        __builtin_mul_overflow(weight_rows, ffn_row, &weight_bytes) ||
+        __builtin_mul_overflow(rows, used, &slots) ||
+        !checked_float_bytes(slots, &ids_bytes) ||
+        __builtin_mul_overflow(slots, ffn, &act_elements) ||
+        !checked_float_bytes(act_elements, &act_bytes) ||
+        __builtin_mul_overflow(slots, hidden, &out_elements) ||
+        !checked_float_bytes(out_elements, &out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "MoE selected down dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, act_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, ids_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "MoE selected down buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_moe_shared_add_plan_op checks the sigmoid-gated shared expert
+// accumulation. The gate is one FP32 vector of hidden values.
+yuuka_status validate_moe_shared_add_plan_op(const yuuka_op & op) {
+    const uint64_t hidden = op.n[0];
+    const uint64_t rows = op.n[1];
+    if (hidden == 0 || rows == 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid MoE shared add dimensions");
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "MoE shared add buffer %d is null", i);
+        }
+    }
+    uint64_t elements = 0;
+    uint64_t row_bytes = 0;
+    uint64_t gate_bytes = 0;
+    if (__builtin_mul_overflow(rows, hidden, &elements) ||
+        !checked_float_bytes(elements, &row_bytes) ||
+        !checked_float_bytes(hidden, &gate_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "MoE shared add dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, row_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, row_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, gate_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, row_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "MoE shared add buffer is too small");
     }
     return YUUKA_OK;
 }
@@ -2450,7 +2624,7 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             const int experts = int(op.n[3]);
             const int used = int(op.n[4]);
             uint64_t hidden_row_bytes = 0;
-            if (!checked_row_bytes(uint64_t(hidden), op.u[0], &hidden_row_bytes)) {
+            if (!moe_row_bytes(uint64_t(hidden), op.u[0], &hidden_row_bytes)) {
                 return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE gate/up row size overflow");
             }
             yuuka::launch_moe_gate_up_grouped(
@@ -2468,7 +2642,7 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
             const int experts = int(op.n[3]);
             const int used = int(op.n[4]);
             uint64_t ffn_row_bytes = 0;
-            if (!checked_row_bytes(uint64_t(ffn), op.u[0], &ffn_row_bytes)) {
+            if (!moe_row_bytes(uint64_t(ffn), op.u[0], &ffn_row_bytes)) {
                 return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE down row size overflow");
             }
             yuuka::launch_moe_down_grouped(
@@ -2483,6 +2657,46 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                 op_ptr<float>(op, 0), op_ptr<const float>(op, 1),
                 op_ptr<const float>(op, 2), int(op.n[1]), int(op.n[2]),
                 int(op.n[0]), stream);
+            break;
+        }
+        case YUUKA_OP_MOE_GATE_UP_SELECTED: {
+            const int hidden = int(op.n[0]);
+            const int ffn = int(op.n[1]);
+            const int rows = int(op.n[2]);
+            const int used = int(op.n[3]);
+            uint64_t hidden_row_bytes = 0;
+            if (!moe_row_bytes(uint64_t(hidden), op.u[0], &hidden_row_bytes)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "MoE selected gate/up row size overflow");
+            }
+            yuuka::launch_moe_gate_up_selected(
+                op_ptr<const float>(op, 0), op_ptr<const int32_t>(op, 1),
+                op_ptr<const void>(op, 2), op_ptr<const void>(op, 3),
+                op_ptr<float>(op, 4), rows, used, hidden, ffn, hidden_row_bytes,
+                op.u[0], stream);
+            break;
+        }
+        case YUUKA_OP_MOE_DOWN_SELECTED: {
+            const int ffn = int(op.n[0]);
+            const int hidden = int(op.n[1]);
+            const int rows = int(op.n[2]);
+            const int used = int(op.n[3]);
+            uint64_t ffn_row_bytes = 0;
+            if (!moe_row_bytes(uint64_t(ffn), op.u[0], &ffn_row_bytes)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "MoE selected down row size overflow");
+            }
+            yuuka::launch_moe_down_selected(
+                op_ptr<const float>(op, 0), op_ptr<const int32_t>(op, 1),
+                op_ptr<const void>(op, 2), op_ptr<float>(op, 3), rows, used,
+                hidden, ffn, ffn_row_bytes, op.u[0], stream);
+            break;
+        }
+        case YUUKA_OP_MOE_SHARED_ADD: {
+            yuuka::launch_moe_shared_add(
+                op_ptr<float>(op, 0), op_ptr<const float>(op, 1),
+                op_ptr<const float>(op, 2), op_ptr<const float>(op, 3),
+                int(op.n[1]), int(op.n[0]), stream);
             break;
         }
         default:
@@ -3533,7 +3747,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_SILU_MUL_QUANT_Q8_1) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MOE_SHARED_ADD) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -3627,6 +3841,15 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_MOE_REDUCE_ADD:
                 status = validate_moe_reduce_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_GATE_UP_SELECTED:
+                status = validate_moe_gate_up_selected_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_DOWN_SELECTED:
+                status = validate_moe_down_selected_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_SHARED_ADD:
+                status = validate_moe_shared_add_plan_op(*op);
                 break;
             case YUUKA_OP_RMSNORM:
                 status = validate_rmsnorm_plan_op(*op);

@@ -6,23 +6,23 @@ is written in HIP/C++. It reads GGUF files directly, keeps quantized weights
 packed, and does not use llama.cpp, GGML, or Ollama as an execution engine.
 
 The repository currently holds a single-request vertical slice for the Qwen3.5
-hybrid decoder (`qwen35`), a CPU reference for its MoE variant (`qwen35moe`),
-and a concurrent serving path:
+hybrid decoder (`qwen35`) and its MoE variant (`qwen35moe`), each with a CPU
+reference and a HIP path, and a concurrent serving path:
 
 - a validated, mmap-backed GGUF reader with split-shard support;
 - Qwen byte-level BPE and SentencePiece tokenizers with Qwen chat rendering;
 - a CPU reference decoder used as the correctness oracle;
-- a HIP decoder that runs the full Qwen3.5 model on the GPU, with rocWMMA/
-  rocBLAS prefill GEMM, an int8 MMQ route for K-quant weights, paged Flash
-  Attention, and chunked prefill;
+- a HIP decoder that runs the full Qwen3.5 and Qwen3.6-MoE models on the GPU,
+  with rocWMMA/rocBLAS prefill GEMM, an int8 MMQ route for K-quant weights,
+  paged Flash Attention, chunked prefill, and on-device IQ2/IQ3 expert decoding;
 - a continuous scheduler with paged KV, reference-counted prefix caching, and
   request cancellation, plus opt-in HIP Graph replay;
 - a CLI (`inspect`, `run`, `bench`) and an OpenAI-compatible server with SSE
   streaming, health, metrics, and pprof endpoints.
 
-Only `qwen35` (CPU and HIP) and `qwen35moe` (CPU reference) are supported. Other
-architectures, unsupported tensor types, and non-Qwen chat templates are
-rejected explicitly rather than approximated. See
+Only `qwen35` and `qwen35moe` are supported, on both the CPU reference and the
+HIP backend. Other architectures, unsupported tensor types, and non-Qwen chat
+templates are rejected explicitly rather than approximated. See
 [`docs/README.md`](docs/README.md) for full status and limitations.
 
 ## Quick start

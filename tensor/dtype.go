@@ -190,3 +190,16 @@ func (d DType) HIPSupported() bool {
 		return false
 	}
 }
+
+// HIPMoESupported reports whether the HIP grouped/selected MoE kernels decode
+// this dtype. It is narrower than HIPSupported and wider than the decode GEMV
+// family: IQ2_XXS, IQ2_S, and IQ3_S are available to MoE expert tensors only, so
+// a general GEMV, GEMM, or LM head keeps failing explicitly on them.
+func (d DType) HIPMoESupported() bool {
+	switch d {
+	case F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ2XXS, IQ2S, IQ3S:
+		return true
+	default:
+		return false
+	}
+}

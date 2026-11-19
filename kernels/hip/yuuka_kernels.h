@@ -354,6 +354,23 @@ void launch_moe_reduce_add(float * x, const float * expert_out,
                            const float * weights, int rows, int used, int hidden,
                            hipStream_t stream);
 
+/* Selected-expert MoE kernels. The decode path reads the routing ids and
+ * launches one grid over the rows*used selected slots, so an expert row is only
+ * scheduled for a token that selected it. */
+void launch_moe_gate_up_selected(const float * norm, const int32_t * ids,
+                                 const void * gate_exps, const void * up_exps,
+                                 float * act, int rows, int used, int hidden,
+                                 int ffn, uint64_t hidden_row_bytes,
+                                 uint32_t dtype, hipStream_t stream);
+void launch_moe_down_selected(const float * act, const int32_t * ids,
+                              const void * down_exps, float * out, int rows,
+                              int used, int hidden, int ffn,
+                              uint64_t ffn_row_bytes, uint32_t dtype,
+                              hipStream_t stream);
+void launch_moe_shared_add(float * x, const float * src, const float * gate,
+                           const float * norm, int rows, int hidden,
+                           hipStream_t stream);
+
 // launch_gdn_chunked_f32 runs the chunkwise gated delta rule, normalization,
 // and gate activations of one recurrent layer. scratch holds two 32x32
 // matrices per 32-token chunk and time-step head.

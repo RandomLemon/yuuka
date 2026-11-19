@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 9
+const RequiredABI = 10
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -436,6 +436,20 @@ func checkGemvDType(dtype tensor.DType, nIn int64) error {
 	}
 	if _, err := dtype.RowBytes(nIn); err != nil {
 		return fmt.Errorf("hip: GEMV shape: %w", err)
+	}
+	return nil
+}
+
+// checkMoEDType is the expert-tensor form of checkGemvDType. The MoE kernels
+// decode the IQ2/IQ3 codebooks as well, so this accepts a wider dtype set while
+// keeping the same row-width check; every other kernel family keeps rejecting
+// those dtypes.
+func checkMoEDType(dtype tensor.DType, nIn int64) error {
+	if !dtype.HIPMoESupported() {
+		return fmt.Errorf("hip: MoE dtype %s is not supported", dtype)
+	}
+	if _, err := dtype.RowBytes(nIn); err != nil {
+		return fmt.Errorf("hip: MoE shape: %w", err)
 	}
 	return nil
 }
@@ -1596,7 +1610,7 @@ func (p *Plan) AddMoEGateUpGrouped(norm, gateExps, upExps, counts, assignRows, a
 	if hidden <= 0 || ffn <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
 		return errors.New("hip: invalid MoE gate/up dimensions")
 	}
-	if err := checkGemvDType(dtype, hidden); err != nil {
+	if err := checkMoEDType(dtype, hidden); err != nil {
 		return err
 	}
 	if err := p.check(norm, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut); err != nil {
@@ -1626,7 +1640,7 @@ func (p *Plan) AddMoEDownGrouped(act, downExps, counts, assignRows, assignSlots,
 	if ffn <= 0 || hidden <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
 		return errors.New("hip: invalid MoE down dimensions")
 	}
-	if err := checkGemvDType(dtype, ffn); err != nil {
+	if err := checkMoEDType(dtype, ffn); err != nil {
 		return err
 	}
 	if err := p.check(act, downExps, counts, assignRows, assignSlots, out); err != nil {
@@ -1665,6 +1679,81 @@ func (p *Plan) AddMoEReduceAdd(x, expertOut, weights *Buffer, hidden, rows, used
 	op.n[0] = C.uint64_t(hidden)
 	op.n[1] = C.uint64_t(rows)
 	op.n[2] = C.uint64_t(used)
+	return p.add(op)
+}
+
+// AddMoESharedAdd appends the sigmoid-gated shared expert accumulation:
+// x[row,i] += sigmoid(dot(gate, norm[row])) * src[row,i]. gate is the FP32
+// [hidden] shared-expert gate vector.
+func (p *Plan) AddMoESharedAdd(x, src, gate, norm *Buffer, hidden, rows int64) error {
+	if hidden <= 0 || rows <= 0 {
+		return errors.New("hip: invalid MoE shared add dimensions")
+	}
+	if err := p.check(x, src, gate, norm); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_SHARED_ADD}
+	op.buf[0] = x.ptr
+	op.buf[1] = src.ptr
+	op.buf[2] = gate.ptr
+	op.buf[3] = norm.ptr
+	op.n[0] = C.uint64_t(hidden)
+	op.n[1] = C.uint64_t(rows)
+	return p.add(op)
+}
+
+// AddMoEGateUpSelected appends the selected-expert gate and up projections:
+// one block per (expert-FFN row, routing slot). ids is int32[rows*used] from
+// AddMoERoute and act receives silu(gate)*up as [rows*used, ffn]. Both expert
+// matrices must share dtype, which the kernel decodes with one instantiation.
+func (p *Plan) AddMoEGateUpSelected(norm, ids, gateExps, upExps, act *Buffer, hidden, ffn, rows, used, experts int64, dtype tensor.DType) error {
+	if hidden <= 0 || ffn <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid MoE selected gate/up dimensions")
+	}
+	if err := checkMoEDType(dtype, hidden); err != nil {
+		return err
+	}
+	if err := p.check(norm, ids, gateExps, upExps, act); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_GATE_UP_SELECTED}
+	op.buf[0] = norm.ptr
+	op.buf[1] = ids.ptr
+	op.buf[2] = gateExps.ptr
+	op.buf[3] = upExps.ptr
+	op.buf[4] = act.ptr
+	op.n[0] = C.uint64_t(hidden)
+	op.n[1] = C.uint64_t(ffn)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(used)
+	op.n[4] = C.uint64_t(experts)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddMoEDownSelected appends the selected-expert down projection. act is
+// [rows*used, ffn] and out receives [rows*used, hidden].
+func (p *Plan) AddMoEDownSelected(act, ids, downExps, out *Buffer, ffn, hidden, rows, used, experts int64, dtype tensor.DType) error {
+	if ffn <= 0 || hidden <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid MoE selected down dimensions")
+	}
+	if err := checkMoEDType(dtype, ffn); err != nil {
+		return err
+	}
+	if err := p.check(act, ids, downExps, out); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_DOWN_SELECTED}
+	op.buf[0] = act.ptr
+	op.buf[1] = ids.ptr
+	op.buf[2] = downExps.ptr
+	op.buf[3] = out.ptr
+	op.n[0] = C.uint64_t(ffn)
+	op.n[1] = C.uint64_t(hidden)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(used)
+	op.n[4] = C.uint64_t(experts)
+	op.u[0] = C.uint32_t(dtype)
 	return p.add(op)
 }
 

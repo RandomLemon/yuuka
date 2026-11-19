@@ -42,6 +42,17 @@ type activations struct {
 	ffnUp   *hip.Buffer
 	logits  *hip.Buffer
 	scores  *hip.Buffer
+	// MoE decode scratch. The routed experts write one slot per selected
+	// expert, so every buffer is sized by the used-expert count.
+	moeLogits        *hip.Buffer // router logits [experts]
+	moeIDs           *hip.Buffer // int32 routing ids [used]
+	moeWeights       *hip.Buffer // normalized routing weights [used]
+	moeCounts        *hip.Buffer // int32 per-expert assignment counts [experts]
+	moeAssignRows    *hip.Buffer // int32 binned assignment rows [experts*used]
+	moeAssignSlots   *hip.Buffer // int32 binned assignment slots [experts*used]
+	moeAssignWeights *hip.Buffer // binned assignment weights [experts*used]
+	moeAct           *hip.Buffer // silu(gate)*up per slot [used*ExpertFFNSize]
+	moeOut           *hip.Buffer // expert down outputs per slot [used*hidden]
 }
 
 // int8Activations holds the Q8_1 form of one decode activation row. The plan
@@ -76,6 +87,19 @@ type prefillActivations struct {
 	xQ8            *hip.Buffer
 	xDS            *hip.Buffer
 	tokens         *hip.Buffer
+	// MoE prefill scratch. The grouped kernels bin every token's selected
+	// experts, so these are sized by rows*used. moeCounts and the three
+	// assignment buffers are the routing bins that AddMoERoute fills.
+	moeLogits        *hip.Buffer // router logits [rows,experts]
+	moeIDs           *hip.Buffer // int32 routing ids [rows,used]
+	moeWeights       *hip.Buffer // normalized routing weights [rows,used]
+	moeCounts        *hip.Buffer // int32 per-expert counts [experts]
+	moeAssignRows    *hip.Buffer // int32 binned rows [experts,rows*used]
+	moeAssignSlots   *hip.Buffer // int32 binned slots [experts,rows*used]
+	moeAssignWeights *hip.Buffer // binned weights [experts,rows*used]
+	moeGate          *hip.Buffer // expert gate projections [rows*used,ffn]
+	moeUp            *hip.Buffer // expert up projections [rows*used,ffn]
+	moeOut           *hip.Buffer // weighted expert output [rows*used,hidden]
 }
 
 // Options configures a shared GPU model and its KV pool.
@@ -369,13 +393,27 @@ func decodeAttentionScratch(heads, headDim, scoreStride, capacity int) uint64 {
 	return uint64(serial)
 }
 
+// ffnWidth returns the widest feed-forward activation width a layer writes.
+// A dense layer writes its single FFN width; an MoE layer writes the shared
+// expert and the routed expert widths, so the shared activation buffers must
+// hold the wider of the two.
+func (m *Model) ffnWidth() int {
+	cfg := m.config
+	if cfg.IsMoE() {
+		return max(cfg.ExpertFFNSize, cfg.SharedFFNSize)
+	}
+	return cfg.FFNSize
+}
+
 func (m *Model) allocActivations() error {
 	cfg := m.config
 	var err error
-	sizes := []struct {
+	ffnWidth := m.ffnWidth()
+	type activationSize struct {
 		dst **hip.Buffer
 		n   uint64
-	}{
+	}
+	sizes := []activationSize{
 		{&m.act.x, uint64(cfg.HiddenSize)},
 		{&m.act.norm, uint64(cfg.HiddenSize)},
 		{&m.act.q, uint64(cfg.HeadCount * cfg.HeadDim * 2)},
@@ -390,10 +428,25 @@ func (m *Model) allocActivations() error {
 		{&m.act.conv, uint64(2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize)},
 		{&m.act.gdn, uint64(cfg.SSMInnerSize)},
 		{&m.act.gdnNorm, uint64(cfg.SSMInnerSize)},
-		{&m.act.ffnGate, uint64(cfg.FFNSize)},
-		{&m.act.ffnUp, uint64(cfg.FFNSize)},
+		{&m.act.ffnGate, uint64(ffnWidth)},
+		{&m.act.ffnUp, uint64(ffnWidth)},
 		{&m.act.logits, uint64(cfg.VocabSize)},
 		{&m.act.scores, decodeAttentionScratch(cfg.HeadCount, int(cfg.HeadDim), m.capacity, m.capacity)},
+	}
+	if cfg.IsMoE() {
+		experts := uint64(cfg.ExpertCount)
+		used := uint64(cfg.ExpertUsedCount)
+		sizes = append(sizes,
+			activationSize{&m.act.moeLogits, experts},
+			activationSize{&m.act.moeIDs, used},
+			activationSize{&m.act.moeWeights, used},
+			activationSize{&m.act.moeCounts, experts},
+			activationSize{&m.act.moeAssignRows, experts * used},
+			activationSize{&m.act.moeAssignSlots, experts * used},
+			activationSize{&m.act.moeAssignWeights, experts * used},
+			activationSize{&m.act.moeAct, used * uint64(cfg.ExpertFFNSize)},
+			activationSize{&m.act.moeOut, used * uint64(cfg.HiddenSize)},
+		)
 	}
 	for _, entry := range sizes {
 		buf, err := m.allocDevice(entry.n * 4)
@@ -409,7 +462,7 @@ func (m *Model) allocActivations() error {
 	for _, width := range []uint64{
 		uint64(cfg.HeadCount * cfg.HeadDim),
 		uint64(cfg.SSMInnerSize),
-		uint64(cfg.FFNSize),
+		uint64(ffnWidth),
 	} {
 		if width > widest {
 			widest = width
@@ -486,8 +539,9 @@ func (m *Model) configurePrefill(rows int) error {
 	m.prefillAll = nil
 	cfg := m.config
 	p := &m.prefill
+	ffnWidth := m.ffnWidth()
 	maxWidth := cfg.HiddenSize
-	for _, width := range []int{cfg.FFNSize, cfg.HeadCount * cfg.HeadDim, cfg.SSMInnerSize} {
+	for _, width := range []int{ffnWidth, cfg.HeadCount * cfg.HeadDim, cfg.SSMInnerSize} {
 		if width > maxWidth {
 			maxWidth = width
 		}
@@ -502,6 +556,11 @@ func (m *Model) configurePrefill(rows int) error {
 	maxOutWidth := maxWidth
 	if convDim := 2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize; convDim > maxOutWidth {
 		maxOutWidth = convDim
+	}
+	// An MoE router writes one logit row per expert; the rocBLAS staging buffer
+	// must hold that output when the router selects the FP16 route.
+	if cfg.IsMoE() && cfg.ExpertCount > maxOutWidth {
+		maxOutWidth = cfg.ExpertCount
 	}
 	rowElems := func(width int) uint64 { return uint64(rows) * uint64(width) * 4 }
 	entries := []struct {
@@ -521,11 +580,60 @@ func (m *Model) configurePrefill(rows int) error {
 		{&p.alpha, rowElems(cfg.SSMTimeStepRank)},
 		{&p.conv, rowElems(2*cfg.SSMGroupCount*cfg.SSMStateSize + cfg.SSMInnerSize)},
 		{&p.gdnNorm, rowElems(cfg.SSMInnerSize)},
-		{&p.ffnGate, rowElems(cfg.FFNSize)},
-		{&p.ffnUp, rowElems(cfg.FFNSize)},
+		{&p.ffnGate, rowElems(ffnWidth)},
+		{&p.ffnUp, rowElems(ffnWidth)},
 		{&p.xF16, uint64(rows) * uint64(maxWidth) * 2},
 		{&p.yF16, uint64(rows) * uint64(maxOutWidth) * 2},
 		{&p.tokens, uint64(rows) * 4},
+	}
+	if cfg.IsMoE() {
+		experts := uint64(cfg.ExpertCount)
+		used := uint64(cfg.ExpertUsedCount)
+		rowSlots := uint64(rows) * used
+		expertWidth := uint64(cfg.ExpertFFNSize)
+		hiddenWidth := uint64(cfg.HiddenSize)
+		entries = append(entries,
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeLogits, uint64(rows) * experts * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeIDs, rowSlots * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeWeights, rowSlots * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeCounts, experts * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeAssignRows, experts * rowSlots * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeAssignSlots, experts * rowSlots * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeAssignWeights, experts * rowSlots * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeGate, rowSlots * expertWidth * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeUp, rowSlots * expertWidth * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeOut, rowSlots * hiddenWidth * 4},
+		)
 	}
 	p.attentionBlas = nil
 	p.attentionSplit = nil

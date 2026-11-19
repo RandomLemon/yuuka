@@ -1,4 +1,5 @@
 #include "../common.cuh"
+#include "../iq_decode.cuh"
 #include "../quant.cuh"
 #include "../yuuka_kernels.h"
 
@@ -8,8 +9,9 @@ constexpr int kThreads = 256;
 constexpr int kSpan = 8;
 
 // row_stride returns the packed byte stride of one weight row: the per-block
-// size times the number of 256-value blocks in the row. Only the K-quant dtypes
-// this kernel supports are listed; every other dtype writes nothing.
+// size times the number of 256-value blocks in the row. Only the K-quant and
+// IQ2/IQ3 dtypes this kernel supports are listed; every other dtype writes
+// nothing.
 __device__ __forceinline__ int64_t row_stride(uint32_t dtype, int64_t n_in) {
     const int64_t blocks = n_in / 256;
     switch (dtype) {
@@ -19,6 +21,12 @@ __device__ __forceinline__ int64_t row_stride(uint32_t dtype, int64_t n_in) {
             return blocks * 176;
         case YUUKA_DTYPE_Q6_K:
             return blocks * 210;
+        case YUUKA_DTYPE_IQ2_XXS:
+            return blocks * 66;
+        case YUUKA_DTYPE_IQ2_S:
+            return blocks * 82;
+        case YUUKA_DTYPE_IQ3_S:
+            return blocks * 110;
         default:
             return 0;
     }
@@ -48,6 +56,25 @@ __global__ void dequant_span_kernel(__half * dst, const uint8_t * w, int64_t n_i
         const int64_t col = (i % spans_per_row) * kSpan;
         const uint8_t * rowp = w + row * stride;
         __half * out = dst + row * n_in + col;
+        if (dtype == YUUKA_DTYPE_IQ2_XXS || dtype == YUUKA_DTYPE_IQ2_S ||
+            dtype == YUUKA_DTYPE_IQ3_S) {
+            const int block_bytes = dtype == YUUKA_DTYPE_IQ2_XXS ? 66
+                                   : dtype == YUUKA_DTYPE_IQ2_S  ? 82
+                                                                 : 110;
+            const uint8_t * blk = rowp + (col / 256) * block_bytes;
+            const int j0 = static_cast<int>(col % 256);
+            for (int j = 0; j < kSpan; ++j) {
+                const int jj = j0 + j;
+                if (dtype == YUUKA_DTYPE_IQ2_XXS) {
+                    out[j] = __float2half(iq2xxs_value(blk, jj));
+                } else if (dtype == YUUKA_DTYPE_IQ2_S) {
+                    out[j] = __float2half(iq2s_value(blk, jj));
+                } else {
+                    out[j] = __float2half(iq3s_value(blk, jj));
+                }
+            }
+            continue;
+        }
         if (dtype == YUUKA_DTYPE_Q6_K) {
             const uint8_t * blk = rowp + (col / 256) * 210;
             for (int j = 0; j < kSpan; ++j) {

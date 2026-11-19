@@ -40,10 +40,11 @@ The repository contains an end-to-end single-node implementation:
 - CPU reference forward pass for the Qwen3.6 hybrid MoE layout (`qwen35moe`),
   including top-k routed experts and a shared expert, validated on a real
   Qwen3.6-35B-A3B IQ2_XXS GGUF. CPU dequantization for `IQ2_XXS`, `IQ2_S`, and
-  `IQ3_S` is included; HIP kernels for these types are not.
-- HIP C ABI, plan executor, and kernels for the full `qwen35` decode and chunked
-  prefill graphs. Native grouped MoE kernels remain tested, but no supported
-  model runtime executes them.
+  `IQ3_S` is included, and the HIP MoE expert kernels and `yuuka_dequant_f16`
+  decode the same codebooks on the device.
+- HIP C ABI, plan executor, and kernels for the full `qwen35` and `qwen35moe`
+  decode and chunked prefill graphs. MoE prefill runs the grouped expert
+  kernels; MoE decode runs the selected-expert kernels.
 - rocWMMA/rocBLAS prefill GEMM, an int8 MMQ prefill GEMM for K-quant weights, a
   streaming prefill LM head over a row block of up to 16 rows, causal GQA Flash
   Attention, and chunked prefill.
@@ -53,10 +54,16 @@ The repository contains an end-to-end single-node implementation:
 - Native CTest coverage for the ABI, quantized GEMV, operators, GEMM, prefill
   (including the LM head dtypes), paged KV/graph, embedding, and MoE kernels.
 
-Not yet implemented: HIP execution and IQ2/IQ3 kernels for `qwen35moe`, model
-architectures other than `qwen35` and `qwen35moe`, NPU execution (the probe is
-diagnostic), quantization presets outside the documented set, speculative
-decoding for non-greedy sampling, and fused mixed-shape multi-request batching.
+The HIP planner executes `qwen35moe` decode and chunked prefill with grouped
+expert kernels for prefill and selected-expert kernels for decode; expert
+tensors may use any dtype in F32/F16/Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K or the
+IQ2_XXS/IQ2_S/IQ3_S codebooks, which only the MoE kernels and
+`yuuka_dequant_f16` decode on the device.
+
+Not yet implemented: model architectures other than `qwen35` and `qwen35moe`,
+NPU execution (the probe is diagnostic), quantization presets outside the
+documented set, speculative decoding for non-greedy sampling, and fused
+mixed-shape multi-request batching.
 See `docs/README.md` for the full status.
 
 Therefore:
