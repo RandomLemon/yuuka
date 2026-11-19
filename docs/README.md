@@ -94,6 +94,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 ### Module indexes
 
 - [Qwen prefill optimization](prefill-optimization/README.md) — Implementation stages and verification for single-request prefill against upstream llama.cpp v1.0.0.
+- [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — Measured `qwen35moe` HIP prefill and decode throughput next to llama.cpp, with the correctness gates taken at the same commit.
 
 ## Implementation status
 

@@ -630,8 +630,10 @@ reduce on one stream:
 | 16 | 0.231 | 6.800 | 4.602 | 0.031 | 11.621 | 1377 |
 | 32 | 0.231 | 12.631 | 8.838 | 0.036 | 21.607 | 1481 |
 
-These are kernel-pipeline numbers. No supported model runtime executes the
-grouped HIP kernels, so there is no end-to-end MoE throughput number.
+These are kernel-pipeline numbers for a synthetic shape. End-to-end
+`qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 128, 512, and 2048
+prefill tokens and 128 decode tokens, next to llama.cpp on the same protocol, is
+recorded in [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md).
 
 ## Kernel resource usage
 
@@ -961,7 +963,8 @@ Each of these is a measured decision that still holds in the current code:
   win at long context, hence the split.
 - **Known limits:** decode throughput is a single-request weight-bandwidth
   number until fused multi-request decode batching exists; NPU execution is a
-  diagnostic probe only; MoE grouped kernels have no supported model runtime;
+  diagnostic probe only; the `qwen35moe` HIP path has one measured model
+  configuration in [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md);
   the longest measured prompt is 8192 tokens at chunk 512.
 
 ## Reproduction
