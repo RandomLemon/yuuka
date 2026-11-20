@@ -1031,23 +1031,41 @@ Kernel-specific block layouts are backend-internal.
 ### 8.1 MoE expert pipeline
 
 `moe_route` selects top-k experts, normalizes the selected softmax weights, and
-bins `(row, slot)` assignments into one bucket per expert using atomics. The
-selection runs on one thread per row with an `O(used * experts * used)` scan, so
-its cost is serialization rather than arithmetic; the measured cost is in
-[Benchmarks](benchmarks.md#grouped-moe-pipeline) and
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution).
-The grouped kernels then index blocks by `(expert, output row)` and walk that
-expert's assignment list:
+bins `(row, slot)` assignments into one bucket per expert using atomics. One
+warp handles one row: every lane holds every 32nd expert in registers
+(`moe_route_kernel<kPerLane>`, instantiated for 1, 2, 4, 8, 16, and 32 experts
+per lane, so up to 1024 experts), a slot is a butterfly max with a lowest-index
+tie-break that matches the ascending scan of the reference selection, and the
+winner is masked out of the lane register set. A slot therefore costs one pass
+over the row instead of a scan per slot. An expert count above 1024 fails plan
+construction instead of selecting from a truncated candidate set.
 
-- `moe_gate_up_grouped` reads one packed gate and up row per block and computes
-  all assigned token rows. The packed bytes are re-read and re-decoded from the
-  cache for every assignment rather than staged in registers or shared memory,
-  so the stage costs one weight-row decode per `(row, slot)` pair and not one
-  per expert.
+The grouped kernels are the prefill form. They index blocks by
+`(expert, 8 output rows)` and each warp owns one output row:
+
+- `moe_gate_up_grouped` walks the expert's assignment list in tiles of eight
+  (`kAssignTileIQ`, four for the general dtypes, whose scalar decoder needs the
+  registers), decodes the gate and up span of the current K step once, and
+  reuses that span across the whole tile. The stage therefore costs one
+  weight-row decode per expert row per tile, not one per assignment, and the
+  activation span of every assignment is loaded once per tile.
 - SwiGLU uses the existing fused `silu_mul` kernel.
-- `moe_down_grouped` performs the expert down projection over the same buckets.
+- `moe_down_grouped` performs the expert down projection over the same buckets
+  with the same tile.
 - `moe_reduce_add` applies routing weights and accumulates into the residual
   stream.
+
+A K step covers `kStepK = 256` values, of which each lane decodes the eight
+values at `base + 8 * lane`. `moe_span8` decodes those eight values with one
+codebook fetch (two for IQ3_S, which holds four-value entries) instead of one
+fetch per value; `iq2xxs_span8`, `iq2s_span8`, and `iq3s_span8` in
+`kernels/hip/iq_decode.cuh` hoist the block offset, the codebook index, and the
+sign word out of the per-value arithmetic, and produce exactly the values the
+per-value forms produce. A warp reduces its eight lane partials with
+`warp_reduce_sum`, so no block barrier and no shared-memory staging appear
+anywhere in the expert path, and the reduction cost no longer scales with the
+thread count. Spans that would cross the end of the row, and dtypes without a
+span decoder, fall back to `moe_packed_value` per value.
 
 The routing and assignment buffers are sized `experts * rows * used`, which is
 safe because one row contributes exactly `used` assignments. A malformed plan
@@ -1056,7 +1074,8 @@ that would exceed a bucket is rejected at plan construction.
 The grouped grid is the prefill form. At one token it would launch
 `experts * ffn` blocks, of which only `used * ffn` correspond to selected
 experts, so the decode plan uses a second family indexed by
-`(output row, routing slot)`:
+`(output row, routing slot)`, with one warp per output row and the same span
+decode and warp reduction:
 
 - `moe_gate_up_selected` reads the routing id of the slot, decodes the gate and
   up rows of that expert, and writes `silu(gate) * up` for the slot.
@@ -1068,36 +1087,36 @@ experts, so the decode plan uses a second family indexed by
 
 Both families decode expert weights with `moe_packed_value`, which accepts the
 eight general matvec dtypes plus IQ2_XXS, IQ2_S, and IQ3_S. That helper is local
-to the MoE kernels so `quant.cuh`'s `packed_value` keeps rejecting the IQ types.
+to the MoE kernels so `quant.cuh`'s `packed_value` keeps rejecting the IQ types,
+and the launcher selects the compile-time codebook form (`MoeCodebook`) so the
+IQ span decoders are reached without a per-element dtype switch.
 `tests/hip/iq_moe_test.cpp` pins the three codebooks against the CPU reference
 values and requires the grouped and selected pipelines to agree with a host
-computation over the same decoded expert matrices. The per-value decode is the
-correctness implementation; no throughput claim is made for it.
+computation over the same decoded expert matrices.
 
-Measured cost of the correctness implementation (2026-11-19, gfx1151,
-Qwen3.6-35B-A3B-UD-IQ2_XXS, tables and reference comparison in
+Measured cost (2026-11-19, gfx1151, Qwen3.6-35B-A3B-UD-IQ2_XXS, tables and
+reference comparison in
 [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution)):
 
 | Stage | Stage time | Share of its phase |
 | --- | ---: | ---: |
-| `moe_gate_up_grouped`, 128-row chunk | 1046.6 ms | 51.0% of the chunk |
-| `moe_down_grouped`, 128-row chunk | 903.0 ms | 44.0% of the chunk |
-| `moe_route`, one row | 0.44 ms per layer | 33.9% of a decode step |
-| `moe_gate_up_selected` + `moe_down_selected`, one token | 19.2 ms | 36.8% of a decode step |
+| `moe_down_grouped`, 128-row chunk | 89.7 ms | 35.2% of the chunk |
+| `moe_gate_up_grouped`, 128-row chunk | 77.4 ms | 30.4% of the chunk |
+| `moe_route`, one row | 12 us per layer | 2.4% of a decode step |
+| `moe_gate_up_selected` + `moe_down_selected`, one token | 3.6 ms | 18.5% of a decode step |
 
-The two grouped kernels decode 66 G weight values/s and the two selected kernels
-52 G values/s. The reference's MMQ tile path decodes 648 G values/s in prefill
-and its `dp4a` matvec 229 G values/s in decode, so the per-value rate differs by
-4.4x to 9.8x on top of the reuse difference. Three properties account for the
-difference and are the candidates a throughput pass has to change: one scalar
-codebook decode per value where the reference decodes eight values per codebook
-fetch and consumes them with `dp4a` against Q8_1 activations, one weight-row
-decode per assignment where the reference stages a decoded int8 tile in shared
-memory once per tile, and a 256-thread block-wide tree reduction per output row
-where the reference reduces within a warp. The expert matrices are the one
-tensor family this repository cannot route through `gemm_mmq` (`packed_value`
-rejects the IQ types, and `dequant_span_kernel` would materialize an FP16 copy
-of 34 B parameters).
+The selected-expert pair now costs 3.6 ms per token for the 1.007 G weight
+values a token decodes, at or below the reference's 4.4 ms for the same stage,
+and the grouped stage streams the 9.06 GB expert weight set at 54 GB/s. What remains is the per-value cost of the FP32 route: one codebook
+fetch per eight values, but also one int8-to-float conversion, one sign select,
+and one scale multiply per value, which the expert stage issues 805 M times per
+layer. The reference avoids that by keeping the decoded values as int8 digits
+and consuming them with `dp4a` against Q8_1-quantized activations, four products
+per instruction. That is the next measured step; it changes the arithmetic of
+the expert path and needs its own correctness pass. The expert matrices remain
+the one tensor family this repository does not route through `gemm_mmq`
+(`packed_value` rejects the IQ types, and `dequant_span_kernel` would
+materialize an FP16 copy of 34 B parameters).
 
 The prefill router projection is the one MoE matmul that does not follow the
 measured prefill dispatch table: an F32 router takes the FP32 batched GEMM

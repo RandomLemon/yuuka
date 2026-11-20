@@ -484,8 +484,10 @@ code. It also prints the decode routing distribution (how many of the 256
 experts the last route selected), because a selected expert re-reads its whole
 packed weight set. The recorded tables and the reference comparison are in
 [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution).
-The test has no pass/fail gate: the MoE path is not optimized yet, so there is
-no recorded constant to hold it to.
+The test has no pass/fail gate: every MoE stage that has a recorded constant is
+gated by the real-model tests of the same package
+(`TestGPUMoEGoldenGeneration`, `TestGPUMoEChunkedPrefill`,
+`TestTinyGPUMoEMatchesCPU`), and the profile is a ranking tool.
 
 `build/yuuka_gemv_decode_sweep --recurrent` is the RECURRENT cell of the decode
 matvec table: it builds one recurrent layer from the five separate operators and

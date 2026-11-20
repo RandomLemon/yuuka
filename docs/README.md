@@ -94,7 +94,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 ### Module indexes
 
 - [Qwen prefill optimization](prefill-optimization/README.md) — Implementation stages and verification for single-request prefill against upstream llama.cpp v1.0.0.
-- [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — Measured `qwen35moe` HIP prefill and decode throughput next to llama.cpp, with the correctness gates taken at the same commit.
+- [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — Measured `qwen35moe` HIP prefill and decode throughput next to llama.cpp, the per-operation attribution of the gap, the optimization pass written against it, and the correctness gates.
 
 ## Implementation status
 
@@ -183,7 +183,11 @@ Implemented and tested:
   F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, or IQ3_S. The
   decode path runs the selected-expert kernels over the routed experts of one
   token; the prefill path runs the grouped kernels over the binned expert
-  assignments.
+  assignments. Both decode the IQ codebooks eight values per codebook fetch and
+  reduce within a warp, and the grouped path reuses one decoded weight span
+  across a tile of assignments, so the router, the decode experts, and the
+  prefill experts are no longer the throughput limit of that model (see the
+  [Qwen3.6 benchmark](benchmarks/qwen3.6_35b_a3b.md#optimization-record)).
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.
 - A diagnostic NPU capability probe (`yuuka npu-probe`, `--npu`) that reports

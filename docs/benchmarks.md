@@ -619,16 +619,25 @@ ceiling and the step column for what a token costs.
 
 Synthetic single-layer shape: 128 experts, top-8, hidden 2048, expert FFN 768,
 Q4_K weights. One route plus grouped gate/up, SwiGLU, grouped down, and weighted
-reduce on one stream:
+reduce on one stream. `build/yuuka_moe_sweep`, median of five timed submissions
+after two warmups, 2026-11-19 after the
+[MoE optimization pass](benchmarks/qwen3.6_35b_a3b.md#optimization-record); the
+gate/up and down columns run the general-dtype codebook instance, which decodes
+one value per scalar step:
 
 | Rows | Route ms | Gate/up ms | Down ms | Reduce ms | Total ms | Tokens/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.220 | 0.389 | 0.401 | 0.015 | 1.023 | 978 |
-| 2 | 0.222 | 0.992 | 0.761 | 0.016 | 1.989 | 1005 |
-| 4 | 0.228 | 1.875 | 1.410 | 0.018 | 3.530 | 1133 |
-| 8 | 0.223 | 3.559 | 2.603 | 0.025 | 6.418 | 1246 |
-| 16 | 0.231 | 6.800 | 4.602 | 0.031 | 11.621 | 1377 |
-| 32 | 0.231 | 12.631 | 8.838 | 0.036 | 21.607 | 1481 |
+| 1 | 0.010 | 0.482 | 0.225 | 0.016 | 0.728 | 1374 |
+| 2 | 0.011 | 1.080 | 0.465 | 0.017 | 1.581 | 1265 |
+| 4 | 0.012 | 2.051 | 0.827 | 0.018 | 2.886 | 1386 |
+| 8 | 0.012 | 3.364 | 1.342 | 0.023 | 4.817 | 1661 |
+| 16 | 0.012 | 5.457 | 2.169 | 0.027 | 7.593 | 2107 |
+| 32 | 0.012 | 8.037 | 3.091 | 0.036 | 11.122 | 2877 |
+
+Before the pass the same cells read 0.220-0.231 ms for the route, 0.389-12.631
+for gate/up, 0.401-8.838 for down, and 1.023-21.607 ms in total. The route
+kernel now costs 20-40x less and no longer appears in the total; the expert
+columns carry the whole time.
 
 These are kernel-pipeline numbers for a synthetic shape. End-to-end
 `qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 128, 512, and 2048
@@ -643,7 +652,8 @@ within 1.1-1.3x of llama.cpp.
 
 `scripts/kernel_resources.sh` compiles the dispatched families with
 `-Rpass-analysis=kernel-resource-usage`. Every listed kernel reports zero
-scratch and zero VGPR spills. Dynamic LDS is set by the launcher and does not
+scratch, and every one reports zero VGPR spills except the generic MoE gate/up
+instance noted under the table. Dynamic LDS is set by the launcher and does not
 appear in the compiler's static figure.
 
 | Kernel | VGPR | SGPR | Static LDS |
@@ -672,7 +682,16 @@ appear in the compiler's static figure.
 | `embedding_batch_f32_kernel` | 21 | 19 | 0 |
 | `conv1d_chunk_f32_kernel` / `conv1d_state_f32_kernel` | 20 / 7 | 40 / 17 | 0 |
 | `cast_f32_to_f16_kernel` / `cast_f16_to_f32_kernel` | 7 / 7 | 18 / 18 | 0 |
-| `moe_route_kernel` / `moe_gate_up_grouped_kernel` / `moe_down_grouped_kernel` / `moe_reduce_add_kernel` | 10 / 23 / 21 / 9 | 32 / 48 / 42 / 21 | 0 / 1,024 B / 1,024 B / 0 |
+| `moe_route_kernel<1..32>` | 17-79 | 22 | 0 |
+| `moe_gate_up_grouped_kernel<*,8>` / `<Generic,4>` | 125-141 / 192 | 88-93 | 0 |
+| `moe_down_grouped_kernel<*,8>` / `<Generic,4>` | 132-137 | 62-88 | 0 |
+| `moe_gate_up_selected_kernel<*>` / `moe_down_selected_kernel<*>` | 52-78 / 44-67 | 26-60 | 0 |
+| `moe_reduce_add_kernel` / `moe_shared_add_kernel` | 9 / 8 | 21 / 20 | 0 / 1,024 B |
+
+`moe_gate_up_grouped_kernel<Generic,4>` is the one listed kernel that spills:
+two SGPR slots and thirty VGPR slots. It is the scalar decoder for the eight
+general dtypes, which measures better at the smaller tile than at the IQ tile,
+and it is not on the path of the model this document records.
 
 ## Serving and server mode
 
