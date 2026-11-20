@@ -477,6 +477,16 @@ worth.
 the opt-in int8 decode matvec instead of the FP32 streaming kernel, which is how
 the two activation sources were compared; the default is the selected route.
 
+MoE attribution uses `TestGPUProfileMoE`, which is opt-in through
+`YUUKA_TEST_MOE_MODEL` and profiles one 128-row chunk and one decode step of the
+`qwen35moe` plan with the same per-operation events, aggregating by operation
+code. It also prints the decode routing distribution (how many of the 256
+experts the last route selected), because a selected expert re-reads its whole
+packed weight set. The recorded tables and the reference comparison are in
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution).
+The test has no pass/fail gate: the MoE path is not optimized yet, so there is
+no recorded constant to hold it to.
+
 `build/yuuka_gemv_decode_sweep --recurrent` is the RECURRENT cell of the decode
 matvec table: it builds one recurrent layer from the five separate operators and
 from the fused pair, and prints the per-layer and 24-layer submission times with

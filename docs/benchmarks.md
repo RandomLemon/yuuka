@@ -632,8 +632,12 @@ reduce on one stream:
 
 These are kernel-pipeline numbers for a synthetic shape. End-to-end
 `qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 128, 512, and 2048
-prefill tokens and 128 decode tokens, next to llama.cpp on the same protocol, is
-recorded in [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md).
+prefill tokens and 128 decode tokens, next to llama.cpp on the same protocol,
+is recorded in [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md),
+together with the per-operation attribution of that gap: the two expert kernels
+hold 95% of the prefill chunk and the decode step is one serial router kernel
+plus the selected-expert kernels, while the dense and attention stages are
+within 1.1-1.3x of llama.cpp.
 
 ## Kernel resource usage
 
