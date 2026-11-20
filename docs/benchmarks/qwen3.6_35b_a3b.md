@@ -296,6 +296,30 @@ weights and therefore the generic codebook instance. The routing kernel is 20x
 faster there, and the generic gate/up instance still spills 30 VGPRs, which is
 why its gain is smaller than the IQ path's.
 
+**Effect on the dense `qwen35` path.** The pass touches three files: the MoE
+kernels, the IQ span helpers that only the MoE kernels call, and one plan
+validation rule. The dense model was A/B'd anyway, because it shares the
+library. `Qwen3.5-4B-Q4_K_M` on the same device, one request, F16 KV, warmup 1
+and median of 3, four alternations of the two builds per cell:
+
+| Cell | before the pass | at `HEAD` | delta |
+| --- | ---: | ---: | ---: |
+| prefill 128 | 1810.4 tokens/s | 1811.6 | +0.1% |
+| prefill 512 | 2212.2 tokens/s | 2206.7 | -0.2% |
+| prefill 2048 | 2292.1 tokens/s | 2281.3 | -0.5% |
+| decode 128 after pp128 | 60.5 tokens/s | 60.6 | +0.1% |
+| decode 128 after pp2048 | 59.1 tokens/s | 59.2 | +0.1% |
+
+The last column is inside the run-to-run spread: the prefill 2048 cells ranged
+2166-2303 and 2166-2299 across the four alternations. The per-operation
+attribution says the same thing structurally: `TestGPUProfileDecode` plans 355
+operations in both builds (17.15 ms and 17.25 ms profiled) and
+`TestGPUProfilePrefill` plans 581 operations for a 512-row chunk at every
+position it profiles, with per-operation counts and 0.5-3% timing differences.
+The current `qwen35` throughput is faster than the F16 rows of
+[benchmarks.md](../benchmarks.md#prefill-prompt-length) because those rows
+predate the streaming LM head, which the qwen35 record already notes.
+
 ## Correctness gates
 
 Every record above was taken at a commit whose MoE path was verified on the same
