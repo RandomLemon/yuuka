@@ -1714,6 +1714,13 @@ yuuka_status validate_moe_route_plan_op(const yuuka_op & op) {
     if (rows == 0 || experts == 0 || used == 0 || used > experts) {
         return fail(YUUKA_ERR_INVALID_ARGUMENT, "invalid MoE route dimensions");
     }
+    // moe_route_kernel keeps one expert candidate per 32-lane wave in registers
+    // and is instantiated up to 32 candidates per lane. A larger expert count
+    // would silently drop candidates, so it is rejected here.
+    if (experts > 32 * 32) {
+        return fail(YUUKA_ERR_UNSUPPORTED, "MoE expert count %llu exceeds 1024",
+                    static_cast<unsigned long long>(experts));
+    }
     for (int i = 0; i < 7; ++i) {
         if (op.buf[i] == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "MoE route buffer %d is null", i);

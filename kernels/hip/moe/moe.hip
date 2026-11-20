@@ -6,11 +6,31 @@
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kWarps = kThreads / 32;
+// One warp decodes eight weight values per lane per K step, so a step covers
+// 256 values of the packed row and costs one codebook fetch per lane.
+constexpr int kLaneValues = 8;
+constexpr int kStepK = 32 * kLaneValues;
+// Assignments that share one decoded weight span. The tile bounds the decode
+// work of one expert row to count/kTile spans and keeps the accumulators of the
+// tile in registers. It is the measured lever at these shapes, because the
+// expert stage is limited by the per-value codebook decode, but it costs
+// registers: the eight-value IQ span decoders afford a tile of eight, while the
+// scalar decoder of the general dtypes is larger and measures better at four.
+constexpr int kAssignTileIQ = 8;
+constexpr int kAssignTileGeneric = 4;
+// Output rows one warp owns. Tiling output rows trades activation traffic for
+// registers and measured neutral at a tile of four on a 128-row chunk, so the
+// selected form keeps one row per warp.
+constexpr int kRowsPerWarp = 1;
+constexpr int kRowsPerBlock = kWarps * kRowsPerWarp;
+constexpr float kMasked = -INFINITY;
 
-// moe_packed_value decodes element index of one packed expert weight row. The
-// MoE kernels are the only family that decodes the IQ2/IQ3 codebooks; every
-// other kernel keeps packed_value, which rejects those dtypes so a GEMV or GEMM
-// on an IQ tensor still fails instead of reading it as zero.
+// moe_packed_value decodes element index of one packed expert weight row. It is
+// the scalar path: eight general matvec dtypes plus the IQ2/IQ3 codebooks that
+// only the MoE kernels and yuuka_dequant_f16 read. The span decoders below
+// cover the IQ codebooks eight values at a time; the scalar form stays for the
+// tails and for the dtypes without a span decoder.
 __device__ __forceinline__ float moe_packed_value(uint32_t dtype,
                                                   const uint8_t * row,
                                                   int64_t index) {
@@ -26,141 +46,350 @@ __device__ __forceinline__ float moe_packed_value(uint32_t dtype,
     }
 }
 
-// moe_route_kernel selects the top-k experts for every row, normalizes the
-// selected softmax weights, and bins assignments by expert. Binning makes the
-// grouped expert kernels read one contiguous assignment range per expert.
+// MoeCodebook selects the compile-time decode form of a launch. Generic keeps
+// the runtime dtype, so the eight general matvec dtypes share one
+// instantiation.
+enum class MoeCodebook { Generic, IQ2XXS, IQ2S, IQ3S };
+
+// moe_span8 decodes the eight values that start at base, which must be a
+// multiple of eight and inside the row. The IQ forms fetch one codebook entry
+// (two for IQ3_S) for the whole span instead of one per value.
+template <MoeCodebook kCodebook>
+__device__ __forceinline__ void moe_span8(uint32_t dtype, const uint8_t * row,
+                                          int64_t base, float (&out)[kLaneValues]) {
+    if constexpr (kCodebook == MoeCodebook::IQ2XXS) {
+        iq2xxs_span8(row + (base / 256) * 66, static_cast<int>(base % 256), out);
+    } else if constexpr (kCodebook == MoeCodebook::IQ2S) {
+        iq2s_span8(row + (base / 256) * 82, static_cast<int>(base % 256), out);
+    } else if constexpr (kCodebook == MoeCodebook::IQ3S) {
+        iq3s_span8(row + (base / 256) * 110, static_cast<int>(base % 256), out);
+    } else {
+        #pragma unroll
+        for (int k = 0; k < kLaneValues; ++k) {
+            out[k] = packed_value(dtype, row, base + k);
+        }
+    }
+}
+
+// moe_dot_span forms one partial dot product of eight activation values and
+// eight decoded weights. The activations are read as two aligned float4 loads,
+// which is why base must be a multiple of eight.
+__device__ __forceinline__ float moe_dot_span(const float * x,
+                                              const float (&w)[kLaneValues]) {
+    const float4 x0 = *reinterpret_cast<const float4 *>(x);
+    const float4 x1 = *reinterpret_cast<const float4 *>(x + 4);
+    float sum = x0.x * w[0] + x0.y * w[1] + x0.z * w[2] + x0.w * w[3];
+    sum += x1.x * w[4] + x1.y * w[5] + x1.z * w[6] + x1.w * w[7];
+    return sum;
+}
+
+// moe_dot_values is the same product for an activation span that is already in
+// registers, which is the reuse the output-row tile depends on.
+__device__ __forceinline__ float moe_dot_values(const float (&x)[kLaneValues],
+                                                const float (&w)[kLaneValues]) {
+    float sum = x[0] * w[0] + x[1] * w[1] + x[2] * w[2] + x[3] * w[3];
+    sum += x[4] * w[4] + x[5] * w[5] + x[6] * w[6] + x[7] * w[7];
+    return sum;
+}
+
+// moe_route_kernel selects the top-k experts of every row, normalizes the
+// selected softmax weights, and bins assignments by expert. One warp handles
+// one row: each lane owns every 32nd expert in registers, a slot is a butterfly
+// max with a lowest-index tie-break that matches the ascending scan of the
+// reference selection, and the winner is masked out of the register set, so a
+// slot costs one pass over the row instead of a scan per slot.
+template <int kPerLane>
 __global__ void moe_route_kernel(const float * logits, int rows, int experts,
                                  int used, int bucket_capacity, int32_t * ids,
                                  float * weights, int32_t * counts,
                                  int32_t * assign_rows, int32_t * assign_slots,
                                  float * assign_weights) {
-    const int row = blockIdx.x;
-    if (row >= rows || threadIdx.x != 0) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (row >= rows) {
         return;
     }
     const float * row_logits = logits + static_cast<int64_t>(row) * experts;
     int32_t * row_ids = ids + static_cast<int64_t>(row) * used;
     float * row_weights = weights + static_cast<int64_t>(row) * used;
+
+    float mine[kPerLane];
+    #pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+        const int expert = lane + 32 * i;
+        mine[i] = expert < experts ? row_logits[expert] : kMasked;
+    }
+    #pragma unroll 1
     for (int slot = 0; slot < used; ++slot) {
-        int best = -1;
-        for (int expert = 0; expert < experts; ++expert) {
-            bool taken = false;
-            for (int prior = 0; prior < slot; ++prior) {
-                if (row_ids[prior] == expert) {
-                    taken = true;
-                    break;
-                }
-            }
-            if (taken) {
-                continue;
-            }
-            if (best < 0 || row_logits[expert] > row_logits[best]) {
-                best = expert;
+        float best = kMasked;
+        int best_index = 0x7fffffff;
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            const int expert = lane + 32 * i;
+            if (mine[i] > best || (mine[i] == best && expert < best_index)) {
+                best = mine[i];
+                best_index = expert;
             }
         }
-        row_ids[slot] = best < 0 ? 0 : best;
-    }
-    const float max_logit = row_logits[row_ids[0]];
-    float total = 0.0f;
-    for (int slot = 0; slot < used; ++slot) {
-        const float weight = expf(row_logits[row_ids[slot]] - max_logit);
-        row_weights[slot] = weight;
-        total += weight;
-    }
-    if (total > 0.0f) {
-        for (int slot = 0; slot < used; ++slot) {
-            row_weights[slot] /= total;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffffffffffull, best, offset);
+            const int other_index =
+                __shfl_xor_sync(0xffffffffffffffffull, best_index, offset);
+            if (other > best || (other == best && other_index < best_index)) {
+                best = other;
+                best_index = other_index;
+            }
+        }
+        if (lane == 0) {
+            row_ids[slot] = best_index;
+        }
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            if (lane + 32 * i == best_index) {
+                mine[i] = kMasked;
+            }
         }
     }
-    for (int slot = 0; slot < used; ++slot) {
-        const int expert = row_ids[slot];
-        const int index = atomicAdd(counts + expert, 1);
-        if (index < bucket_capacity) {
-            const int64_t base = static_cast<int64_t>(expert) * bucket_capacity + index;
-            assign_rows[base] = row;
-            assign_slots[base] = slot;
-            assign_weights[base] = row_weights[slot];
-        }
+
+    // Weights: lane slot holds the exponent of its slot, the warp sums the
+    // selected slots, and the lanes below used bin their assignment.
+    float weight = 0.0f;
+    if (lane < used) {
+        weight = expf(row_logits[row_ids[lane]] - row_logits[row_ids[0]]);
+    }
+    const float total = warp_reduce_sum(weight);
+    if (lane >= used) {
+        return;
+    }
+    const float normalized = total > 0.0f ? weight / total : weight;
+    row_weights[lane] = normalized;
+    const int expert = row_ids[lane];
+    const int index = atomicAdd(counts + expert, 1);
+    if (index < bucket_capacity) {
+        const int64_t base = static_cast<int64_t>(expert) * bucket_capacity + index;
+        assign_rows[base] = row;
+        assign_slots[base] = lane;
+        assign_weights[base] = normalized;
     }
 }
 
 // moe_gate_up_grouped_kernel computes one expert output row for every token
-// assigned to that expert. Blocks are indexed by (expert, expert-FFN row), so
-// one packed weight row serves every assigned token.
+// assigned to that expert. One warp owns kRowsPerWarp output rows, decodes the
+// packed gate and up rows once per K step, and reuses that span across a tile of
+// assignments, so a chunk costs one weight-row decode per expert row instead of
+// one per assignment, and one activation read per out-row tile instead of one
+// per output row.
+template <MoeCodebook kCodebook, int kTile>
 __global__ void moe_gate_up_grouped_kernel(
     const float * norm, const uint8_t * gate_exps, const uint8_t * up_exps,
     const int32_t * counts, const int32_t * assign_rows,
     const int32_t * assign_slots, float * gate_out, float * up_out, int rows,
     int experts, int used, int hidden, int ffn, uint64_t hidden_row_bytes,
     uint32_t dtype) {
+    const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x;
-    const int out_row = blockIdx.y;
-    if (expert >= experts || out_row >= ffn) {
+    const int out_row0 = blockIdx.y * kRowsPerBlock + (threadIdx.x >> 5) * kRowsPerWarp;
+    if (expert >= experts || out_row0 >= ffn) {
         return;
     }
-    const uint8_t * gate_row =
-        gate_exps + static_cast<int64_t>(expert * ffn + out_row) * hidden_row_bytes;
-    const uint8_t * up_row =
-        up_exps + static_cast<int64_t>(expert * ffn + out_row) * hidden_row_bytes;
-    __shared__ float scratch[kThreads];
+    const int64_t bucket = static_cast<int64_t>(expert) * rows * used;
     const int count = counts[expert];
-    for (int a = 0; a < count; ++a) {
-        const int64_t base = static_cast<int64_t>(expert) * rows * used + a;
-        const int row = assign_rows[base];
-        const int slot = assign_slots[base];
-        const float * x = norm + static_cast<int64_t>(row) * hidden;
-        float gate_sum = 0.0f;
-        float up_sum = 0.0f;
-        for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-            const float value = x[i];
-            gate_sum += value * moe_packed_value(dtype, gate_row, i);
-            up_sum += value * moe_packed_value(dtype, up_row, i);
+    for (int a0 = 0; a0 < count; a0 += kTile) {
+        const int take = count - a0 < kTile ? count - a0 : kTile;
+        int64_t tile_offset[kTile];
+        float gate_acc[kRowsPerWarp][kTile];
+        float up_acc[kRowsPerWarp][kTile];
+        #pragma unroll
+        for (int j = 0; j < kTile; ++j) {
+            tile_offset[j] = j < take
+                ? static_cast<int64_t>(assign_rows[bucket + a0 + j]) * hidden
+                : 0;
+            #pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                gate_acc[r][j] = 0.0f;
+                up_acc[r][j] = 0.0f;
+            }
         }
-        gate_sum = block_reduce_sum<kThreads>(gate_sum, scratch);
-        up_sum = block_reduce_sum<kThreads>(up_sum, scratch);
-        if (threadIdx.x == 0) {
-            const int64_t dst =
-                (static_cast<int64_t>(row) * used + slot) * ffn + out_row;
-            gate_out[dst] = gate_sum;
-            up_out[dst] = up_sum;
+        for (int64_t base = 0; base < hidden; base += kStepK) {
+            const int64_t idx = base + kLaneValues * lane;
+            const bool full = idx + kLaneValues <= hidden;
+            float x[kTile][kLaneValues];
+            if (full) {
+                #pragma unroll
+                for (int j = 0; j < kTile; ++j) {
+                    const float * src = norm + tile_offset[j] + idx;
+                    if (j < take) {
+                        const float4 x0 = *reinterpret_cast<const float4 *>(src);
+                        const float4 x1 = *reinterpret_cast<const float4 *>(src + 4);
+                        x[j][0] = x0.x; x[j][1] = x0.y; x[j][2] = x0.z; x[j][3] = x0.w;
+                        x[j][4] = x1.x; x[j][5] = x1.y; x[j][6] = x1.z; x[j][7] = x1.w;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                const int out_row = out_row0 + r;
+                if (out_row >= ffn) {
+                    break;
+                }
+                const uint8_t * gate_row = gate_exps +
+                    static_cast<int64_t>(expert * ffn + out_row) * hidden_row_bytes;
+                const uint8_t * up_row = up_exps +
+                    static_cast<int64_t>(expert * ffn + out_row) * hidden_row_bytes;
+                if (full) {
+                    float gate_w[kLaneValues];
+                    float up_w[kLaneValues];
+                    moe_span8<kCodebook>(dtype, gate_row, idx, gate_w);
+                    moe_span8<kCodebook>(dtype, up_row, idx, up_w);
+                    #pragma unroll
+                    for (int j = 0; j < kTile; ++j) {
+                        if (j >= take) {
+                            continue;
+                        }
+                        gate_acc[r][j] += moe_dot_values(x[j], gate_w);
+                        up_acc[r][j] += moe_dot_values(x[j], up_w);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < kTile; ++j) {
+                        if (j >= take) {
+                            continue;
+                        }
+                        const float * src = norm + tile_offset[j];
+                        for (int64_t i = idx; i < hidden; ++i) {
+                            gate_acc[r][j] += src[i] * moe_packed_value(dtype, gate_row, i);
+                            up_acc[r][j] += src[i] * moe_packed_value(dtype, up_row, i);
+                        }
+                    }
+                }
+            }
         }
-        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            const int out_row = out_row0 + r;
+            if (out_row >= ffn) {
+                break;
+            }
+            #pragma unroll
+            for (int j = 0; j < kTile; ++j) {
+                if (j >= take) {
+                    continue;
+                }
+                const float g = warp_reduce_sum(gate_acc[r][j]);
+                const float u = warp_reduce_sum(up_acc[r][j]);
+                if (lane == 0) {
+                    const int64_t dst =
+                        (static_cast<int64_t>(assign_rows[bucket + a0 + j]) * used +
+                         assign_slots[bucket + a0 + j]) * ffn + out_row;
+                    gate_out[dst] = g;
+                    up_out[dst] = u;
+                }
+            }
+        }
     }
 }
 
 // moe_down_grouped_kernel computes one expert down-projection row for every
-// token assigned to that expert.
+// token assigned to that expert, with the same output-row x assignment tile as
+// the gate/up kernel.
+template <MoeCodebook kCodebook, int kTile>
 __global__ void moe_down_grouped_kernel(
     const float * act, const uint8_t * down_exps, const int32_t * counts,
     const int32_t * assign_rows, const int32_t * assign_slots, float * out,
     int rows, int experts, int used, int hidden, int ffn,
     uint64_t ffn_row_bytes, uint32_t dtype) {
+    const int lane = threadIdx.x & 31;
     const int expert = blockIdx.x;
-    const int out_row = blockIdx.y;
-    if (expert >= experts || out_row >= hidden) {
+    const int out_row0 = blockIdx.y * kRowsPerBlock + (threadIdx.x >> 5) * kRowsPerWarp;
+    if (expert >= experts || out_row0 >= hidden) {
         return;
     }
-    const uint8_t * weight_row =
-        down_exps + static_cast<int64_t>(expert * hidden + out_row) * ffn_row_bytes;
-    __shared__ float scratch[kThreads];
+    const int64_t bucket = static_cast<int64_t>(expert) * rows * used;
     const int count = counts[expert];
-    for (int a = 0; a < count; ++a) {
-        const int64_t base = static_cast<int64_t>(expert) * rows * used + a;
-        const int row = assign_rows[base];
-        const int slot = assign_slots[base];
-        const float * x =
-            act + (static_cast<int64_t>(row) * used + slot) * ffn;
-        float sum = 0.0f;
-        for (int i = threadIdx.x; i < ffn; i += blockDim.x) {
-            sum += x[i] * moe_packed_value(dtype, weight_row, i);
+    for (int a0 = 0; a0 < count; a0 += kTile) {
+        const int take = count - a0 < kTile ? count - a0 : kTile;
+        int64_t tile_offset[kTile];
+        float acc[kRowsPerWarp][kTile];
+        #pragma unroll
+        for (int j = 0; j < kTile; ++j) {
+            tile_offset[j] = j < take
+                ? (static_cast<int64_t>(assign_rows[bucket + a0 + j]) * used +
+                   assign_slots[bucket + a0 + j]) * ffn
+                : 0;
+            #pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                acc[r][j] = 0.0f;
+            }
         }
-        sum = block_reduce_sum<kThreads>(sum, scratch);
-        if (threadIdx.x == 0) {
-            const int64_t dst =
-                (static_cast<int64_t>(row) * used + slot) * hidden + out_row;
-            out[dst] = sum;
+        for (int64_t base = 0; base < ffn; base += kStepK) {
+            const int64_t idx = base + kLaneValues * lane;
+            const bool full = idx + kLaneValues <= ffn;
+            float x[kTile][kLaneValues];
+            if (full) {
+                #pragma unroll
+                for (int j = 0; j < kTile; ++j) {
+                    if (j < take) {
+                        const float * src = act + tile_offset[j] + idx;
+                        const float4 x0 = *reinterpret_cast<const float4 *>(src);
+                        const float4 x1 = *reinterpret_cast<const float4 *>(src + 4);
+                        x[j][0] = x0.x; x[j][1] = x0.y; x[j][2] = x0.z; x[j][3] = x0.w;
+                        x[j][4] = x1.x; x[j][5] = x1.y; x[j][6] = x1.z; x[j][7] = x1.w;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                const int out_row = out_row0 + r;
+                if (out_row >= hidden) {
+                    break;
+                }
+                const uint8_t * weight_row = down_exps +
+                    static_cast<int64_t>(expert * hidden + out_row) * ffn_row_bytes;
+                if (full) {
+                    float w[kLaneValues];
+                    moe_span8<kCodebook>(dtype, weight_row, idx, w);
+                    #pragma unroll
+                    for (int j = 0; j < kTile; ++j) {
+                        if (j >= take) {
+                            continue;
+                        }
+                        acc[r][j] += moe_dot_values(x[j], w);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < kTile; ++j) {
+                        if (j >= take) {
+                            continue;
+                        }
+                        const float * src = act + tile_offset[j];
+                        for (int64_t i = idx; i < ffn; ++i) {
+                            acc[r][j] += src[i] *
+                                moe_packed_value(dtype, weight_row, i);
+                        }
+                    }
+                }
+            }
         }
-        __syncthreads();
+        for (int j = 0; j < kTile; ++j) {
+            if (j >= take) {
+                continue;
+            }
+            const int64_t dst_base =
+                (static_cast<int64_t>(assign_rows[bucket + a0 + j]) * used +
+                 assign_slots[bucket + a0 + j]) * hidden;
+            #pragma unroll
+            for (int r = 0; r < kRowsPerWarp; ++r) {
+                const int out_row = out_row0 + r;
+                if (out_row >= hidden) {
+                    break;
+                }
+                const float sum = warp_reduce_sum(acc[r][j]);
+                if (lane == 0) {
+                    out[dst_base + out_row] = sum;
+                }
+            }
+        }
     }
 }
 
@@ -185,15 +414,16 @@ __global__ void moe_reduce_add_kernel(float * x, const float * expert_out,
 }
 
 // moe_gate_up_selected_kernel computes one expert-FFN row for one selected
-// expert of one token. Blocks are indexed by (expert-FFN row, token slot), so
-// the decode path launches one grid over the used experts only instead of the
-// grouped kernel's experts-by-FFN grid, which would schedule every unselected
-// expert row.
+// expert of one token. One warp owns one output row and decodes the packed rows
+// eight values per codebook fetch, so the grid no longer needs a block-wide
+// reduction per output element.
+template <MoeCodebook kCodebook>
 __global__ void moe_gate_up_selected_kernel(
     const float * norm, const int32_t * ids, const uint8_t * gate_exps,
     const uint8_t * up_exps, float * act, int rows, int used, int hidden,
     int ffn, uint64_t hidden_row_bytes, uint32_t dtype) {
-    const int out_row = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int out_row = blockIdx.x * kWarps + (threadIdx.x >> 5);
     const int slot_index = blockIdx.y;
     if (out_row >= ffn || slot_index >= rows * used) {
         return;
@@ -205,29 +435,41 @@ __global__ void moe_gate_up_selected_kernel(
     const uint8_t * up_row =
         up_exps + static_cast<int64_t>(expert * ffn + out_row) * hidden_row_bytes;
     const float * x = norm + static_cast<int64_t>(row) * hidden;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-        const float value = x[i];
-        gate_sum += value * moe_packed_value(dtype, gate_row, i);
-        up_sum += value * moe_packed_value(dtype, up_row, i);
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int64_t base = 0; base < hidden; base += kStepK) {
+        const int64_t idx = base + kLaneValues * lane;
+        if (idx + kLaneValues <= hidden) {
+            float gate_w[kLaneValues];
+            float up_w[kLaneValues];
+            moe_span8<kCodebook>(dtype, gate_row, idx, gate_w);
+            moe_span8<kCodebook>(dtype, up_row, idx, up_w);
+            gate += moe_dot_span(x + idx, gate_w);
+            up += moe_dot_span(x + idx, up_w);
+        } else {
+            for (int64_t i = idx; i < hidden; ++i) {
+                gate += x[i] * moe_packed_value(dtype, gate_row, i);
+                up += x[i] * moe_packed_value(dtype, up_row, i);
+            }
+        }
     }
-    __shared__ float scratch[kThreads];
-    gate_sum = block_reduce_sum<kThreads>(gate_sum, scratch);
-    up_sum = block_reduce_sum<kThreads>(up_sum, scratch);
-    if (threadIdx.x == 0) {
+    gate = warp_reduce_sum(gate);
+    up = warp_reduce_sum(up);
+    if (lane == 0) {
         act[static_cast<int64_t>(slot_index) * ffn + out_row] =
-            (gate_sum / (1.0f + expf(-gate_sum))) * up_sum;
+            (gate / (1.0f + expf(-gate))) * up;
     }
 }
 
 // moe_down_selected_kernel computes one down-projection row for one selected
 // expert of one token.
+template <MoeCodebook kCodebook>
 __global__ void moe_down_selected_kernel(
     const float * act, const int32_t * ids, const uint8_t * down_exps, float * out,
     int rows, int used, int hidden, int ffn, uint64_t ffn_row_bytes,
     uint32_t dtype) {
-    const int out_row = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int out_row = blockIdx.x * kWarps + (threadIdx.x >> 5);
     const int slot_index = blockIdx.y;
     if (out_row >= hidden || slot_index >= rows * used) {
         return;
@@ -237,12 +479,20 @@ __global__ void moe_down_selected_kernel(
         down_exps + static_cast<int64_t>(expert * hidden + out_row) * ffn_row_bytes;
     const float * x = act + static_cast<int64_t>(slot_index) * ffn;
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < ffn; i += blockDim.x) {
-        sum += x[i] * moe_packed_value(dtype, weight_row, i);
+    for (int64_t base = 0; base < ffn; base += kStepK) {
+        const int64_t idx = base + kLaneValues * lane;
+        if (idx + kLaneValues <= ffn) {
+            float w[kLaneValues];
+            moe_span8<kCodebook>(dtype, weight_row, idx, w);
+            sum += moe_dot_span(x + idx, w);
+        } else {
+            for (int64_t i = idx; i < ffn; ++i) {
+                sum += x[i] * moe_packed_value(dtype, weight_row, i);
+            }
+        }
     }
-    __shared__ float scratch[kThreads];
-    sum = block_reduce_sum<kThreads>(sum, scratch);
-    if (threadIdx.x == 0) {
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) {
         out[static_cast<int64_t>(slot_index) * hidden + out_row] = sum;
     }
 }
@@ -275,6 +525,52 @@ __global__ void moe_shared_add_kernel(float * x, const float * src,
 
 namespace yuuka {
 
+namespace {
+
+// moe_codebook maps a dtype to the compile-time decode form of the expert
+// kernels.
+MoeCodebook moe_codebook(uint32_t dtype) {
+    switch (dtype) {
+    case YUUKA_DTYPE_IQ2_XXS:
+        return MoeCodebook::IQ2XXS;
+    case YUUKA_DTYPE_IQ2_S:
+        return MoeCodebook::IQ2S;
+    case YUUKA_DTYPE_IQ3_S:
+        return MoeCodebook::IQ3S;
+    default:
+        return MoeCodebook::Generic;
+    }
+}
+
+// moe_route_grid selects the route instantiation whose per-lane register set
+// covers the expert count. The bound is 32 values per lane, so up to 1024
+// experts; the launcher rejects a larger count instead of silently truncating
+// the candidate set.
+int moe_route_per_lane(int experts) {
+    const int needed = (experts + 31) / 32;
+    if (needed <= 1) {
+        return 1;
+    }
+    if (needed <= 2) {
+        return 2;
+    }
+    if (needed <= 4) {
+        return 4;
+    }
+    if (needed <= 8) {
+        return 8;
+    }
+    if (needed <= 16) {
+        return 16;
+    }
+    if (needed <= 32) {
+        return 32;
+    }
+    return 0;
+}
+
+} // namespace
+
 int launch_moe_route(const float * logits, int rows, int experts, int used,
                      int bucket_capacity, int32_t * ids, float * weights,
                      int32_t * counts, int32_t * assign_rows,
@@ -284,14 +580,41 @@ int launch_moe_route(const float * logits, int rows, int experts, int used,
         bucket_capacity < rows * used) {
         return YUUKA_ERR_INVALID_ARGUMENT;
     }
+    const int per_lane = moe_route_per_lane(experts);
+    if (per_lane == 0) {
+        return YUUKA_ERR_INVALID_ARGUMENT;
+    }
     const hipError_t err =
         hipMemsetAsync(counts, 0, static_cast<size_t>(experts) * sizeof(int32_t), stream);
     if (err != hipSuccess) {
         return YUUKA_ERR_DEVICE;
     }
-    moe_route_kernel<<<rows, kThreads, 0, stream>>>(
-        logits, rows, experts, used, bucket_capacity, ids, weights, counts,
-        assign_rows, assign_slots, assign_weights);
+    const dim3 grid(static_cast<unsigned>((rows + kWarps - 1) / kWarps));
+    #define YUUKA_LAUNCH_MOE_ROUTE(PER_LANE)                                          \
+        moe_route_kernel<PER_LANE><<<grid, kThreads, 0, stream>>>(                     \
+            logits, rows, experts, used, bucket_capacity, ids, weights, counts,        \
+            assign_rows, assign_slots, assign_weights)
+    switch (per_lane) {
+    case 1:
+        YUUKA_LAUNCH_MOE_ROUTE(1);
+        break;
+    case 2:
+        YUUKA_LAUNCH_MOE_ROUTE(2);
+        break;
+    case 4:
+        YUUKA_LAUNCH_MOE_ROUTE(4);
+        break;
+    case 8:
+        YUUKA_LAUNCH_MOE_ROUTE(8);
+        break;
+    case 16:
+        YUUKA_LAUNCH_MOE_ROUTE(16);
+        break;
+    default:
+        YUUKA_LAUNCH_MOE_ROUTE(32);
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_ROUTE
     return YUUKA_OK;
 }
 
@@ -301,17 +624,33 @@ void launch_moe_gate_up_grouped(const float * norm, const void * gate_exps,
                                 const int32_t * assign_slots, float * gate_out,
                                 float * up_out, int rows, int experts, int used,
                                 int hidden, int ffn, uint64_t hidden_row_bytes,
-                                uint32_t dtype,
-                                hipStream_t stream) {
+                                uint32_t dtype, hipStream_t stream) {
     if (rows <= 0 || experts <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
         return;
     }
-    const dim3 grid(static_cast<unsigned>(experts), static_cast<unsigned>(ffn));
-    moe_gate_up_grouped_kernel<<<grid, kThreads, 0, stream>>>(
-        norm, static_cast<const uint8_t *>(gate_exps),
-        static_cast<const uint8_t *>(up_exps), counts, assign_rows, assign_slots,
-        gate_out, up_out, rows, experts, used, hidden, ffn, hidden_row_bytes,
-        dtype);
+    const dim3 grid(static_cast<unsigned>(experts),
+                    static_cast<unsigned>((ffn + kRowsPerBlock - 1) / kRowsPerBlock));
+    const auto * gate = static_cast<const uint8_t *>(gate_exps);
+    const auto * up = static_cast<const uint8_t *>(up_exps);
+    #define YUUKA_LAUNCH_MOE_GATE_UP_GROUPED(CODEBOOK, TILE)                           \
+        moe_gate_up_grouped_kernel<CODEBOOK, TILE><<<grid, kThreads, 0, stream>>>(            \
+            norm, gate, up, counts, assign_rows, assign_slots, gate_out, up_out,       \
+            rows, experts, used, hidden, ffn, hidden_row_bytes, dtype)
+    switch (moe_codebook(dtype)) {
+    case MoeCodebook::IQ2XXS:
+        YUUKA_LAUNCH_MOE_GATE_UP_GROUPED(MoeCodebook::IQ2XXS, kAssignTileIQ);
+        break;
+    case MoeCodebook::IQ2S:
+        YUUKA_LAUNCH_MOE_GATE_UP_GROUPED(MoeCodebook::IQ2S, kAssignTileIQ);
+        break;
+    case MoeCodebook::IQ3S:
+        YUUKA_LAUNCH_MOE_GATE_UP_GROUPED(MoeCodebook::IQ3S, kAssignTileIQ);
+        break;
+    default:
+        YUUKA_LAUNCH_MOE_GATE_UP_GROUPED(MoeCodebook::Generic, kAssignTileGeneric);
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_GATE_UP_GROUPED
 }
 
 void launch_moe_down_grouped(const float * act, const void * down_exps,
@@ -323,11 +662,28 @@ void launch_moe_down_grouped(const float * act, const void * down_exps,
     if (rows <= 0 || experts <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
         return;
     }
-    const dim3 grid(static_cast<unsigned>(experts), static_cast<unsigned>(hidden));
-    moe_down_grouped_kernel<<<grid, kThreads, 0, stream>>>(
-        act, static_cast<const uint8_t *>(down_exps), counts, assign_rows,
-        assign_slots, out, rows, experts, used, hidden, ffn, ffn_row_bytes,
-        dtype);
+    const dim3 grid(static_cast<unsigned>(experts),
+                    static_cast<unsigned>((hidden + kRowsPerBlock - 1) / kRowsPerBlock));
+    const auto * down = static_cast<const uint8_t *>(down_exps);
+    #define YUUKA_LAUNCH_MOE_DOWN_GROUPED(CODEBOOK, TILE)                              \
+        moe_down_grouped_kernel<CODEBOOK, TILE><<<grid, kThreads, 0, stream>>>(               \
+            act, down, counts, assign_rows, assign_slots, out, rows, experts, used,     \
+            hidden, ffn, ffn_row_bytes, dtype)
+    switch (moe_codebook(dtype)) {
+    case MoeCodebook::IQ2XXS:
+        YUUKA_LAUNCH_MOE_DOWN_GROUPED(MoeCodebook::IQ2XXS, kAssignTileIQ);
+        break;
+    case MoeCodebook::IQ2S:
+        YUUKA_LAUNCH_MOE_DOWN_GROUPED(MoeCodebook::IQ2S, kAssignTileIQ);
+        break;
+    case MoeCodebook::IQ3S:
+        YUUKA_LAUNCH_MOE_DOWN_GROUPED(MoeCodebook::IQ3S, kAssignTileIQ);
+        break;
+    default:
+        YUUKA_LAUNCH_MOE_DOWN_GROUPED(MoeCodebook::Generic, kAssignTileGeneric);
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_DOWN_GROUPED
 }
 
 void launch_moe_reduce_add(float * x, const float * expert_out,
@@ -348,12 +704,28 @@ void launch_moe_gate_up_selected(const float * norm, const int32_t * ids,
     if (rows <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
         return;
     }
-    const dim3 grid(static_cast<unsigned>(ffn),
+    const dim3 grid(static_cast<unsigned>((ffn + kWarps - 1) / kWarps),
                     static_cast<unsigned>(rows * used));
-    moe_gate_up_selected_kernel<<<grid, kThreads, 0, stream>>>(
-        norm, ids, static_cast<const uint8_t *>(gate_exps),
-        static_cast<const uint8_t *>(up_exps), act, rows, used, hidden, ffn,
-        hidden_row_bytes, dtype);
+    const auto * gate = static_cast<const uint8_t *>(gate_exps);
+    const auto * up = static_cast<const uint8_t *>(up_exps);
+    #define YUUKA_LAUNCH_MOE_GATE_UP_SELECTED(CODEBOOK)                                \
+        moe_gate_up_selected_kernel<CODEBOOK><<<grid, kThreads, 0, stream>>>(           \
+            norm, ids, gate, up, act, rows, used, hidden, ffn, hidden_row_bytes, dtype)
+    switch (moe_codebook(dtype)) {
+    case MoeCodebook::IQ2XXS:
+        YUUKA_LAUNCH_MOE_GATE_UP_SELECTED(MoeCodebook::IQ2XXS);
+        break;
+    case MoeCodebook::IQ2S:
+        YUUKA_LAUNCH_MOE_GATE_UP_SELECTED(MoeCodebook::IQ2S);
+        break;
+    case MoeCodebook::IQ3S:
+        YUUKA_LAUNCH_MOE_GATE_UP_SELECTED(MoeCodebook::IQ3S);
+        break;
+    default:
+        YUUKA_LAUNCH_MOE_GATE_UP_SELECTED(MoeCodebook::Generic);
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_GATE_UP_SELECTED
 }
 
 void launch_moe_down_selected(const float * act, const int32_t * ids,
@@ -364,11 +736,27 @@ void launch_moe_down_selected(const float * act, const int32_t * ids,
     if (rows <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
         return;
     }
-    const dim3 grid(static_cast<unsigned>(hidden),
+    const dim3 grid(static_cast<unsigned>((hidden + kWarps - 1) / kWarps),
                     static_cast<unsigned>(rows * used));
-    moe_down_selected_kernel<<<grid, kThreads, 0, stream>>>(
-        act, ids, static_cast<const uint8_t *>(down_exps), out, rows, used,
-        hidden, ffn, ffn_row_bytes, dtype);
+    const auto * down = static_cast<const uint8_t *>(down_exps);
+    #define YUUKA_LAUNCH_MOE_DOWN_SELECTED(CODEBOOK)                                   \
+        moe_down_selected_kernel<CODEBOOK><<<grid, kThreads, 0, stream>>>(              \
+            act, ids, down, out, rows, used, hidden, ffn, ffn_row_bytes, dtype)
+    switch (moe_codebook(dtype)) {
+    case MoeCodebook::IQ2XXS:
+        YUUKA_LAUNCH_MOE_DOWN_SELECTED(MoeCodebook::IQ2XXS);
+        break;
+    case MoeCodebook::IQ2S:
+        YUUKA_LAUNCH_MOE_DOWN_SELECTED(MoeCodebook::IQ2S);
+        break;
+    case MoeCodebook::IQ3S:
+        YUUKA_LAUNCH_MOE_DOWN_SELECTED(MoeCodebook::IQ3S);
+        break;
+    default:
+        YUUKA_LAUNCH_MOE_DOWN_SELECTED(MoeCodebook::Generic);
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_DOWN_SELECTED
 }
 
 void launch_moe_shared_add(float * x, const float * src, const float * gate,

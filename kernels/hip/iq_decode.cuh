@@ -560,4 +560,72 @@ __device__ __forceinline__ float iq3s_value(const uint8_t * blk, int j) {
     return ((sign_byte >> rem) & 1) ? -db * v : db * v;
 }
 
+// The span8 forms decode eight consecutive values that start at a multiple of
+// eight. Every codebook group below covers at least eight values, so one span
+// shares the block scale, the codebook entry or entries, and the sign word,
+// which is what makes a span one codebook fetch instead of eight. The values
+// are the same expressions as the per-value forms above; the span only hoists
+// the index arithmetic.
+__device__ __forceinline__ void iq2xxs_span8(const uint8_t * blk, int j, float * out) {
+    const float d = load_f16_device(blk);
+    const int ib32 = j / 32, l = (j % 32) / 8;
+    const uint8_t * p = blk + 2 + 8 * ib32;
+    uint32_t aux0, aux1;
+    __builtin_memcpy(&aux0, p, 4);
+    __builtin_memcpy(&aux1, p + 4, 4);
+    const float db = d * (0.5f + static_cast<float>(aux1 >> 28)) * 0.25f;
+    const uint64_t grid = k_iq2xxs_grid[(aux0 >> (8 * l)) & 0xFF];
+    const uint8_t signs = k_ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float v = static_cast<float>((grid >> (8 * k)) & 0xFF);
+        out[k] = ((signs >> k) & 1) ? -db * v : db * v;
+    }
+}
+
+__device__ __forceinline__ void iq2s_span8(const uint8_t * blk, int j, float * out) {
+    const float d = load_f16_device(blk);
+    const int ib32 = j / 32, l = (j % 32) / 8;
+    const uint8_t * qs = blk + 2, * qh = blk + 66, * sc = blk + 74;
+    const uint8_t * signs = qs + 32;
+    const uint16_t idx = static_cast<uint16_t>(qs[4 * ib32 + l]) |
+        static_cast<uint16_t>((static_cast<uint16_t>(qh[ib32]) << (8 - 2 * l)) & 0x300);
+    const uint8_t s = sc[ib32];
+    const float db = d * (0.5f +
+        static_cast<float>(l < 2 ? (s & 0xF) : (s >> 4))) * 0.25f;
+    const uint64_t grid = k_iq2s_grid[idx];
+    const uint8_t sign_byte = signs[4 * ib32 + l];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float v = static_cast<float>((grid >> (8 * k)) & 0xFF);
+        out[k] = ((sign_byte >> k) & 1) ? -db * v : db * v;
+    }
+}
+
+// IQ3_S holds two four-value entries per eight-value run, so one span needs two
+// codebook fetches and one grid is reused by four consecutive values.
+__device__ __forceinline__ void iq3s_span8(const uint8_t * blk, int j, float * out) {
+    const float d = load_f16_device(blk);
+    const int ib32 = j / 32, within = j % 32;
+    const int l = within / 8;
+    const uint8_t * qs = blk + 2, * qh = blk + 66, * signs = blk + 74;
+    const uint8_t * scales = blk + 106;
+    const uint8_t s = scales[ib32 / 2];
+    const float db = d * (1.0f + 2.0f *
+        static_cast<float>((ib32 & 1) ? (s >> 4) : (s & 0xF)));
+    const uint16_t idx_lo = static_cast<uint16_t>(qs[ib32 * 8 + 2 * l]) |
+        static_cast<uint16_t>((static_cast<uint16_t>(qh[ib32]) << (8 - 2 * l)) & 0x100);
+    const uint16_t idx_hi = static_cast<uint16_t>(qs[ib32 * 8 + 2 * l + 1]) |
+        static_cast<uint16_t>((static_cast<uint16_t>(qh[ib32]) << (7 - 2 * l)) & 0x100);
+    const uint32_t grid_lo = k_iq3s_grid[idx_lo];
+    const uint32_t grid_hi = k_iq3s_grid[idx_hi];
+    const uint8_t sign_byte = signs[ib32 * 4 + l];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const uint32_t grid = k < 4 ? grid_lo : grid_hi;
+        const float v = static_cast<float>((grid >> (8 * (k % 4))) & 0xFF);
+        out[k] = ((sign_byte >> k) & 1) ? -db * v : db * v;
+    }
+}
+
 } // namespace
