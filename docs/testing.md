@@ -611,10 +611,12 @@ YUUKA_TEST_MOE_MODEL=/path/to/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf \
 `YUUKA_TEST_MOE_ROUTE=mmq|q8` selects the routed-expert prefill route for
 `TestGPUMoEGoldenGeneration`, `TestGPUMoEChunkedPrefill`, `TestGPUProfileMoE`,
 `TestGPUMoEMmqMatchesQ8`, and `TestGPUChunkedPrefillLongContext` (with
-`YUUKA_TEST_MODEL` pointing at the MoE GGUF). Unset and `q8` keep the released
-Q8_1 `dp4a` route; `mmq` enables `Options.MoEMMQ`. `TestGPUMoEMmqMatchesQ8`
-requires both routes to produce the same first-token logits, a difference of at
-most 0.05, and the golden continuation `[11751, 11, 264, 3177]`.
+`YUUKA_TEST_MODEL` pointing at the MoE GGUF). Unset and `mmq` keep the measured
+int8 WMMA route; `q8` forces the Q8_1 `dp4a` route through
+`Options.ForceMoEQ8`. `TestGPUMoEMmqMatchesQ8` requires both routes to produce
+the same first-token logits, a difference of at most 0.05, and the golden
+continuation `[11751, 11, 264, 3177]`. The assignment-tile table the dispatch
+uses is pinned per row class by `TestSelectMoEPrefillPath`.
 
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU

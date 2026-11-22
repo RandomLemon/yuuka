@@ -1102,9 +1102,10 @@ and requires it to match a host computation over the same decoded weights and th
 dequantized Q8_1 activations to 2e-2; the measured difference is 1.5e-6, and the
 two routes select the same experts. Chunks below sixteen rows, widths that do
 not fill the tiles, and non-IQ experts keep the FP32 grouped kernels, which is
-also what serves the cropped one-row FFN of the last layer; K-quant experts can
-take the opt-in int8 WMMA route described next. The route is a plan-build-time
-decision (`addMoEPrefillFFN`), not a runtime option.
+also what serves the cropped one-row FFN of the last layer; K-quant and IQ
+experts take the int8 WMMA route described next when their shape fits its tile.
+The route is a plan-build-time decision (`addMoEPrefillFFN`), not a runtime
+option.
 
 **The int8 WMMA expert route.** The Q8_1 route above still dots one assignment
 at a time with `v_dot4`, so its cost grows with the assignment count even when
@@ -1125,23 +1126,34 @@ WMMA of the dense MMQ GEMM, staged through
   of 64, four accumulator fragments per warp). The K step is 128 values, or 64
   at the widest assignment tile, which keeps the staged operands near the 30 KiB
   budget that holds two blocks per CU.
-- The weight staging, the per-16/per-32 scale slots, and the Q4_K/Q5_K minimum
-  term are the dense GEMM's, so the digits are the same ones the dequantized
-  reference path sees. The activation tile is gathered through the routing
-  arrays: the gate/up projections read the activation row of the assignment, the
-  down projection reads the SwiGLU slot of the assignment, and both scatter the
-  result to that slot row.
-- The assignment tile width is chosen at plan build time from the average bucket
-  of one expert, `ceil(rows*used/experts)`, so one weight pass covers a bucket at
-  every measured chunk size.
+- The K-quant weight staging, the per-16/per-32 scale slots, and the Q4_K/Q5_K
+  minimum term are the dense GEMM's, so the digits are the same ones the
+  dequantized reference path sees. The activation tile is gathered through the
+  routing arrays: the gate/up projections read the activation row of the
+  assignment, the down projection reads the SwiGLU slot of the assignment, and
+  both scatter the result to that slot row.
+- The assignment tile width is chosen at plan build time from the measured table
+  below, so one weight pass covers an expert's bucket at every measured chunk
+  size.
 
-The IQ expert codebooks enter the same tile through a span hook,
-`yuuka_mmq::stage_weights_with`: the fragment mapping (warp to fragment-pair
-region, lane to 16-byte slot) is the dense GEMM's, while the eight-value decode
-comes from the `iq2xxs_dot8`, `iq2s_dot8`, and `iq3s_dot8` forms of
-`kernels/hip/iq_decode.cuh`. The staged digits are therefore the ones the dp4a
-route and the FP32 reference path see, and only the scale slot rule differs per
-codebook:
+The IQ expert codebooks fill the same tile through their own group staging,
+`stage_iq_weights`: one thread owns one (row, 32-value group) task, fetches the
+group header once, decodes all thirty-two values with `iq2xxs_dot32`,
+`iq2s_dot32`, or `iq3s_dot32`, and writes both WMMA halves' 16-byte lane slots
+plus the two scale entries of the group. The fragment layout is the dense GEMM's;
+only the decode and the scale-slot rule differ per codebook. Each task loads the
+group header once instead of once per half, which is what took the expert stage
+from 24.9 to 61 GB/s of unique weight bytes at a 512-row chunk.
+
+The dot32 forms apply the codebook signs branch-free: a set sign bit means the
+value is negated, so the four digits packed in one 32-bit word are
+`(v ^ mask) + (mask & 0x01010101)`, where `mask` has 0xFF in the negated bytes.
+That is exact only because no codebook entry contains a zero digit, which the
+grid tables guarantee (`tensor.TestIQGridDigitsAreNonZero`). The sign masks are a
+compile-time expansion of the two sign encodings: IQ2_XXS indexes
+`k_ksigns_iq2xs` with a seven-bit field and IQ2_S/IQ3_S use the byte and nibble
+as the pattern. The staged digits are therefore the ones the dp4a route and the
+FP32 reference path see.
 
 | codebook | weight scale | `kSlicesPerScale` | minimum term |
 | --- | --- | ---: | --- |
@@ -1173,10 +1185,18 @@ of each group scale byte at opposite extremes (0 and 15, a 31x scale difference
 between the two 16-value halves), so applying that scale per 32 values instead
 of per 16 fails the test.
 
-The route is a plan-build-time decision (`SelectMoEPrefillPath`), gated by
-`Options.MoEMMQ`: it serves the K-quant and the IQ2_XXS/IQ2_S/IQ3_S expert
-dtypes, and enabling it by default waits for the recorded tile sweep
-(`docs/benchmarks.md`, grouped MoE pipeline). On the real model it reproduces the
+The route is the selected plan-build-time choice (`SelectMoEPrefillPath`) for
+every dtype it decodes: the K-quants and IQ2_XXS/IQ2_S/IQ3_S, when every weight
+row is a whole number of 256-value blocks and the output width fills the
+128-channel tile. The assignment tile width comes from the measured table in
+`moeAssignmentTile`: 16 up to 384 rows, 32 from 512 to 2048, and 64 from 4096.
+The table is the measured winner of each row class in
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md), where the
+synthetic tile sweep and the end-to-end A/B are recorded; at 512 rows the two
+widths tie in the synthetic sweep and the real model prefers 32 because its
+routing concentrates more assignments per expert than a random draw.
+`Options.ForceMoEQ8` keeps the Q8_1 dp4a route for the same shapes so the two can
+be compared on identical plan inputs. On the real model the route reproduces the
 golden four-token continuation and the chunk-invariant first token of the Q8_1
 route (`TestGPUMoEMmqMatchesQ8`, `TestGPUChunkedPrefillLongContext`).
 

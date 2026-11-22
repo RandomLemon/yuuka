@@ -16,7 +16,7 @@ treated as format and correctness references only.
 > Phase 5 adds F16/Q8_0 KV formats, greedy prompt-lookup speculative decoding,
 > Q4_0/Q5_0 tensors, and the `qwen35moe` hybrid MoE architecture on both the CPU
 > reference and the HIP decoder, including on-device IQ2_XXS/IQ2_S/IQ3_S expert
-> decoding and an opt-in int8 WMMA expert prefill route for K-quant and IQ
+> decoding and a measured int8 WMMA expert prefill route for K-quant and IQ
 > experts.
 > NPU support is a
 > future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
@@ -161,9 +161,9 @@ Implemented and tested:
   GEMV, GEMM, or LM-head kernel accepts them, and those families keep failing
   explicitly. MoE prefill decodes the expert digits to int8 and dots them
   against a Q8_1 activation tile with `dp4a` for chunks of at least sixteen
-  rows, keeps the FP32 form for every other shape and dtype, and has an opt-in
-  int8 WMMA form for the K-quant and IQ expert dtypes whose dispatch table is
-  still a derivation.
+  rows, keeps the FP32 form for every other shape and dtype, and takes the int8
+  WMMA form for the K-quant and IQ expert dtypes whose row, K width, and output
+  width fit its tile.
 - An opt-in prefill attribution profile (`TestGPUProfilePrefill`) that records
   per-operation time for a 512-token chunk at positions 0, 2048, and 7680.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
@@ -191,11 +191,14 @@ Implemented and tested:
   token; the prefill path runs the grouped kernels over the binned expert
   assignments. Both decode the IQ codebooks eight values per codebook fetch and
   reduce within a warp, and the grouped path reuses one decoded weight span
-  across a tile of assignments. The K-quant and the IQ expert dtypes
-  additionally have an opt-in int8 WMMA grouped route (`Options.MoEMMQ`) that
-  replaces the per-assignment `dp4a` with the dense MMQ GEMM's int8 tiles; it
-  stays opt-in until its assignment-tile table is measured (see
-  [kernels.md](kernels.md#81-moe-expert-pipeline)).
+  across a tile of assignments. The K-quant and the IQ expert dtypes take the
+  int8 WMMA grouped route, which replaces the per-assignment `dp4a` with the
+  dense MMQ GEMM's int8 tiles at a measured assignment-tile table (see
+  [kernels.md](kernels.md#81-moe-expert-pipeline)); `Options.ForceMoEQ8` keeps
+  the `dp4a` route for A/B measurement. On Qwen3.6-35B-A3B it moves the expert
+  stage from 99.4 to 58.4 ms at a 128-row chunk and from 363.2 to 142.1 ms at
+  512 rows, and prefill from 733-751 to 949-1227 tokens/s at 128-512 tokens
+  ([benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#optimization-record-2026-11-22-int8-wmma-expert-route)).
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.
 - A diagnostic NPU capability probe (`yuuka npu-probe`, `--npu`) that reports

@@ -667,16 +667,30 @@ goes from 1.56 to 2.54 ms while the FP32 route goes from 5.36 to 19.71 ms. The
 widest tiles lose on this shape because a bucket averages `128*8/128 = 8`
 assignments, so a tile of 64 or 128 leaves most columns padded (tile 128:
 4.816 / 6.131 / 7.588 / 7.944 ms total). The assignment tile is therefore a
-dispatch decision, not a constant; the table above is synthetic, and the tile
-table for the target model belongs with its own record in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md).
+dispatch decision, not a constant; the tile table the dispatch uses was measured
+per row class afterwards and is recorded with the target model in
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#optimization-record-2026-11-22-int8-wmma-expert-route).
 
 `--route q8` runs the same shape through the Q8_1 `dp4a` pipeline, and
 `--dtype q4_k|q5_k|q6_k|iq2xxs|iq2s|iq3s` selects the synthetic expert codebook
 for either quantized route, so one binary covers the two quantized forms per
-codebook. The IQ2_XXS, IQ2_S, and IQ3_S cells are not recorded yet: the tile
-table for the target model's IQ experts belongs with the same record as the
-K-quant table.
+codebook. Measured 2026-11-22 with the IQ staging of
+[qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#optimization-record-2026-11-22-int8-wmma-expert-route),
+`--dtype iq2xxs --experts 256 --used 8 --hidden 2048 --ffn 512`, three runs per
+cell with the median reported:
+
+| Rows | FP32 grouped ms | Q8_1 `dp4a` ms | int8 WMMA ms | WMMA tile |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 1.593 | 1.405 | 0.985 | 16 |
+| 32 | 2.742 | 2.400 | 1.634 | 16 |
+| 64 | 4.073 | 3.507 | 2.100 | 16 |
+| 128 | 5.591 | 4.434 | 2.491 | 16 |
+| 512 | 17.675 | 10.086 | 4.337 | 32 |
+
+The columns are the total of the route, gate/up, down, and reduce stages. The
+WMMA route is 1.4x the Q8_1 route at 16 rows and 2.3x at 512 rows; the
+assignment tile in the last column is the table `SelectMoEPrefillPath` uses for
+that row class.
 
 These are kernel-pipeline numbers for a synthetic shape. End-to-end
 `qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 128, 512, and 2048
@@ -726,10 +740,10 @@ appear in the compiler's static figure.
 | `moe_down_grouped_kernel<*,8>` / `<Generic,4>` | 132-137 | 62-88 | 0 |
 | `moe_gate_up_selected_kernel<*>` / `moe_down_selected_kernel<*>` | 52-78 / 44-67 | 26-60 | 0 |
 | `moe_reduce_add_kernel` / `moe_shared_add_kernel` | 9 / 8 | 21 / 20 | 0 / 1,024 B |
-| `moe_gemm_mmq_kernel<*, 16, 128>` (six codebooks, both activation layouts) | 92-106 | 46-50 | 0 (22.5 KiB dynamic) |
-| `moe_gemm_mmq_kernel<*, 32, 128>` | 110-155 | 46-48 | 0 (25 KiB dynamic) |
-| `moe_gemm_mmq_kernel<*, 64, 128>` | 138-148 | 46-49 | 0 (30 KiB dynamic) |
-| `moe_gemm_mmq_kernel<*, 128, 64>` | 131-181 | 47-51 | 0 (15 KiB dynamic) |
+| `moe_gemm_mmq_kernel<*, 16, 128>` (six codebooks, both activation layouts) | 93-106 | 46-50 | 0 (22.5 KiB dynamic) |
+| `moe_gemm_mmq_kernel<*, 32, 128>` | 111-159 | 46-48 | 0 (25 KiB dynamic) |
+| `moe_gemm_mmq_kernel<*, 64, 128>` | 138-149 | 46-49 | 0 (30 KiB dynamic) |
+| `moe_gemm_mmq_kernel<*, 128, 64>` | 128-172 | 48-51 | 0 (15 KiB dynamic) |
 
 `moe_gate_up_grouped_kernel<Generic,4>` is the one listed kernel that spills:
 two SGPR slots and thirty VGPR slots. It is the scalar decoder for the eight

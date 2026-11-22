@@ -20,7 +20,11 @@ A later pass ([2026-11-22 record](#optimization-record-2026-11-22)) moves the
 512-output decode mats to the streaming family and the routed expert prefill to
 an int8 `dp4a` route: prefill reaches 723-751 tokens/s and decode 61.8-63.6
 tokens/s, 0.46-0.67 of the reference's prefill and 0.91-0.96 of its decode. The
-reference columns below are the 2026-11-19 measurements of this file.
+[int8 WMMA record](#optimization-record-2026-11-22-int8-wmma-expert-route) then
+replaces the routed-expert route with the grouped int8 WMMA tile: prefill
+reaches 949-1227 tokens/s and decode stays at 63-64 tokens/s, 0.68-0.79 of the
+reference's prefill and 0.96-0.97 of its decode. The reference columns below are
+the 2026-11-19 measurements of this file.
 
 ## Environment and protocol
 
@@ -396,6 +400,129 @@ and 62.2 ms for two runs of the four-lane build. The constant stays at four and
 the kernel is unchanged; the remaining 2.0 ms per layer is the per-row dependent
 FMA chain and the per-row `q`/`k`/`v` reads, which needs a different
 decomposition than a lane sweep.
+
+## Optimization record (2026-11-22, int8 WMMA expert route)
+
+The [attribution above](#what-remains) put the expert stage at 99.4 ms (128-row
+chunk) and 363.2 ms (512-row chunk) on the Q8_1 `dp4a` route, 91 and 25 GB/s of
+the 9.06 GB unique expert bytes against the reference's 182 GB/s. The grouped
+int8 WMMA tile of the dense prefill GEMM was already in the tree
+([kernels.md](../kernels.md#81-moe-expert-pipeline)); this pass took it to the
+IQ codebooks, tuned its weight decode, and made it the default route for the
+dtypes it serves.
+
+**The route.** `moe_gate_up_mmq` and `moe_down_mmq` keep the Q8_1 activation
+tile and the routed buckets and replace the per-assignment `dp4a` with
+16x16x16 int8 WMMA over an assignment tile. One block owns one expert and one
+128-channel tile and walks the expert's bucket in tiles of `n[5]` assignments,
+so one decoded weight tile serves the whole assignment tile.
+
+**The IQ decode.** The first form decoded eight values per codebook fetch and
+applied the codebook signs value by value. It now decodes one 32-value group per
+thread with `iq2xxs_dot32`, `iq2s_dot32`, and `iq3s_dot32`: the group header is
+fetched once instead of once per WMMA half, and the signs are applied word-wise
+with `(v ^ mask) + (mask & 0x01010101)`, which is exact because no codebook entry
+holds a zero digit (`tensor.TestIQGridDigitsAreNonZero`). A thread that owns a
+whole group also writes both halves' lane slots, so the group is decoded once
+rather than twice.
+
+**The assignment tile.** The tile width is now a measured table instead of the
+bucket mean: 16 up to 384 rows, 32 from 512 to 2048, and 64 from 4096. The table
+below is the same harness and protocol as
+[benchmarks.md](../benchmarks.md#grouped-moe-pipeline), three runs per cell with
+the median reported, at the shape of this model (256 experts, top-8, hidden
+2048, expert FFN 512, IQ2_XXS gate/up and down):
+
+| Chunk rows | Tile | Gate/up ms | Down ms | Total ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 16 | 1.611 | 0.677 | 2.485 |
+| 128 | 32 | 2.254 | 0.966 | 3.433 |
+| 128 | 64 | 3.604 | 1.579 | 5.363 |
+| 128 | 128 | 6.359 | 3.130 | 9.719 |
+| 512 | 16 | 2.425 | 1.318 | 4.284 |
+| 512 | 32 | 2.416 | 1.334 | 4.351 |
+| 512 | 64 | 3.633 | 1.808 | 5.966 |
+| 512 | 128 | 6.744 | 3.644 | 10.945 |
+| 1024 | 32 | 3.590 | 2.485 | 7.176 |
+| 2048 | 32 | 6.135 | 5.487 | 13.365 |
+| 4096 | 64 | 10.580 | 12.673 | 26.351 |
+
+The synthetic sweep ties at 512 rows, so that boundary came from the same-session
+A/B below: routing in the real model concentrates more assignments per expert
+than a random draw, and the 16-wide tile then needs a second weight pass. The
+128-wide tile loses everywhere because the narrow channel tile doubles the block
+count, and 16 wins below 512 rows because a wider tile doubles the token tiles of
+MMA for a bucket that one 16-wide tile already covers.
+
+**Same-session A/B.** `TestGPUProfileMoE` with `YUUKA_TEST_MOE_ROUTE=q8|mmq`, one
+session per route, F16 KV, same prompt:
+
+| Measurement | Q8_1 `dp4a` | int8 WMMA | ratio |
+| --- | ---: | ---: | ---: |
+| expert stage, 128-row chunk | 98.8 ms | 58.4 | 1.69x |
+| expert stage, 512-row chunk | 354.8 ms | 142.1 | 2.50x |
+| `moe_gate_up` (`*_q8` / `*_mmq`), 512-row chunk | 160.2 ms | 93.1 | 1.72x |
+| `moe_down` (`*_q8` / `*_mmq`), 512-row chunk | 194.6 ms | 49.0 | 3.97x |
+| chunk wall clock, 128 rows | 182.9 ms | 141.6 | 1.29x |
+| chunk wall clock, 512 rows | 644.1 ms | 415.3 | 1.55x |
+| decode step wall clock | 19.28 ms | 19.26 | 1.00x |
+
+Two runs per route in one session, so the stage sums move by a few percent
+between runs; the ratios are stable within 4%.
+
+**End to end.** `yuuka bench --backend hip --warmup 1 --reps 3`, F16 KV, greedy,
+one request, chunk 512:
+
+| Measurement | previous record | this pass | ratio | llama.cpp |
+| --- | ---: | ---: | ---: | ---: |
+| prefill 128 tokens | 733.5 | 949.3 | 1.29x | 1092.24 |
+| prefill 512 tokens | 751.0 | 1226.9 | 1.63x | 1600.79 |
+| prefill 2048 tokens | 723.3 | 1065.1 | 1.47x | 1558.81 |
+| decode, 128-token prompt | 63.5 | 63.0-64.0 | 1.00x | 65.98 |
+
+The prefill cells moved 1.29-1.63x; the 2048-token cell is the slowest of the
+three because its four 512-row chunks pay the growing attention cost, which this
+pass does not touch. Decode is unchanged to within run-to-run noise, as the
+expert decode kernels were not touched.
+
+### Targets and what was missed
+
+The pass targeted an expert stage of 60 ms at 128 rows and 90 ms at 512 rows,
+that is the 37 ms weight-read floor with a small margin.
+
+| Item | Before | Target | Measured | Result |
+| --- | ---: | ---: | ---: | --- |
+| expert stage, 128 rows | 99.4 ms | <= 60 | 58.4 | met |
+| expert stage, 512 rows | 363.2 ms | <= 90 | 142.1 | missed, 2.5x better than before |
+| prefill 128 | 733.5 tok/s | >= 900 | 949.3 | met |
+| prefill 512 | 751.0 tok/s | >= 1100 | 1226.9 | met |
+| prefill 2048 | 723.3 tok/s | >= 1100 | 1065.1 | missed, 1.47x better than before |
+| decode | 63.5 tok/s | no regression | 63.0-64.0 | met |
+| first-token logit diff vs CPU | 0.0029 | <= 0.0035 | 0.0029 | met |
+
+The two misses have separate causes, and neither is the weight read:
+
+- **512-row expert stage.** Unique expert bytes per chunk pass are the same at
+  128 and 512 rows (one weight pass per expert either way), so the difference is
+  not bandwidth but the work around it: 150 GB/s of unique weight bytes at 128
+  rows against 61 GB/s at 512 rows. A diagnostic run of the same kernel with the
+  weight staging disabled puts the split per layer at 0.65 ms of activation
+  gather, MMA, and epilogue work against 0.96 ms of weight staging for a 128-row
+  chunk, and 1.25 against 1.20 ms at 512 rows. The 512-row chunk doubles the
+  activation work because a 32-wide assignment tile is two token tiles of MMA,
+  quadruples the gathered activation bytes, and quadruples the expert-output
+  traffic (gate/up write 16.8 MB and down writes 33.5 MB per layer at 512 rows
+  against 4.2 and 8.4 MB at 128 rows). The next lever is the fused
+  gate/up/SwiGLU/quantize epilogue, which removes the 16.8 MB write and read of
+  the gate/up tiles per layer; that is the optional PR4 of this plan and is not
+  claimed here. A wider channel tile (two accumulator fragment sets per warp,
+  halving the block count and the activation re-gather) is the other candidate;
+  it was not measured, and the channel tile still follows the assignment tile as
+  the warp decomposition requires.
+- **2048-token prefill.** The 512-row chunk that composes it is 1226.9 tok/s on
+  its own; the 2048-token run pays the attention cost of a 4x longer context in
+  its later chunks. The attention kernels are recorded in
+  [kernels.md](../kernels.md#75-fp16-mma-paged-prefill-attention) and are outside this pass.
 
 ## Correctness gates
 
