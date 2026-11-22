@@ -671,6 +671,13 @@ dispatch decision, not a constant; the table above is synthetic, and the tile
 table for the target model belongs with its own record in
 [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md).
 
+`--route q8` runs the same shape through the Q8_1 `dp4a` pipeline, and
+`--dtype q4_k|q5_k|q6_k|iq2xxs|iq2s|iq3s` selects the synthetic expert codebook
+for either quantized route, so one binary covers the two quantized forms per
+codebook. The IQ2_XXS, IQ2_S, and IQ3_S cells are not recorded yet: the tile
+table for the target model's IQ experts belongs with the same record as the
+K-quant table.
+
 These are kernel-pipeline numbers for a synthetic shape. End-to-end
 `qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 128, 512, and 2048
 prefill tokens and 128 decode tokens, next to llama.cpp on the same protocol,
@@ -719,6 +726,10 @@ appear in the compiler's static figure.
 | `moe_down_grouped_kernel<*,8>` / `<Generic,4>` | 132-137 | 62-88 | 0 |
 | `moe_gate_up_selected_kernel<*>` / `moe_down_selected_kernel<*>` | 52-78 / 44-67 | 26-60 | 0 |
 | `moe_reduce_add_kernel` / `moe_shared_add_kernel` | 9 / 8 | 21 / 20 | 0 / 1,024 B |
+| `moe_gemm_mmq_kernel<*, 16, 128>` (six codebooks, both activation layouts) | 92-106 | 46-50 | 0 (22.5 KiB dynamic) |
+| `moe_gemm_mmq_kernel<*, 32, 128>` | 110-155 | 46-48 | 0 (25 KiB dynamic) |
+| `moe_gemm_mmq_kernel<*, 64, 128>` | 138-148 | 46-49 | 0 (30 KiB dynamic) |
+| `moe_gemm_mmq_kernel<*, 128, 64>` | 131-181 | 47-51 | 0 (15 KiB dynamic) |
 
 `moe_gate_up_grouped_kernel<Generic,4>` is the one listed kernel that spills:
 two SGPR slots and thirty VGPR slots. It is the scalar decoder for the eight

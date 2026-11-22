@@ -134,7 +134,7 @@ hard-coded from another GPU.
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
 | `moe_route` / `moe_gate_up_grouped` / `moe_down_grouped` | Sparse MoE prefill | Top-k routing, per-expert assignment bins, packed expert reads |
 | `moe_gate_up_q8` / `moe_down_q8` | Sparse MoE prefill, IQ experts | Q8_1 activation tile, int8 `dp4a`, sixteen-assignment tile |
-| `moe_gate_up_mmq` / `moe_down_mmq` | Sparse MoE prefill, K-quant experts | Q8_1 activation tile, int8 WMMA, 16-128 assignment tile, gather/scatter through the routed bucket |
+| `moe_gate_up_mmq` / `moe_down_mmq` | Sparse MoE prefill, K-quant and IQ experts | Q8_1 activation tile, int8 WMMA, 16-128 assignment tile, gather/scatter through the routed bucket |
 | `moe_gate_up_selected` / `moe_down_selected` / `moe_shared_add` | Sparse MoE decode | One grid per routing slot, no binning, sigmoid-gated shared expert |
 | `sampling` | Output | GPU sampling or a low-cost host path |
 
@@ -1135,16 +1135,50 @@ WMMA of the dense MMQ GEMM, staged through
   of one expert, `ceil(rows*used/experts)`, so one weight pass covers a bucket at
   every measured chunk size.
 
-`tests/hip/moe_mmq_test.cpp` pins the route for Q4_K and Q6_K experts, whose
-scale layouts differ (per 32 values with a row minimum, and per 16 values
+The IQ expert codebooks enter the same tile through a span hook,
+`yuuka_mmq::stage_weights_with`: the fragment mapping (warp to fragment-pair
+region, lane to 16-byte slot) is the dense GEMM's, while the eight-value decode
+comes from the `iq2xxs_dot8`, `iq2s_dot8`, and `iq3s_dot8` forms of
+`kernels/hip/iq_decode.cuh`. The staged digits are therefore the ones the dp4a
+route and the FP32 reference path see, and only the scale slot rule differs per
+codebook:
+
+| codebook | weight scale | `kSlicesPerScale` | minimum term |
+| --- | --- | ---: | --- |
+| Q4_K / Q5_K | one per 32 values | 2 | per-row minimum |
+| Q6_K | one per 16 values | 1 | none |
+| IQ2_XXS | one per 32 values | 2 | none |
+| IQ2_S | one per 16 values (low/high nibble of `sc[ib32]`) | 1 | none |
+| IQ3_S | one per 32 values | 2 | none |
+
+`tests/hip/moe_mmq_test.cpp` pins the K-quant form for Q4_K and Q6_K experts,
+whose scale layouts differ (per 32 values with a row minimum, and per 16 values
 without), at assignment tiles 16, 32, 64, and 128, and at bucket sizes that do
 not fill the tile. The projections are compared against a host computation over
 the dequantized weights and the same Q8_1 values (measured 1e-6 relative), and
-the down projection over the device SwiGLU tile. The route is a plan-build-time
-decision (`SelectMoEPrefillPath`), gated by `Options.MoEMMQ`: it serves the
-K-quant expert dtypes, the IQ codebooks keep the dp4a route until they have a
-decoder in this tile layout, and enabling it by default waits for the recorded
-tile sweep (`docs/benchmarks.md`, grouped MoE pipeline).
+the down projection over the device SwiGLU tile.
+
+`tests/hip/iq_moe_mmq_test.cpp` pins the IQ form for all three codebooks at the
+same tile widths. The expert rows are built from the first block of each codebook
+in the Qwen3.6 IQ2_XXS GGUF, and each bucket size (1, `J-1`, `J`, `J+1`, and
+`3J+5` assignments, plus an empty bucket) is written directly into the routing
+arrays, because a bucket that owns more than half of the assignments cannot come
+from one top-k chunk. The gate and up projections are compared element by
+element against the dp4a route over the same Q8_1 tile (measured 3e-8 relative),
+which pins the digits, the scale slot, and the scatter; the down projection is
+compared over the same Q8_1 SwiGLU tile (measured 1e-9 relative); and the whole
+pipeline is compared against a host computation over the `yuuka_dequant_f16`
+decode of the same blocks (2e-2). The IQ2_S rows are built with the two nibbles
+of each group scale byte at opposite extremes (0 and 15, a 31x scale difference
+between the two 16-value halves), so applying that scale per 32 values instead
+of per 16 fails the test.
+
+The route is a plan-build-time decision (`SelectMoEPrefillPath`), gated by
+`Options.MoEMMQ`: it serves the K-quant and the IQ2_XXS/IQ2_S/IQ3_S expert
+dtypes, and enabling it by default waits for the recorded tile sweep
+(`docs/benchmarks.md`, grouped MoE pipeline). On the real model it reproduces the
+golden four-token continuation and the chunk-invariant first token of the Q8_1
+route (`TestGPUMoEMmqMatchesQ8`, `TestGPUChunkedPrefillLongContext`).
 
 The grouped grid is the prefill form. At one token it would launch
 `experts * ffn` blocks, of which only `used * ffn` correspond to selected

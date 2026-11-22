@@ -16,7 +16,8 @@ treated as format and correctness references only.
 > Phase 5 adds F16/Q8_0 KV formats, greedy prompt-lookup speculative decoding,
 > Q4_0/Q5_0 tensors, and the `qwen35moe` hybrid MoE architecture on both the CPU
 > reference and the HIP decoder, including on-device IQ2_XXS/IQ2_S/IQ3_S expert
-> decoding and an opt-in int8 WMMA expert prefill route for K-quant experts.
+> decoding and an opt-in int8 WMMA expert prefill route for K-quant and IQ
+> experts.
 > NPU support is a
 > future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
 > and does not execute model operations. All first-release success criteria are
@@ -161,8 +162,8 @@ Implemented and tested:
   explicitly. MoE prefill decodes the expert digits to int8 and dots them
   against a Q8_1 activation tile with `dp4a` for chunks of at least sixteen
   rows, keeps the FP32 form for every other shape and dtype, and has an opt-in
-  int8 WMMA form for the K-quant expert dtypes whose dispatch table is still a
-  derivation.
+  int8 WMMA form for the K-quant and IQ expert dtypes whose dispatch table is
+  still a derivation.
 - An opt-in prefill attribution profile (`TestGPUProfilePrefill`) that records
   per-operation time for a 512-token chunk at positions 0, 2048, and 7680.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
@@ -190,10 +191,10 @@ Implemented and tested:
   token; the prefill path runs the grouped kernels over the binned expert
   assignments. Both decode the IQ codebooks eight values per codebook fetch and
   reduce within a warp, and the grouped path reuses one decoded weight span
-  across a tile of assignments. The K-quant expert dtypes additionally have an
-  opt-in int8 WMMA grouped route (`Options.MoEMMQ`) that replaces the
-  per-assignment `dp4a` with the dense MMQ GEMM's int8 tiles; it stays opt-in
-  until its assignment-tile table is measured (see
+  across a tile of assignments. The K-quant and the IQ expert dtypes
+  additionally have an opt-in int8 WMMA grouped route (`Options.MoEMMQ`) that
+  replaces the per-assignment `dp4a` with the dense MMQ GEMM's int8 tiles; it
+  stays opt-in until its assignment-tile table is measured (see
   [kernels.md](kernels.md#81-moe-expert-pipeline)).
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.

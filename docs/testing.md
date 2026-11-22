@@ -608,6 +608,14 @@ YUUKA_TEST_MOE_MODEL=/path/to/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf \
   go test -tags hip ./engine/gpu -run TestGPUMoE -count=1 -timeout 60m
 ```
 
+`YUUKA_TEST_MOE_ROUTE=mmq|q8` selects the routed-expert prefill route for
+`TestGPUMoEGoldenGeneration`, `TestGPUMoEChunkedPrefill`, `TestGPUProfileMoE`,
+`TestGPUMoEMmqMatchesQ8`, and `TestGPUChunkedPrefillLongContext` (with
+`YUUKA_TEST_MODEL` pointing at the MoE GGUF). Unset and `q8` keep the released
+Q8_1 `dp4a` route; `mmq` enables `Options.MoEMMQ`. `TestGPUMoEMmqMatchesQ8`
+requires both routes to produce the same first-token logits, a difference of at
+most 0.05, and the golden continuation `[11751, 11, 264, 3177]`.
+
 The real-model suite covers GGUF loading, tokenizer golden IDs, greedy golden
 token sequences, determinism, logits tolerance against a llama.cpp CPU
 reference, layer-by-layer hidden-state comparison, the paged HIP executor, KV
@@ -623,8 +631,15 @@ matrices, the Q8_1 int8 expert pipeline (compared against a host computation
 over the dequantized Q8_1 activations), the int8 WMMA expert pipeline for Q4_K
 and Q6_K experts at assignment tiles 16, 32, 64, and 128 with partially filled
 buckets (`hip_moe_mmq_correctness`, projections compared against a host
-computation over the dequantized weights and the same Q8_1 values), and the
-shared-expert accumulation. The
+computation over the dequantized weights and the same Q8_1 values), the same
+pipeline for the IQ2_XXS, IQ2_S, and IQ3_S codebooks (`hip_iq_moe_mmq_correctness`,
+expert rows built from the first block of each codebook of the Qwen3.6 GGUF,
+bucket sizes of 1, `J-1`, `J`, `J+1`, and `3J+5` assignments plus an empty
+bucket, gate/up and down compared element by element against the dp4a route over
+the same Q8_1 tiles at a 1e-5 relative bound, and the pipeline against a host
+computation over the `yuuka_dequant_f16` decode at 2e-2; the IQ2_S rows carry
+opposite extremes in the two nibbles of each group scale byte, so a per-32
+scale application fails), and the shared-expert accumulation. The
 real-model HIP tests use an F32 KV pool so the expert arithmetic is compared
 without KV storage rounding.
 
