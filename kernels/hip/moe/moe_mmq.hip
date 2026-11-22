@@ -40,7 +40,6 @@ using yuuka_mmq::kPairBytes;
 using yuuka_mmq::kSpan;
 using yuuka_mmq::set_fragment;
 using yuuka_mmq::stage_weights;
-using yuuka_mmq::stage_weights_with;
 
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
@@ -67,52 +66,86 @@ constexpr bool iq_scale_per_16() {
     return DType == YUUKA_DTYPE_IQ2_S;
 }
 
-// stage_iq_weight_span decodes eight IQ expert values into packed int8 digits
-// and stages the codebook block scale of the 16-value slice they belong to.
-// The digits are the same ones the iq*_span8 forms produce, because the dot8
-// forms read the same codebook entry, sign word, and scale expression.
+// stage_iq_weights stages the kTileI x kStepK IQ weight tile. One thread owns one
+// (row, 32-value group) task: it fetches that group's header once, decodes all
+// thirty-two values, and writes both WMMA halves' 16-byte lane slots plus the
+// two scale entries of the group. The dense K-quant staging is per lane slot
+// instead, which fetches the same group header twice (once per half); here a
+// group costs one header fetch per row and one codebook fetch per eight values.
 template <uint32_t DType, int kTileI, int kStepK>
-__device__ __forceinline__ int2 stage_iq_weight_span(const uint8_t * row, int64_t k,
-                                                     float * scale_a, int row_index) {
-    int32_t w[2];
-    float scale = 0.0f;
-    if constexpr (DType == YUUKA_DTYPE_IQ2_XXS) {
-        iq2xxs_dot8(row + (k / 256) * 66, static_cast<int>(k % 256), w, scale);
-    } else if constexpr (DType == YUUKA_DTYPE_IQ2_S) {
-        iq2s_dot8(row + (k / 256) * 82, static_cast<int>(k % 256), w, scale);
-    } else {
-        static_assert(DType == YUUKA_DTYPE_IQ3_S,
-                      "the IQ expert staging serves IQ2_XXS, IQ2_S, and IQ3_S");
-        iq3s_dot8(row + (k / 256) * 110, static_cast<int>(k % 256), w, scale);
+__device__ __forceinline__ void stage_iq_weights(int8_t * tile_a, float * scale_a,
+                                                 const uint8_t * w, uint64_t row_bytes,
+                                                 int64_t n0, int64_t n_out, int64_t k0) {
+    constexpr int kPairsPerStep = kStepK / 32;
+    constexpr int kTasks = kTileI * kPairsPerStep;
+    constexpr int kTasksPerThread = (kTasks + kThreads - 1) / kThreads;
+    constexpr uint64_t kBlockBytes = DType == YUUKA_DTYPE_IQ2_XXS ? 66
+                                   : DType == YUUKA_DTYPE_IQ2_S   ? 82
+                                                                  : 110;
+    #pragma unroll
+    for (int i = 0; i < kTasksPerThread; ++i) {
+        const int task = threadIdx.x + i * kThreads;
+        if (task >= kTasks) {
+            continue;
+        }
+        // Threads cover rows first, so consecutive threads of a warp stage
+        // consecutive rows and the group index is spread over the block.
+        const int row = task % kTileI;
+        const int pair = task / kTileI;
+        const int group = row / kFragRows;
+        const int row_in_frag = row % kFragRows;
+        int8_t * low = tile_a + fragment_offset<false, kPairsPerStep>(
+                                    group, pair, row_in_frag, 0);
+        int8_t * high = tile_a + fragment_offset<false, kPairsPerStep>(
+                                    group, pair, row_in_frag, kSpan);
+        const int64_t gn = n0 + row;
+        if (gn >= n_out) {
+            // The planned shapes fill the channel tile, so this only guards a
+            // tile the ABI rejects; a zero row contributes nothing.
+            *reinterpret_cast<int4 *>(low) = make_int4(0, 0, 0, 0);
+            *reinterpret_cast<int4 *>(high) = make_int4(0, 0, 0, 0);
+            continue;
+        }
+        const uint8_t * row_ptr = w + gn * row_bytes;
+        const int64_t k = k0 + static_cast<int64_t>(pair) * 32;
+        const int j = static_cast<int>(k % 256);
+        const uint8_t * blk = row_ptr + (k / 256) * kBlockBytes;
+        int32_t w8[8];
+        float scale_lo = 0.0f;
+        float scale_hi = 0.0f;
+        if constexpr (DType == YUUKA_DTYPE_IQ2_XXS) {
+            iq2xxs_dot32(blk, j, w8, scale_lo, scale_hi);
+        } else if constexpr (DType == YUUKA_DTYPE_IQ2_S) {
+            iq2s_dot32(blk, j, w8, scale_lo, scale_hi);
+        } else {
+            static_assert(DType == YUUKA_DTYPE_IQ3_S,
+                          "the IQ expert staging serves IQ2_XXS, IQ2_S, and IQ3_S");
+            iq3s_dot32(blk, j, w8, scale_lo, scale_hi);
+        }
+        // Runs 0 and 2 fill the first WMMA half's lane slot (values 0..7 and
+        // 16..23) and runs 1 and 3 the second (values 8..15 and 24..31).
+        *reinterpret_cast<int4 *>(low) = make_int4(w8[0], w8[1], w8[4], w8[5]);
+        *reinterpret_cast<int4 *>(high) = make_int4(w8[2], w8[3], w8[6], w8[7]);
+        // The scale tiles are indexed per 16-value slice of the staged K step, so
+        // the two slices of the group write their own entry; a per-32 codebook
+        // carries one scale and writes it to both.
+        const int slice = static_cast<int>(k % kStepK) / 16;
+        scale_a[slice * kTileI + row] = scale_lo;
+        scale_a[(slice + 1) * kTileI + row] = scale_hi;
     }
-    // The scale tiles are indexed per 16-value slice of the staged K step, so a
-    // per-16 codebook writes the slice of its span and a per-32 codebook fills
-    // both slices of its group with the one scale it carries.
-    const int slice = static_cast<int>((k % kStepK) / 16);
-    if constexpr (iq_scale_per_16<DType>()) {
-        scale_a[slice * kTileI + row_index] = scale;
-    } else {
-        scale_a[(slice & ~1) * kTileI + row_index] = scale;
-        scale_a[((slice & ~1) + 1) * kTileI + row_index] = scale;
-    }
-    return make_int2(w[0], w[1]);
 }
 
 // stage_weight_tile stages the weight tile with the decoder of the dtype's
-// family: the shared K-quant span for Q4_K/Q5_K/Q6_K, and the IQ span above for
-// the codebooks. The fragment mapping is the same call either way.
+// family: the shared K-quant span for Q4_K/Q5_K/Q6_K, and the IQ group staging
+// above for the codebooks. Both fill the same fragment layout.
 template <uint32_t DType, int kTileI, int kStepK>
 __device__ __forceinline__ void stage_weight_tile(int8_t * tile_a, float * scale_a,
                                                   const uint8_t * w,
                                                   uint64_t row_bytes, int64_t n0,
                                                   int64_t n_out, int64_t k0) {
     if constexpr (is_iq_codebook<DType>()) {
-        stage_weights_with<kTileI, kStepK, kThreads>(
-            tile_a, scale_a, w, row_bytes, n0, n_out, k0,
-            [](const uint8_t * row, int64_t k, float * scales, int row_index) {
-                return stage_iq_weight_span<DType, kTileI, kStepK>(row, k, scales,
-                                                                  row_index);
-            });
+        stage_iq_weights<DType, kTileI, kStepK>(tile_a, scale_a, w, row_bytes, n0, n_out,
+                                                k0);
     } else {
         stage_weights<DType, kTileI, kStepK, kThreads>(tile_a, scale_a, w, row_bytes,
                                                        n0, n_out, k0);

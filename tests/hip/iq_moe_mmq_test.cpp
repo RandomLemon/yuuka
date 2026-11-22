@@ -507,9 +507,14 @@ int check_case(context & ctx, uint32_t dtype, int tile_j) {
     // The dp4a route and the WMMA route decode the same digits and consume the
     // same Q8_1 values, so an element-by-element comparison at the same slot
     // positions pins the staged digits, the scale slot, and the scatter.
+    std::printf("  cell dtype %u rows %d tile_j %d\n", dtype, rows, tile_j);
+    std::fflush(stdout);
     float gate_route = 0.0f, gate_scale = 1.0f, up_route = 0.0f, up_scale = 1.0f;
     worst_diff(gate_mmq, gate_q8, gate_route, gate_scale);
     worst_diff(up_mmq, up_q8, up_route, up_scale);
+    std::printf("  gate q8 %.4g/%.4g up q8 %.4g/%.4g\n", gate_route, gate_scale,
+                up_route, up_scale);
+    std::fflush(stdout);
     CHECK(gate_route <= 1e-5f * gate_scale);
     CHECK(up_route <= 1e-5f * up_scale);
 
@@ -594,6 +599,7 @@ int check_case(context & ctx, uint32_t dtype, int tile_j) {
                 counts_host[3], counts_host[4], gate_route, gate_scale, gate_ref_diff,
                 gate_ref_scale, up_route, up_scale, up_ref_diff, up_ref_scale,
                 down_route, down_scale, down_ref_diff, down_ref_scale);
+    std::fflush(stdout);
     return 0;
 }
 

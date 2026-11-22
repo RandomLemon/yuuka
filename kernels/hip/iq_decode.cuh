@@ -9,7 +9,10 @@
 
 namespace {
 
-__device__ __constant__ uint8_t k_ksigns_iq2xs[128] = {
+// The sign table is constexpr because the IQ2_XXS sign masks below are derived
+// from it at compile time; device code that decodes value by value still reads
+// it directly.
+constexpr uint8_t k_ksigns_iq2xs[128] = {
     0, 129, 130, 3,
     132, 5, 6, 135,
     136, 9, 10, 139,
@@ -641,6 +644,126 @@ __device__ __forceinline__ void iq3s_dot8(const uint8_t * blk, int j,
     }
     w[0] = iq_pack4_i8(digit[0], digit[1], digit[2], digit[3]);
     w[1] = iq_pack4_i8(digit[4], digit[5], digit[6], digit[7]);
+}
+
+// SignMasks expands a sign pattern into the byte masks a branch-free
+// conditional negate needs: 0xFF for a value the group negates and 0x00
+// otherwise, two 32-bit words per eight values. IQ2_S and IQ3_S select the
+// pattern with a byte and a nibble, so they index the identity table; IQ2_XXS
+// selects a seven-bit index into k_ksigns_iq2xs and gets the expansion of that
+// entry instead, which keeps its per-group sign to one 8-byte load.
+struct SignMasks {
+    uint32_t iq2xxs[128][2];
+    uint32_t byte[256][2];
+    constexpr SignMasks() : iq2xxs(), byte() {
+        for (int i = 0; i < 128; ++i) {
+            for (int j = 0; j < 8; ++j) {
+                if (((k_ksigns_iq2xs[i] >> j) & 1) != 0) {
+                    iq2xxs[i][j / 4] |= uint32_t(0xFF) << (8 * (j % 4));
+                }
+            }
+        }
+        for (int i = 0; i < 256; ++i) {
+            for (int j = 0; j < 8; ++j) {
+                if (((i >> j) & 1) != 0) {
+                    byte[i][j / 4] |= uint32_t(0xFF) << (8 * (j % 4));
+                }
+            }
+        }
+    }
+};
+
+__device__ const SignMasks k_sign_masks{};
+
+// iq_sign_bytes applies a sign mask to the four digits packed in one word. The
+// two's-complement negate of a byte is (v ^ 0xFF) + 1, so the whole word is
+// (v ^ mask) + (mask & 0x01010101) as long as no byte carries into its
+// neighbour: that needs every input digit to be nonzero, which holds for all
+// three codebooks (tensor/iq_test.go pins it against the same tables). A digit
+// error here would be caught by the per-codebook tests that compare the int8
+// route against the dequantized reference.
+__device__ __forceinline__ int32_t iq_sign_bytes(uint32_t digits, uint32_t mask) {
+    return static_cast<int32_t>((digits ^ mask) + (mask & 0x01010101u));
+}
+
+// The dot32 forms decode the thirty-two values of one codebook group, which is
+// one thread's share of a staged row: the group header, the scale, and the sign
+// words are fetched once and the digits are sign-applied word-wise instead of
+// value by value. w[2*l] and w[2*l + 1] hold the eight values of run l (values
+// 8*l .. 8*l + 7) in the little-endian byte order the int8 WMMA operand needs,
+// and the caller writes run 0 and 2 to one WMMA half's lane slot and runs 1 and
+// 3 to the other.
+//
+// scale_lo belongs to the first sixteen-value slice of the group (runs 0 and 1)
+// and scale_hi to the second (runs 2 and 3); IQ2_XXS and IQ3_S carry one scale
+// per 32 values, so both receive the same value and IQ2_S carries one per 16.
+__device__ __forceinline__ void iq2xxs_dot32(const uint8_t * blk, int j, int32_t (&w)[8],
+                                             float & scale_lo, float & scale_hi) {
+    const float d = load_f16_device(blk);
+    const int ib32 = j / 32;
+    const uint8_t * p = blk + 2 + 8 * ib32;
+    uint32_t aux0, aux1;
+    __builtin_memcpy(&aux0, p, 4);
+    __builtin_memcpy(&aux1, p + 4, 4);
+    scale_lo = d * (0.5f + static_cast<float>(aux1 >> 28)) * 0.25f;
+    scale_hi = scale_lo;
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t grid = k_iq2xxs_grid[(aux0 >> (8 * l)) & 0xFF];
+        const uint32_t sign = (aux1 >> (7 * l)) & 127;
+        w[2 * l] = iq_sign_bytes(static_cast<uint32_t>(grid),
+                                 k_sign_masks.iq2xxs[sign][0]);
+        w[2 * l + 1] = iq_sign_bytes(static_cast<uint32_t>(grid >> 32),
+                                     k_sign_masks.iq2xxs[sign][1]);
+    }
+}
+
+__device__ __forceinline__ void iq2s_dot32(const uint8_t * blk, int j, int32_t (&w)[8],
+                                           float & scale_lo, float & scale_hi) {
+    const float d = load_f16_device(blk);
+    const int ib32 = j / 32;
+    const uint8_t * qs = blk + 2, * qh = blk + 66, * sc = blk + 74;
+    const uint8_t * signs = qs + 32;
+    const uint8_t s = sc[ib32];
+    scale_lo = d * (0.5f + static_cast<float>(s & 0xF)) * 0.25f;
+    scale_hi = d * (0.5f + static_cast<float>(s >> 4)) * 0.25f;
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint16_t idx = static_cast<uint16_t>(qs[4 * ib32 + l]) |
+            static_cast<uint16_t>((static_cast<uint16_t>(qh[ib32]) << (8 - 2 * l)) & 0x300);
+        const uint32_t sign = signs[4 * ib32 + l];
+        const uint64_t grid = k_iq2s_grid[idx];
+        w[2 * l] = iq_sign_bytes(static_cast<uint32_t>(grid),
+                                 k_sign_masks.byte[sign][0]);
+        w[2 * l + 1] = iq_sign_bytes(static_cast<uint32_t>(grid >> 32),
+                                     k_sign_masks.byte[sign][1]);
+    }
+}
+
+// IQ3_S holds two four-value codebook entries per eight-value run and one scale
+// byte per two 32-value groups, so one dot32 needs eight grid fetches.
+__device__ __forceinline__ void iq3s_dot32(const uint8_t * blk, int j, int32_t (&w)[8],
+                                           float & scale_lo, float & scale_hi) {
+    const float d = load_f16_device(blk);
+    const int ib32 = j / 32;
+    const uint8_t * qs = blk + 2, * qh = blk + 66, * signs = blk + 74;
+    const uint8_t * scales = blk + 106;
+    const uint8_t s = scales[ib32 / 2];
+    scale_lo = d * (1.0f + 2.0f *
+                    static_cast<float>((ib32 & 1) ? (s >> 4) : (s & 0xF)));
+    scale_hi = scale_lo;
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint16_t idx_lo = static_cast<uint16_t>(qs[ib32 * 8 + 2 * l]) |
+            static_cast<uint16_t>((static_cast<uint16_t>(qh[ib32]) << (8 - 2 * l)) & 0x100);
+        const uint16_t idx_hi = static_cast<uint16_t>(qs[ib32 * 8 + 2 * l + 1]) |
+            static_cast<uint16_t>((static_cast<uint16_t>(qh[ib32]) << (7 - 2 * l)) & 0x100);
+        const uint32_t sign_byte = signs[ib32 * 4 + l];
+        w[2 * l] = iq_sign_bytes(k_iq3s_grid[idx_lo],
+                                 k_sign_masks.byte[sign_byte & 0xF][0]);
+        w[2 * l + 1] = iq_sign_bytes(k_iq3s_grid[idx_hi],
+                                     k_sign_masks.byte[sign_byte >> 4][0]);
+    }
 }
 
 // The span8 forms decode eight consecutive values that start at a multiple of

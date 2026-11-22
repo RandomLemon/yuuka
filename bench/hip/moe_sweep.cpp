@@ -138,6 +138,7 @@ int main(int argc, char ** argv) {
     const char * route = "fp32";
     const char * dtype = "q4_k";
     int tile_j = 16;
+    int experts = 128, used = 8, hidden = 2048, ffn = 768;
     std::vector<int> row_sweep{1, 2, 4, 8, 16, 32};
     for (int arg = 1; arg < argc; ++arg) {
         const std::string_view flag(argv[arg]);
@@ -145,6 +146,14 @@ int main(int argc, char ** argv) {
             route = argv[++arg];
         } else if (flag == "--tile-j" && arg + 1 < argc) {
             tile_j = std::atoi(argv[++arg]);
+        } else if (flag == "--experts" && arg + 1 < argc) {
+            experts = std::atoi(argv[++arg]);
+        } else if (flag == "--used" && arg + 1 < argc) {
+            used = std::atoi(argv[++arg]);
+        } else if (flag == "--hidden" && arg + 1 < argc) {
+            hidden = std::atoi(argv[++arg]);
+        } else if (flag == "--ffn" && arg + 1 < argc) {
+            ffn = std::atoi(argv[++arg]);
         } else if (flag == "--dtype" && arg + 1 < argc) {
             dtype = argv[++arg];
         } else if (flag == "--rows" && arg + 1 < argc) {
@@ -168,7 +177,8 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr,
                          "usage: %s [--route fp32|q8|mmq] [--dtype q4_k|q5_k|q6_k|"
                          "iq2xxs|iq2s|iq3s] [--tile-j 16|32|64|128] "
-                         "[--rows 16,32,64]\n",
+                         "[--rows 16,32,64] [--experts 256] [--used 8] "
+                         "[--hidden 2048] [--ffn 512]\n",
                          argv[0]);
             return 2;
         }
@@ -192,7 +202,6 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    const int experts = 128, used = 8, hidden = 2048, ffn = 768;
     const uint64_t hidden_row = row_bytes(hidden, dtype);
     const uint64_t ffn_row = row_bytes(ffn, dtype);
     const uint32_t weight_dtype = dtype_id(dtype);

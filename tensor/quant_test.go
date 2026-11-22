@@ -201,6 +201,36 @@ func TestIQDTypeCapabilities(t *testing.T) {
 	}
 }
 
+// TestIQGridDigitsAreNonZero pins the precondition of the branch-free sign
+// application in the HIP IQ decoders: they negate a packed four-digit word with
+// (v ^ mask) + (mask & 0x01010101), which carries into the neighbouring byte if
+// a digit is zero. Every entry is therefore checked to hold a nonzero digit in
+// each byte, and the digits are checked to stay in signed int8 range so the int8
+// WMMA operand can carry them.
+func TestIQGridDigitsAreNonZero(t *testing.T) {
+	check := func(name string, index int, word uint64, bytes int) {
+		for j := 0; j < bytes; j++ {
+			digit := uint8(word >> (8 * j))
+			if digit == 0 {
+				t.Fatalf("%s grid[%d] byte %d is zero; the sign negate carries",
+					name, index, j)
+			}
+			if digit > 127 {
+				t.Fatalf("%s grid[%d] byte %d is %d, outside int8", name, index, j, digit)
+			}
+		}
+	}
+	for i, word := range iq2xxs_grid {
+		check("IQ2_XXS", i, word, 8)
+	}
+	for i, word := range iq2s_grid {
+		check("IQ2_S", i, word, 8)
+	}
+	for i, word := range iq3s_grid {
+		check("IQ3_S", i, uint64(word), 4)
+	}
+}
+
 func TestDequantizeIQReference(t *testing.T) {
 	// Reference values were produced by ggml's dequantize_row_iq2_xxs,
 	// dequantize_row_iq3_s, and dequantize_row_iq2_s on the first block of
