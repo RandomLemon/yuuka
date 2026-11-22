@@ -929,16 +929,20 @@ following hold, and falls back to the tiled per-head kernel otherwise:
 - the pool is F32 or F16, so an FP16 tile staging is either lossless or a
   documented rounding step (Q8_0 stays on the tiled kernel);
 - `heads == 4 * kv_heads`, so one workgroup can serve the four query heads that
-  share a KV head;
+  share a KV head; or the pool is F16 at width 256 and
+  `heads == 8 * kv_heads`, where two consecutive workgroups share a KV head;
 - `head_dim` is 64, 128, or 256, the widths the kernel is instantiated for;
 - `rows >= 64` or `position + rows >= 256`: below that the chunk offers too few
   16-row query tiles to fill 40 CUs, and the tiled kernel measures faster.
 
-Geometry. A workgroup is four waves, one per query head of the group, and owns a
+Geometry. A workgroup is four waves, one per logical query head, and owns a
 16-row query tile. Each wave keeps the whole `16 x head_dim` output block in
 accumulator registers (128 registers per lane at head width 256), so the value
 product never leaves the wave. K and V tiles of 16 keys are staged in shared
-memory once per workgroup and reused by all four heads.
+memory once per workgroup and reused by all four heads. At 4:1 the workgroup's
+four heads share one KV head. At 8:1 the grouping template launches two
+workgroups per KV head, indexes the paged K/V by `blockIdx.x / 2`, and keeps
+the logical head for the Q load, output, gate, and partial records.
 
 Score orientation. The score product runs as `S^T = K Q^T` rather than
 `S = Q K^T`, so both operands are row major in shared memory: K keeps the
@@ -988,6 +992,18 @@ run. The full-model differential test records 0.015 maximum logit difference at
 a 64-token prompt with the top-1 token unchanged; that is the same magnitude as
 changing the KV storage format from F32 to F16 on the tiled kernel (0.011 on the
 same prompt), which is the accuracy regime the current route runs in.
+
+At the qwen35moe 8:1 geometry the kernel output stays inside the same native
+5e-3 bound, but this model's router is sensitive enough that the FP16 staging
+flips near-tie expert selections. Against the forced tiled control the full
+8192-token stream moves by at most 1.43 / 1.26 / 0.87 logits at 512 / 2048 /
+8192 tokens, with the top-1 token and all three greedy continuation tokens
+identical at every prefix. The approved route gate is therefore 2.0 for this
+model (`moeAttentionRouteLogitTolerance`), while the dense 4:1 route keeps its
+0.05/0.3 bounds. The native 16/2/256 F16 test uses different K/V values per
+physical KV head, a reversed block table, a nonzero position, a 37-row query
+tail, and a displaced last-row crop, and compares the grouped-head kernel with
+the tiled and host references.
 
 #### Split-key F16 prefill
 
@@ -1145,6 +1161,21 @@ only the decode and the scale-slot rule differ per codebook. Each task loads the
 group header once instead of once per half, which is what took the expert stage
 from 24.9 to 61 GB/s of unique weight bytes at a 512-row chunk.
 
+At the measured qwen35moe gate/up cell (512 rows, hidden 2048, expert FFN 512,
+IQ2_XXS, 32-assignment tile) the staging instead uses the direct fragment layout
+the dense MMQ GEMM measured. Four neighboring lanes own the four 32-value groups
+of one weight row, so the decoder's `w[0..3]` and `w[4..7]` words land in the
+two contiguous 16-byte slices of that row; the activation gather writes the two
+Q8_1 halves and the block scale in the same layout. Each pair then feeds two
+signed int8 WMMAs into one exact int32 accumulator, followed by the same FP32
+scale expression as the generic tile. The stage measures 67.9 ms per 512-row
+chunk against 88.9 ms for the generic IQ staging (23.6% less), and 71.7 against
+92.0 ms at a 2048-token prompt. Other dtypes, shapes, tiles, and the down
+projection keep the generic staging; the per-32 rule is not used for IQ2_S
+down. The direct route is exercised by the focused test below and produces the
+same model logits and snapshot as the generic route when attention is held
+fixed.
+
 The dot32 forms apply the codebook signs branch-free: a set sign bit means the
 value is negated, so the four digits packed in one 32-bit word are
 `(v ^ mask) + (mask & 0x01010101)`, where `mask` has 0xFF in the negated bytes.
@@ -1175,10 +1206,17 @@ same tile widths. The expert rows are built from the first block of each codeboo
 in the Qwen3.6 IQ2_XXS GGUF, and each bucket size (1, `J-1`, `J`, `J+1`, and
 `3J+5` assignments, plus an empty bucket) is written directly into the routing
 arrays, because a bucket that owns more than half of the assignments cannot come
-from one top-k chunk. The gate and up projections are compared element by
-element against the dp4a route over the same Q8_1 tile (measured 3e-8 relative),
-which pins the digits, the scale slot, and the scatter; the down projection is
-compared over the same Q8_1 SwiGLU tile (measured 1e-9 relative); and the whole
+from one top-k chunk. A second part runs the direct IQ2_XXS cell at 512 rows,
+hidden 2048, expert FFN 512, 17 experts, and top-8: expert 16 is empty, and the
+eight replaced slots produce buckets of 1, 15, 31, 32, 33, 63, 97, and 127
+assignments, each shuffled with a fixed seed. The gate and up projections are
+compared element by element against the dp4a route over the same Q8_1 tile
+(measured 2.4e-7 relative), which pins the digits, the scale slot, and the
+scatter; the down projection is run with both IQ2_S and IQ3_S and compared over
+the same Q8_1 SwiGLU tile (measured 1.7e-8 relative); sampled channels are also
+compared with the independent host arithmetic. In the original tile sweep the
+down projection is compared over the same Q8_1 SwiGLU tile (measured 1e-9
+relative); and the whole
 pipeline is compared against a host computation over the `yuuka_dequant_f16`
 decode of the same blocks (2e-2). The IQ2_S rows are built with the two nibbles
 of each group scale byte at opposite extremes (0 and 15, a 31x scale difference
@@ -1256,8 +1294,14 @@ FP16-staged activation tile is enough noise to flip near-tie experts.
 Perturbing the reference model's router weights by 1e-4 relative moves its
 first-token logits by 0.64, and the WMMA router left the chunked prefill at
 0.77 against the CPU reference where the FP32 route holds it at 0.009. The
-projection is 2048x256 per row, so the accuracy costs nothing measurable. Every
-other prefill matmul, including the shared expert, keeps the measured dispatch.
+projection is 2048x256 per row, so the accuracy costs nothing measurable. At
+the measured 512-row cell that launcher runs a 64x64 FP32 block tile with one
+ascending-K accumulator per output, which reproduces the scalar kernel byte for
+byte; other row counts keep the scalar form. Every other prefill matmul,
+including the shared expert, keeps the measured dispatch. The shared expert's
+gate/up pair reuses the routed experts' Q8_1 activation tile instead of
+quantizing the same normalized rows a second time; its down projection still
+quantizes its own SwiGLU product.
 
 ### 8.2 Speculative verification
 
@@ -1288,11 +1332,14 @@ traffic without reducing occupancy:
   exposes `heads * (state / 32)` workgroups. On gfx1151, for chunks of at
   least 128 rows whose FFN gate buffer fits the preparation span, a separate
   launch writes the normalized Q/K per token and key group, and the decay
-  and beta per token and head. The core reads these FP32 arrays with no
-  per-token block barriers. The FFN and recurrence use the scratch in stream
-  order. The scratch slot is available from C ABI 5 and is mutually exclusive
-  with the triangular scratch slot. Without either span, the register core
-  recomputes Q/K per column workgroup using two block barriers per row.
+  and beta per token and head. When the FFN gate buffer is narrower than the
+  span, as on an MoE model with a 512-wide expert FFN, the wider attention Q
+  buffer is used instead; the next full-attention layer overwrites it on the
+  same stream. The core reads these FP32 arrays with no per-token block
+  barriers. The FFN and recurrence use the scratch in stream order. The
+  scratch slot is available from C ABI 5 and is mutually exclusive with the
+  triangular scratch slot. Without either span, the register core recomputes
+  Q/K per column workgroup using two block barriers per row.
   Both cores sum `S^T k` and `S^T q` across the four lanes with shuffles.
   Gated RMSNorm runs as a separate row kernel over each `(row, head)` pair,
   because splitting columns across workgroups would otherwise break the

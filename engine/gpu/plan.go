@@ -954,10 +954,20 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 	var prepared *hip.Buffer
 	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
 	preparedWidth := uint64(convDim - inner + 2*rank)
-	if arch == "gfx1151" && stateSize == 128 && rows >= 128 &&
-		preparedWidth <= p.ffnGate.Bytes()/4/uint64(rows) {
-		// The FFN writes this buffer after the recurrent op on the same stream.
-		prepared = p.ffnGate
+	if arch == "gfx1151" && stateSize == 128 && rows >= 128 {
+		// The preparation span fits the FFN gate buffer on the dense model.
+		// The MoE gate buffer is only one expert width, so the recurrent chunk
+		// falls back to the wider attention Q buffer, which the next
+		// full-attention layer overwrites on the same stream. Both buffers are
+		// dead until then, and neither aliases a recurrent operand.
+		fits := func(buf *hip.Buffer) bool {
+			return buf != nil && preparedWidth <= buf.Bytes()/4/uint64(rows)
+		}
+		if fits(p.ffnGate) {
+			prepared = p.ffnGate
+		} else if fits(p.q) {
+			prepared = p.q
+		}
 	}
 	if err := plan.AddRecurrentChunkAt(hip.RecurrentChunkArgs{
 		ConvState:   s.conv[layerIndex],
@@ -1016,7 +1026,7 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 		return err
 	}
 	if err := m.addPrefillSwiGLU(plan, gate, up, down, p.norm, rows, dispatchRows,
-		hidden, ffn); err != nil {
+		hidden, ffn, false); err != nil {
 		return err
 	}
 	return plan.Add(p.x, p.tmp, rows*hidden)
@@ -1025,9 +1035,11 @@ func (m *Model) addPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, ro
 // addPrefillSwiGLU runs one gate/up/down feed-forward block over the activation
 // tile norm and leaves the result in m.prefill.tmp. It does not touch the
 // residual stream, so both the dense FFN and the MoE shared expert call it
-// before adding their own contributions.
+// before adding their own contributions. normQ8Ready reports that the Q8_1
+// form of norm is already in p.xQ8/p.xDS from the immediately preceding routed
+// expert quantizer.
 func (m *Model) addPrefillSwiGLU(plan *hip.Plan, gate, up, down weight, norm *hip.Buffer,
-	rows, dispatchRows, hidden, ffn int64) error {
+	rows, dispatchRows, hidden, ffn int64, normQ8Ready bool) error {
 	p := &m.prefill
 	// Fuse the gate/up pair when both matmuls select the custom WMMA path.
 	// The fused kernel shares one activation tile and applies SwiGLU in the
@@ -1043,9 +1055,12 @@ func (m *Model) addPrefillSwiGLU(plan *hip.Plan, gate, up, down weight, norm *hi
 		}
 	} else if gatePath == hip.PrefillMMQ && upPath == hip.PrefillMMQ {
 		// The two projections read exactly the same activation tile, so the
-		// Q8_1 quantization runs once for the pair.
-		if err := plan.AddQuantizeQ8_1At(norm, 0, p.xQ8, p.xDS, hidden, rows); err != nil {
-			return err
+		// Q8_1 quantization runs once for the pair. The MoE shared expert
+		// already has that tile from the routed expert quantizer.
+		if !normQ8Ready {
+			if err := plan.AddQuantizeQ8_1At(norm, 0, p.xQ8, p.xDS, hidden, rows); err != nil {
+				return err
+			}
 		}
 		if err := plan.AddGemmMmqAt(gate.buf, 0, p.xQ8, p.xDS, p.ffnGate, 0, hidden, ffn, rows, gate.dtype); err != nil {
 			return err
@@ -1215,7 +1230,7 @@ func (m *Model) addMoEPrefillFFN(plan *hip.Plan, prefix string, postNorm weight,
 	// The shared expert reads the normalized tile, which none of the routed
 	// expert operations write.
 	if err := m.addPrefillSwiGLU(plan, sharedGate, sharedUp, sharedDown, p.norm,
-		rows, dispatchRows, hidden, sharedFFN); err != nil {
+		rows, dispatchRows, hidden, sharedFFN, quantized); err != nil {
 		return err
 	}
 	return plan.AddMoESharedAdd(p.x, p.tmp, sharedGateVec.buf, p.norm, hidden, rows)

@@ -5,6 +5,7 @@
 
 #include "yuuka_hip.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -295,9 +296,175 @@ void run_lm_head(yuuka_device * device, yuuka_stream * stream, yuuka_event * eve
     release(wb);
 }
 
+uint16_t float_to_half(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000;
+    const int32_t exp = int32_t((bits >> 23) & 0xff) - 127;
+    const uint32_t mant = bits & 0x7fffff;
+    if (exp > 15) return uint16_t(sign | 0x7c00);
+    if (exp < -24) return uint16_t(sign);
+    if (exp < -14) {
+        const uint32_t shift = uint32_t(-exp - 14);
+        const uint32_t full = mant | 0x800000;
+        return uint16_t(sign | ((full + (1u << (shift + 12))) >> (shift + 13)));
+    }
+    uint32_t rounded = mant + 0x1000;
+    int32_t e = exp;
+    if (rounded & 0x800000) {
+        rounded = 0;
+        e++;
+        if (e > 15) return uint16_t(sign | 0x7c00);
+    }
+    return uint16_t(sign | ((e + 15) << 10) | (rounded >> 13));
+}
+
+void put_half(uint8_t * dst, float value) {
+    const uint16_t half = float_to_half(value);
+    dst[0] = uint8_t(half & 0xff);
+    dst[1] = uint8_t(half >> 8);
+}
+
+// pack_dense_weights builds valid packed K-quant rows with the same scale and
+// minimum layout tests/hip/prefill_test.cpp uses, so the sweep measures the
+// production arithmetic instead of a deltas-only shortcut.
+std::vector<uint8_t> pack_dense_weights(yuuka_dtype dtype, int64_t n_in,
+                                        int64_t n_out, std::mt19937 & rng) {
+    std::vector<uint8_t> packed(row_bytes(dtype, uint64_t(n_in)) * uint64_t(n_out));
+    std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
+    const uint64_t bytes = row_bytes(dtype, uint64_t(n_in));
+    for (int64_t row = 0; row < n_out; ++row) {
+        uint8_t * dst = packed.data() + uint64_t(row) * bytes;
+        if (dtype == YUUKA_DTYPE_F32) {
+            for (int64_t i = 0; i < n_in; ++i) {
+                const float value = dist(rng);
+                std::memcpy(dst + i * 4, &value, 4);
+            }
+        } else if (dtype == YUUKA_DTYPE_Q5_K) {
+            for (int64_t b = 0; b < n_in / 256; ++b) {
+                uint8_t * block = dst + b * 176;
+                put_half(block, 0.002f);
+                put_half(block + 2, 0.001f);
+                for (int i = 0; i < 12; ++i) block[4 + i] = uint8_t(rng() & 0xff);
+                for (int i = 0; i < 160; ++i) block[16 + i] = uint8_t(rng() & 0xff);
+            }
+        } else if (dtype == YUUKA_DTYPE_Q6_K) {
+            for (int64_t b = 0; b < n_in / 256; ++b) {
+                uint8_t * block = dst + b * 210;
+                for (int i = 0; i < 192; ++i) block[i] = uint8_t(rng() & 0xff);
+                for (int i = 0; i < 16; ++i) {
+                    block[192 + i] =
+                        uint8_t(int8_t(std::uniform_int_distribution<int>(-10, 10)(rng)));
+                }
+                put_half(block + 208, 0.002f);
+            }
+        }
+    }
+    return packed;
+}
+
+int run_moe_dense_cells(yuuka_device * device, yuuka_stream * stream,
+                        yuuka_event * event) {
+    constexpr int64_t rows = 512;
+    const struct {
+        yuuka_dtype dtype;
+        int64_t n_in;
+        int64_t n_out;
+        const char * name;
+    } cells[] = {
+        {YUUKA_DTYPE_F32, 2048, 256, "router"},
+        {YUUKA_DTYPE_Q5_K, 2048, 8192, "attn q/qkv"},
+        {YUUKA_DTYPE_Q5_K, 2048, 4096, "recurrent gate"},
+        {YUUKA_DTYPE_Q5_K, 2048, 512, "kv and shared gate/up"},
+        {YUUKA_DTYPE_Q5_K, 4096, 2048, "attention out"},
+        {YUUKA_DTYPE_Q6_K, 4096, 2048, "ssm out"},
+        {YUUKA_DTYPE_Q6_K, 512, 2048, "shared down"},
+    };
+    std::mt19937 rng(24680);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    bool ok = true;
+    for (const auto & cell : cells) {
+        if (!ok) break;
+        const bool kquant = cell.dtype != YUUKA_DTYPE_F32;
+        std::vector<uint8_t> weights =
+            pack_dense_weights(cell.dtype, cell.n_in, cell.n_out, rng);
+        std::vector<float> x(size_t(cell.n_in * rows));
+        for (float & value : x) value = dist(rng);
+        Buffer wb, xb, ob, qsb, dsb;
+        ok = alloc(device, wb, weights.size()) &&
+             alloc(device, xb, x.size() * 4) &&
+             alloc(device, ob, size_t(cell.n_out * rows) * 4);
+        if (ok && kquant) {
+            ok = alloc(device, qsb, uint64_t(cell.n_in) * uint64_t(rows)) &&
+                 alloc(device, dsb, uint64_t(rows) * uint64_t(cell.n_in / 32) * 8);
+        }
+        if (ok) {
+            ok = check(yuuka_memcpy_h2d(wb.buf, weights.data(), weights.size()),
+                       "h2d dense sweep weights") &&
+                 check(yuuka_memcpy_h2d(xb.buf, x.data(), x.size() * 4),
+                       "h2d dense sweep x");
+        }
+        auto submit = [&]() {
+            if (cell.dtype == YUUKA_DTYPE_F32) {
+                return check(yuuka_gemm(stream, ob.buf, xb.buf, wb.buf, cell.n_in,
+                                        cell.n_out, rows, YUUKA_DTYPE_F32, event),
+                             "dense sweep gemm f32");
+            }
+            return check(yuuka_quantize_q8_1(stream, qsb.buf, dsb.buf, xb.buf,
+                                             cell.n_in, rows, event),
+                         "dense sweep quantize") &&
+                   check(yuuka_gemm_mmq(stream, ob.buf, qsb.buf, dsb.buf, wb.buf,
+                                        cell.n_in, cell.n_out, rows, cell.dtype,
+                                        event),
+                         "dense sweep gemm mmq");
+        };
+        auto wait = [&]() { return check(yuuka_event_wait(event), "dense sweep wait"); };
+        std::vector<double> samples;
+        samples.reserve(5);
+        for (int i = 0; ok && i < 7; ++i) {
+            const auto start = Clock::now();
+            ok = submit();
+            if (ok) ok = wait();
+            const double ms = elapsed_ms(start, Clock::now());
+            if (ok && i >= 2) samples.push_back(ms);
+        }
+        if (ok && samples.size() == 5) {
+            std::sort(samples.begin(), samples.end());
+            const double weight_gb = double(weights.size()) / 1e9;
+            const double flops = 2.0 * double(cell.n_in) * double(cell.n_out) *
+                                 double(rows);
+            const double median = samples[2];
+            std::printf("DENSE %-6s M=%lld K=%lld N=%lld %-22s median=%.3fms"
+                        " %.1fGB/s %.1fTF/s samples=",
+                        dtype_name(cell.dtype), static_cast<long long>(rows),
+                        static_cast<long long>(cell.n_in),
+                        static_cast<long long>(cell.n_out), cell.name, median,
+                        weight_gb / (median / 1000.0),
+                        flops / (median / 1000.0) / 1e12);
+            for (size_t i = 0; i < samples.size(); ++i) {
+                std::printf("%s%.3f", i == 0 ? "" : ",", samples[i]);
+            }
+            std::printf("\n");
+        }
+        release(dsb);
+        release(qsb);
+        release(ob);
+        release(xb);
+        release(wb);
+    }
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    bool dense = false;
+    if (argc == 2 && std::strcmp(argv[1], "--moe-dense") == 0) {
+        dense = true;
+    } else if (argc != 1) {
+        std::fprintf(stderr, "usage: %s [--moe-dense]\n", argc == 0 ? "prefill_sweep" : argv[0]);
+        return 2;
+    }
     yuuka_device * device = nullptr;
     if (yuuka_device_open(0, &device) != YUUKA_OK) {
         std::fprintf(stderr, "SKIP: no HIP device: %s\n", yuuka_last_error());
@@ -308,6 +475,13 @@ int main() {
     if (!check(yuuka_stream_create(device, &stream), "stream") ||
         !check(yuuka_event_create(device, &event), "event")) {
         return 1;
+    }
+    if (dense) {
+        const int status = run_moe_dense_cells(device, stream, event);
+        yuuka_event_destroy(event);
+        yuuka_stream_destroy(stream);
+        yuuka_device_close(device);
+        return status;
     }
     const yuuka_dtype dtypes[] = {YUUKA_DTYPE_F16, YUUKA_DTYPE_Q8_0, YUUKA_DTYPE_Q4_K,
                                   YUUKA_DTYPE_Q5_K, YUUKA_DTYPE_Q6_K};

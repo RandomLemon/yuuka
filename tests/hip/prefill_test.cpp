@@ -583,6 +583,80 @@ bool test_gemm_mmq(yuuka_device * device, yuuka_stream * stream, yuuka_event * e
     return ok;
 }
 
+// test_gemm_mmq_direct_control compares a selected direct MMQ cell at M=512
+// with the generic tile on the same first 512 rows of an M=513 call. The
+// activations are quantized separately for each row count, so the Q8_1 digits
+// also have to agree row by row. Direct and generic differ only in staging and
+// in how the two int8 WMMAs of a 32-value scale block are accumulated, which
+// is exact int32 arithmetic followed by the same FP32 scale expression.
+bool test_gemm_mmq_direct_control(yuuka_device * device, yuuka_stream * stream,
+                                  yuuka_event * event, yuuka_dtype dtype,
+                                  const char * name, int64_t n_in, int64_t n_out,
+                                  std::mt19937 & rng) {
+    constexpr int64_t rows = 512;
+    constexpr int64_t control_rows = rows + 1;
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> x(size_t(n_in * control_rows));
+    for (float & v : x) v = dist(rng);
+    std::vector<uint8_t> packed = pack_weights(dtype, rng, n_in, n_out);
+    const uint64_t qbytes = uint64_t(n_in) * uint64_t(control_rows);
+    const uint64_t sbytes = uint64_t(control_rows) * uint64_t(n_in / 32) * 8;
+    Buffer wb, xb, qsb, dsb, ob, ocb;
+    bool ok = alloc(device, wb, packed.size()) && alloc(device, xb, x.size() * 4) &&
+              alloc(device, qsb, qbytes) && alloc(device, dsb, sbytes) &&
+              alloc(device, ob, size_t(n_out * rows) * 4) &&
+              alloc(device, ocb, size_t(n_out * control_rows) * 4) &&
+              upload(wb, packed.data(), packed.size()) && upload_vec(xb, x);
+    if (ok) {
+        ok = check(yuuka_quantize_q8_1(stream, qsb.buf, dsb.buf, xb.buf, n_in, rows,
+                                       event), "control q8_1 direct") &&
+             check(yuuka_event_wait(event), "control quantize direct wait") &&
+             check(yuuka_gemm_mmq(stream, ob.buf, qsb.buf, dsb.buf, wb.buf, n_in,
+                                  n_out, rows, dtype, event), "control mmq direct") &&
+             check(yuuka_event_wait(event), "control direct wait") &&
+             check(yuuka_quantize_q8_1(stream, qsb.buf, dsb.buf, xb.buf, n_in,
+                                       control_rows, event), "control q8_1 generic") &&
+             check(yuuka_event_wait(event), "control quantize generic wait") &&
+             check(yuuka_gemm_mmq(stream, ocb.buf, qsb.buf, dsb.buf, wb.buf, n_in,
+                                  n_out, control_rows, dtype, event), "control mmq generic") &&
+             check(yuuka_event_wait(event), "control generic wait");
+    }
+    std::vector<float> got(size_t(n_out * rows));
+    std::vector<float> control(size_t(n_out * control_rows));
+    ok = ok && download_vec(ob, got) && download_vec(ocb, control);
+    if (ok) {
+        const size_t bytes = got.size() * sizeof(float);
+        if (std::memcmp(got.data(), control.data(), bytes) != 0) {
+            size_t first = 0;
+            bool found = false;
+            double max_diff = 0.0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                if (got[i] != control[i] && !found) {
+                    first = i;
+                    found = true;
+                }
+                max_diff = std::max(max_diff,
+                                    double(std::fabs(got[i] - control[i])));
+            }
+            std::fprintf(stderr,
+                         "%s direct/generic first difference at row %lld col %lld,"
+                         " max abs %.3g\n", name,
+                         static_cast<long long>(first / size_t(n_out)),
+                         static_cast<long long>(first % size_t(n_out)), max_diff);
+            ok = false;
+        }
+    }
+    std::printf("%s direct vs generic M=%lld: %s\n", name,
+                static_cast<long long>(rows), ok ? "ok" : "FAILED");
+    release(ocb);
+    release(ob);
+    release(dsb);
+    release(qsb);
+    release(xb);
+    release(wb);
+    return ok;
+}
+
 bool test_silu_mul_quant_q8_1(yuuka_device * device, yuuka_stream * stream,
                              yuuka_event * event, std::mt19937 & rng) {
     constexpr uint64_t width = 256, rows = 17, channels = 65, offset = 16;
@@ -1511,6 +1585,146 @@ bool test_attention_prefill_mma(yuuka_device * device, yuuka_stream * stream,
     return ok;
 }
 
+// test_attention_prefill_mma_gqa exercises the 8:1 grouped-head WMMA path on
+// the qwen35moe geometry: 16 query heads, 2 physical KV heads, width 256, F16
+// pool. The query chunk is not a multiple of the 16-row tile and starts at a
+// nonzero position. A second op reads the last query row through the crop
+// displacement the final chunk uses. K and V are rounded to half once, and the
+// CPU reference reads exactly those stored values.
+bool test_attention_prefill_mma_gqa(yuuka_device * device, yuuka_stream * stream,
+                                    yuuka_event * event, std::mt19937 & rng) {
+    constexpr int heads = 16, kv_heads = 2, head_dim = 256;
+    constexpr int kv_dim = kv_heads * head_dim;
+    constexpr int block_size = 16, capacity = 288, position = 220, rows = 37;
+    const int blocks = (capacity + block_size - 1) / block_size;
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> q(size_t(rows) * heads * 2 * head_dim);
+    for (float & x : q) x = dist(rng);
+    std::vector<uint16_t> key(size_t(capacity) * kv_dim), value(key.size());
+    for (uint16_t & x : key) x = float_to_half(dist(rng));
+    for (uint16_t & x : value) x = float_to_half(dist(rng));
+    const float scale = 1.0f / std::sqrt(float(head_dim));
+    std::vector<int32_t> block_table(static_cast<size_t>(blocks), 0);
+    for (int i = 0; i < blocks; ++i) block_table[size_t(i)] = blocks - 1 - i;
+    std::vector<uint16_t> pk(key.size()), pv(value.size());
+    for (int r = 0; r < capacity; ++r) {
+        const int64_t dst = int64_t(block_table[size_t(r / block_size)]) * block_size +
+                            (r % block_size);
+        std::memcpy(&pk[size_t(dst) * kv_dim], &key[size_t(r) * kv_dim],
+                    size_t(kv_dim) * sizeof(uint16_t));
+        std::memcpy(&pv[size_t(dst) * kv_dim], &value[size_t(r) * kv_dim],
+                    size_t(kv_dim) * sizeof(uint16_t));
+    }
+    Buffer qb, kb, vb, ob, tb, ot;
+    bool ok = alloc(device, qb, q.size() * 4) && alloc(device, kb, pk.size() * 2) &&
+              alloc(device, vb, pv.size() * 2) &&
+              alloc(device, ob, size_t(rows) * heads * head_dim * 4) &&
+              alloc(device, ot, size_t(heads) * head_dim * 4) &&
+              alloc(device, tb, block_table.size() * 4) && upload_vec(qb, q) &&
+              upload_vec(kb, pk) && upload_vec(vb, pv) && upload_vec(tb, block_table);
+    std::vector<float> got(size_t(rows) * heads * head_dim);
+    std::vector<float> again(got.size());
+    std::vector<float> got_last(size_t(heads) * head_dim);
+    std::vector<float> again_last(got_last.size());
+    for (int pass = 0; pass < 2 && ok; ++pass) {
+        yuuka_plan * plan = nullptr;
+        ok = check(yuuka_plan_create(device, &plan), "gqa attention plan create");
+        if (ok) {
+            yuuka_op op{};
+            op.code = YUUKA_OP_ATTENTION_PREFILL_PAGED;
+            op.buf[0] = qb.buf;
+            op.buf[1] = kb.buf;
+            op.buf[2] = vb.buf;
+            op.buf[3] = ob.buf;
+            op.buf[4] = tb.buf;
+            op.n[0] = kv_heads;
+            op.n[1] = heads;
+            op.n[2] = head_dim;
+            op.n[3] = kv_dim;
+            op.n[4] = rows;
+            op.u[0] = block_size;
+            op.u[1] = capacity;
+            op.u[2] = YUUKA_DTYPE_F16;
+            op.f[0] = scale;
+            ok = check(yuuka_plan_add(plan, &op), "add gqa attention prefill mma");
+            if (ok) {
+                op.buf[3] = ot.buf;
+                op.off[0] = uint64_t(rows - 1) * uint64_t(heads) * 2 *
+                            uint64_t(head_dim) * sizeof(float);
+                op.n[4] = 1;
+                op.n[5] = rows - 1;
+                ok = check(yuuka_plan_add(plan, &op), "add displaced gqa attention");
+            }
+        }
+        if (ok) ok = execute(plan, stream, event, position);
+        if (ok) {
+            ok = download_vec(ob, pass == 0 ? got : again) &&
+                 download_vec(ot, pass == 0 ? got_last : again_last);
+        }
+        if (plan != nullptr) yuuka_plan_destroy(plan);
+    }
+    if (ok) {
+        std::vector<float> scores(size_t(position + rows));
+        auto check_row = [&](int r, const float * out, size_t out_base,
+                             const char * what) {
+            const int pos = position + r;
+            for (int h = 0; h < heads && ok; ++h) {
+                const int kvh = h / (heads / kv_heads);
+                const float * qp = q.data() + size_t(r * heads + h) * 2 * head_dim;
+                float max_s = -INFINITY;
+                for (int p = 0; p <= pos; ++p) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        dot += qp[d] * half_to_float(
+                            key[size_t(p * kv_dim + kvh * head_dim + d)]);
+                    }
+                    scores[size_t(p)] = dot * scale;
+                    max_s = std::max(max_s, scores[size_t(p)]);
+                }
+                float total = 0.0f;
+                for (int p = 0; p <= pos; ++p) {
+                    scores[size_t(p)] = std::exp(scores[size_t(p)] - max_s);
+                    total += scores[size_t(p)];
+                }
+                for (int d = 0; d < head_dim; ++d) {
+                    float want = 0.0f;
+                    for (int p = 0; p <= pos; ++p) {
+                        want += scores[size_t(p)] / total *
+                                half_to_float(value[size_t(p * kv_dim +
+                                                            kvh * head_dim + d)]);
+                    }
+                    want *= 1.0f / (1.0f + std::exp(-qp[head_dim + d]));
+                    const float have = out[out_base + size_t(h * head_dim + d)];
+                    if (!std::isfinite(have) ||
+                        std::fabs(have - want) > 5e-3f * (1.0f + std::fabs(want))) {
+                        std::fprintf(stderr,
+                                     "gqa mma %s mismatch row %d head %d dim %d: %.6f vs %.6f\n",
+                                     what, r, h, d, have, want);
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        };
+        for (int r = 0; r < rows && ok; ++r) {
+            check_row(r, got.data(), size_t(r * heads) * head_dim, "chunk");
+        }
+        check_row(rows - 1, got_last.data(), 0, "displaced");
+        if (got != again || got_last != again_last) {
+            std::fprintf(stderr, "gqa mma attention is not reproducible\n");
+            ok = false;
+        }
+    }
+    std::printf("gqa 8:1 mma attention prefill: %s\n", ok ? "ok" : "FAILED");
+    release(tb);
+    release(ot);
+    release(ob);
+    release(vb);
+    release(kb);
+    release(qb);
+    return ok;
+}
+
 bool test_attention_prefill_split(yuuka_device * device, yuuka_stream * stream,
                                   yuuka_event * event, std::mt19937 & rng,
                                   int position) {
@@ -1967,6 +2181,25 @@ int main() {
                        2560, 1024, 128, rng) && ok;
     ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q5_K, "mmq Q5_K direct SSM out",
                        4096, 2560, 128, rng) && ok;
+    // The qwen35moe dense Q5_K cells selected at the release chunk. The first
+    // call is the CPU/Q8_1 oracle for one selected cell; the rest compare the
+    // complete 512-row matrix against the generic tile on 513 rows.
+    ok = test_gemm_mmq(device, stream, event, YUUKA_DTYPE_Q5_K,
+                       "mmq Q5_K MoE QKV", 2048, 8192, 512, rng) && ok;
+    const struct {
+        const char * name;
+        int64_t n_in;
+        int64_t n_out;
+    } moe_dense_q5[] = {
+        {"mmq Q5_K MoE QKV direct/generic", 2048, 8192},
+        {"mmq Q5_K MoE gate direct/generic", 2048, 4096},
+        {"mmq Q5_K MoE KV direct/generic", 2048, 512},
+        {"mmq Q5_K MoE out direct/generic", 4096, 2048},
+    };
+    for (const auto & c : moe_dense_q5) {
+        ok = test_gemm_mmq_direct_control(device, stream, event, YUUKA_DTYPE_Q5_K,
+                                          c.name, c.n_in, c.n_out, rng) && ok;
+    }
     ok = test_blas(device, stream, event, rng) && ok;
     const struct {
         yuuka_dtype dtype;
@@ -2002,6 +2235,7 @@ int main() {
     ok = test_embedding_and_kv(device, stream, event, rng) && ok;
     ok = test_attention_prefill(device, stream, event, rng) && ok;
     ok = test_attention_prefill_mma(device, stream, event, rng) && ok;
+    ok = test_attention_prefill_mma_gqa(device, stream, event, rng) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 0) && ok;
     ok = test_attention_prefill_split(device, stream, event, rng, 270) && ok;
     ok = test_recurrent_chunk(device, stream, event, rng, 128, RecurrentPath::PerToken) && ok;

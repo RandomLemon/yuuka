@@ -48,6 +48,13 @@ func TestGPUAttentionPathsAgree(t *testing.T) {
 		repetitions = 450
 		gate = 0.3
 	}
+	// The 8:1 F16 MMA route can flip a near-tie MoE expert selection even when
+	// the attention output is within the native bound; the approved contract
+	// keeps the top-1 token and greedy continuation and uses the MoE route
+	// envelope recorded in moe_real_test.go.
+	if model.Config.IsMoE() {
+		gate = moeAttentionRouteLogitTolerance
+	}
 	ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", repetitions))
 	if err != nil {
 		t.Fatal(err)

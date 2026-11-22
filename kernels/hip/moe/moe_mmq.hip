@@ -135,6 +135,89 @@ __device__ __forceinline__ void stage_iq_weights(int8_t * tile_a, float * scale_
     }
 }
 
+// stage_iq2xxs_direct_weights stages the IQ2_XXS weight tile in the direct
+// fragment layout the dense MMQ GEMM measured. Four neighboring lanes own the
+// four 32-value groups of one weight row, and each group is written to the two
+// contiguous 16-byte slices of that row. The scale pair is the one the
+// per-32 epilogue reads.
+template <int kTileI, int kStepK>
+__device__ __forceinline__ void stage_iq2xxs_direct_weights(
+    int8_t * tile_a, float * scale_a, const uint8_t * w, uint64_t row_bytes,
+    int64_t n0, int64_t n_out, int64_t k0) {
+    constexpr int kPairsPerStep = kStepK / 32;
+    constexpr int kTasks = kTileI * kPairsPerStep;
+    constexpr int kTasksPerThread = (kTasks + kThreads - 1) / kThreads;
+    constexpr uint64_t kBlockBytes = 66;
+    #pragma unroll
+    for (int i = 0; i < kTasksPerThread; ++i) {
+        const int task = threadIdx.x + i * kThreads;
+        if (task >= kTasks) {
+            continue;
+        }
+        const int row = task / kPairsPerStep;
+        const int pair = task % kPairsPerStep;
+        int8_t * dst = tile_a +
+            fragment_offset<true, kPairsPerStep>(row / kFragRows, pair,
+                                                 row % kFragRows, 0);
+        const int64_t gn = n0 + row;
+        if (gn >= n_out) {
+            *reinterpret_cast<int4 *>(dst) = make_int4(0, 0, 0, 0);
+            *reinterpret_cast<int4 *>(dst + kPairBytes / 2) =
+                make_int4(0, 0, 0, 0);
+            continue;
+        }
+        const uint8_t * row_ptr = w + gn * row_bytes;
+        const int64_t k = k0 + static_cast<int64_t>(pair) * 32;
+        const int j = static_cast<int>(k % 256);
+        const uint8_t * blk = row_ptr + (k / 256) * kBlockBytes;
+        int32_t w8[8];
+        float scale_lo = 0.0f;
+        float scale_hi = 0.0f;
+        iq2xxs_dot32(blk, j, w8, scale_lo, scale_hi);
+        *reinterpret_cast<int4 *>(dst) =
+            make_int4(w8[0], w8[1], w8[2], w8[3]);
+        *reinterpret_cast<int4 *>(dst + kPairBytes / 2) =
+            make_int4(w8[4], w8[5], w8[6], w8[7]);
+        const int slice = static_cast<int>(k % kStepK) / 16;
+        scale_a[slice * kTileI + row] = scale_lo;
+        scale_a[(slice + 1) * kTileI + row] = scale_hi;
+    }
+}
+
+// stage_iq2xxs_direct_activations gathers the routed activation tile in the
+// same direct layout. Both Q8_1 halves and the block scale are read once per
+// (assignment, pair); assignments beyond take are zeroed without dereferencing
+// their bucket entry.
+template <int kTileJ, int kStepK>
+__device__ __forceinline__ void stage_iq2xxs_direct_activations(
+    int8_t * tile_b, float2 * scale_b, const int8_t * xs, const float2 * xds,
+    const int32_t * assign_rows, int64_t bucket, int a0, int take,
+    int64_t n_in, int64_t k0) {
+    constexpr int kPairsPerStep = kStepK / 32;
+    for (int index = threadIdx.x; index < kTileJ * kPairsPerStep;
+         index += kThreads) {
+        const int token = index % kTileJ;
+        const int pair = index / kTileJ;
+        auto * dst = reinterpret_cast<int4 *>(
+            tile_b + fragment_offset<true, kPairsPerStep>(
+                         token / kFragRows, pair, token % kFragRows, 0));
+        float2 scale = make_float2(0.0f, 0.0f);
+        int4 low = make_int4(0, 0, 0, 0);
+        int4 high = make_int4(0, 0, 0, 0);
+        if (token < take) {
+            const int64_t j = bucket + a0 + token;
+            const int64_t row = static_cast<int64_t>(assign_rows[j]);
+            const int8_t * src = xs + row * n_in + k0 + pair * 32;
+            low = *reinterpret_cast<const int4 *>(src);
+            high = *reinterpret_cast<const int4 *>(src + 16);
+            scale = xds[row * (n_in / 32) + (k0 / 32) + pair];
+        }
+        dst[0] = low;
+        dst[kPairBytes / (2 * sizeof(int4))] = high;
+        scale_b[pair * kTileJ + token] = scale;
+    }
+}
+
 // stage_weight_tile stages the weight tile with the decoder of the dtype's
 // family: the shared K-quant span for Q4_K/Q5_K/Q6_K, and the IQ group staging
 // above for the codebooks. Both fill the same fragment layout.
@@ -258,7 +341,8 @@ __device__ __forceinline__ void stage_activations_gather(
 // tile row of the assignment (gate/up), true reads the SwiGLU slot of the
 // assignment (down). The output is always written to the slot row, which is
 // what moe_reduce_add and the down projection expect.
-template <uint32_t DType, int kTileJ, int kStepK, bool kActivationBySlot>
+template <uint32_t DType, int kTileJ, int kStepK, bool kActivationBySlot,
+          bool kDirectIQ2 = false>
 __global__ void moe_gemm_mmq_kernel(
     float * out, const int8_t * xs, const float2 * xds, const uint8_t * w,
     uint64_t row_bytes, const int32_t * counts, const int32_t * assign_rows,
@@ -315,14 +399,70 @@ __global__ void moe_gemm_mmq_kernel(
             }
         }
         for (int64_t k0 = 0; k0 < n_in; k0 += kStepK) {
-            stage_weight_tile<DType, T::kTileI, kStepK>(
-                tile_a, scale_a, weights, row_bytes, n0, n_out, k0);
-            stage_activations_gather<kTileJ, kStepK, kActivationBySlot>(
-                tile_b, scale_b, xs, xds, assign_rows, assign_slots, bucket, a0,
-                take, used, n_in, k0);
+            if constexpr (kDirectIQ2) {
+                static_assert(DType == YUUKA_DTYPE_IQ2_XXS && kTileJ == 32 &&
+                              kStepK == 128 && !kActivationBySlot,
+                              "the direct IQ2 route is fixed to the measured tile");
+                stage_iq2xxs_direct_weights<T::kTileI, kStepK>(
+                    tile_a, scale_a, weights, row_bytes, n0, n_out, k0);
+                stage_iq2xxs_direct_activations<kTileJ, kStepK>(
+                    tile_b, scale_b, xs, xds, assign_rows, bucket, a0, take,
+                    n_in, k0);
+            } else {
+                stage_weight_tile<DType, T::kTileI, kStepK>(
+                    tile_a, scale_a, weights, row_bytes, n0, n_out, k0);
+                stage_activations_gather<kTileJ, kStepK, kActivationBySlot>(
+                    tile_b, scale_b, xs, xds, assign_rows, assign_slots, bucket,
+                    a0, take, used, n_in, k0);
+            }
             __syncthreads();
             #pragma unroll
             for (int pair = 0; pair < kPairsPerStep; ++pair) {
+#if defined(__gfx1151__)
+                if constexpr (kDirectIQ2) {
+                    using Operand = int32_t __attribute__((ext_vector_type(4)));
+                    using Accum = int32_t __attribute__((ext_vector_type(8)));
+                    const int operand_lane = lane % kFragRows;
+                    const int direct_a = (row_base / kFragRows) *
+                                             kPairsPerStep * kPairBytes +
+                                         operand_lane * kLaneBytes;
+                    const int slice_offset = pair * kPairBytes;
+                    const Operand a0 = *reinterpret_cast<const Operand *>(
+                        tile_a + direct_a + slice_offset);
+                    const Operand a1 = *reinterpret_cast<const Operand *>(
+                        tile_a + direct_a + slice_offset + kPairBytes / 2);
+                    float wd[8];
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const int direct_row = row_base + 2 * e + (lane >> 4);
+                        wd[e] = scale_a[(2 * pair) * T::kTileI + direct_row];
+                    }
+                    #pragma unroll
+                    for (int t = 0; t < T::kTokenTiles; ++t) {
+                        const int direct_b = (col_base / kFragRows + t) *
+                                                 kPairsPerStep * kPairBytes +
+                                             operand_lane * kLaneBytes;
+                        const Operand b0 = *reinterpret_cast<const Operand *>(
+                            tile_b + direct_b + slice_offset);
+                        const Operand b1 = *reinterpret_cast<const Operand *>(
+                            tile_b + direct_b + slice_offset + kPairBytes / 2);
+                        Accum accum = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                            true, a0, true, b0, Accum{}, true);
+                        accum = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                            true, a1, true, b1, accum, true);
+                        const float2 dsb =
+                            scale_b[pair * kTileJ + col_base + t * kFragRows +
+                                    (lane & 15)];
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            sum[t][e] = fmaf(wd[e] * dsb.x,
+                                             static_cast<float>(accum[e]),
+                                             fmaf(0.0f, dsb.y, sum[t][e]));
+                        }
+                    }
+                    continue;
+                }
+#endif
                 const int4 av = *reinterpret_cast<const int4 *>(
                     tile_a + a_base + pair * kPairBytes);
                 int4 bv[T::kTokenTiles];
@@ -411,7 +551,8 @@ __global__ void moe_gemm_mmq_kernel(
     }
 }
 
-template <uint32_t DType, int kTileJ, int kStepK, bool kActivationBySlot>
+template <uint32_t DType, int kTileJ, int kStepK, bool kActivationBySlot,
+          bool kDirectIQ2 = false>
 void launch_tile(float * out, const int8_t * xs, const float2 * xds,
                  const uint8_t * w, uint64_t row_bytes, const int32_t * counts,
                  const int32_t * assign_rows, const int32_t * assign_slots,
@@ -420,7 +561,8 @@ void launch_tile(float * out, const int8_t * xs, const float2 * xds,
     using S = Shared<kTileJ, kStepK>;
     static const hipError_t attribute = hipFuncSetAttribute(
         reinterpret_cast<const void *>(
-            &moe_gemm_mmq_kernel<DType, kTileJ, kStepK, kActivationBySlot>),
+            &moe_gemm_mmq_kernel<DType, kTileJ, kStepK, kActivationBySlot,
+                                 kDirectIQ2>),
         hipFuncAttributeMaxDynamicSharedMemorySize, S::kBytes);
     // A rejected attribute makes the launch below fail with a clear device
     // error through the caller's hipGetLastError check; nothing runs silently.
@@ -428,7 +570,7 @@ void launch_tile(float * out, const int8_t * xs, const float2 * xds,
     constexpr int kTileI = Tile<kTileJ>::kTileI;
     const dim3 grid(static_cast<unsigned>(experts),
                     static_cast<unsigned>((n_out + kTileI - 1) / kTileI));
-    moe_gemm_mmq_kernel<DType, kTileJ, kStepK, kActivationBySlot>
+    moe_gemm_mmq_kernel<DType, kTileJ, kStepK, kActivationBySlot, kDirectIQ2>
         <<<grid, kThreads, S::kBytes, stream>>>(
             out, xs, xds, w, row_bytes, counts, assign_rows, assign_slots, rows,
             used, n_in, n_out);
@@ -456,6 +598,18 @@ int launch_moe_mmq(float * out, const int8_t * xs, const float2 * xds,
     if (rows <= 0 || experts <= 0 || used <= 0 || n_in <= 0 || n_out <= 0 ||
         !supported_tile(tile_j)) {
         return YUUKA_ERR_INVALID_ARGUMENT;
+    }
+    // The measured qwen35moe gate/up cell. The direct layout keeps both
+    // (assignment, pair) operands contiguous and applies one FP32 scale after
+    // the exact int32 dot of each 32-value group.
+    if constexpr (!kActivationBySlot) {
+        if (dtype == YUUKA_DTYPE_IQ2_XXS && tile_j == 32 && rows == 512 &&
+            n_in == 2048 && n_out == 512) {
+            launch_tile<YUUKA_DTYPE_IQ2_XXS, 32, 128, false, true>(
+                out, xs, xds, w, row_bytes, counts, assign_rows, assign_slots,
+                rows, experts, used, n_in, n_out, stream);
+            return YUUKA_OK;
+        }
     }
     #define YUUKA_MOE_MMQ_CASE(DT, J)                                                 \
         if (dtype == (DT) && tile_j == (J)) {                                        \

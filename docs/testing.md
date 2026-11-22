@@ -184,6 +184,18 @@ gated at 0.3 with the top-1 token still required to match. This is the accuracy 
 llama.cpp's default K-quant prefill path runs in. See
 [benchmarks.md](benchmarks.md#isolated-kernels).
 
+The qwen35moe 8:1 F16 grouped-head route is a stronger case of the same effect.
+Its attention output stays within the native 5e-3 bound, but an FP16-staged
+query can flip a near-tie expert selection in this router-sensitive model: on
+the fixed 8192-token stream the full-model logits move by at most 1.43 / 1.26 /
+0.87 against the forced tiled control at 512 / 2048 / 8192 tokens. The top-1
+token and three greedy continuation tokens are identical at every prefix, and
+`TestGPUMoEPrefillGreedyContinuity` enforces both that behavior and the
+`moeAttentionRouteLogitTolerance = 2.0` envelope recorded in
+[moe_real_test.go](../engine/gpu/moe_real_test.go). The dense 4:1 route keeps
+the tighter 0.05/0.3 bounds. This gate was approved explicitly for the record
+in [qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md).
+
 Paged KV and graph replay have dedicated native coverage in
 `tests/hip/paged_test.cpp`:
 
@@ -197,10 +209,13 @@ Paged KV and graph replay have dedicated native coverage in
   heads per KV head, a permuted block table, and a 64-row chunk, matches the
   FP32 reference within 5e-3 relative, reproduces its output bitwise on a second
   run, and reports its difference against the tiled kernel on the same plan
-  input. The full-model differential test `TestGPUAttentionPathsAgree` compares
-  the default FP16 MMA dispatch against the tiled path selected by
-  `ForceTiledAttention` (and the opt-in rocBLAS path) and enforces the 0.05
-  logit gate at a 64-token prompt and 0.3 at 2048 tokens;
+  input. A second case covers 16 query heads and 2 KV heads at width 256 with
+  independent K/V per physical head, a nonzero position, a query tail that is
+  not a multiple of the 16-row tile, and a displaced last-row crop. The
+  full-model differential test `TestGPUAttentionPathsAgree` compares the default
+  FP16 MMA dispatch against the tiled path selected by `ForceTiledAttention`
+  (and the opt-in rocBLAS path) and enforces the 0.05 logit gate at a 64-token
+  prompt and 0.3 at 2048 tokens, or the recorded 2.0 MoE route envelope;
 - device-to-device block copies used for private prefix blocks;
 - graph capture and replay with device-resident token/position updates across
   several positions;

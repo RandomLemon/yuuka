@@ -632,6 +632,48 @@ func decodeBufferNames(m *Model, s *Session) map[uintptr]string {
 	} {
 		add(item.buf, item.name)
 	}
+	p := m.prefill
+	for _, item := range []struct {
+		buf  *hip.Buffer
+		name string
+	}{
+		{p.x, "prefill.x"},
+		{p.norm, "prefill.norm"},
+		{p.q, "prefill.q"},
+		{p.k, "prefill.k"},
+		{p.v, "prefill.v"},
+		{p.attn, "prefill.attn"},
+		{p.tmp, "prefill.tmp"},
+		{p.qkv, "prefill.qkv"},
+		{p.z, "prefill.z"},
+		{p.beta, "prefill.beta"},
+		{p.alpha, "prefill.alpha"},
+		{p.conv, "prefill.conv"},
+		{p.gdnNorm, "prefill.gdn_norm"},
+		{p.ffnGate, "prefill.ffn_gate"},
+		{p.ffnUp, "prefill.ffn_up"},
+		{p.xF16, "prefill.x_f16"},
+		{p.yF16, "prefill.y_f16"},
+		{p.tokens, "prefill.tokens"},
+		{p.moeLogits, "prefill.moe_logits"},
+		{p.moeIDs, "prefill.moe_ids"},
+		{p.moeWeights, "prefill.moe_weights"},
+		{p.moeCounts, "prefill.moe_counts"},
+		{p.moeAssignRows, "prefill.moe_assign_rows"},
+		{p.moeAssignSlots, "prefill.moe_assign_slots"},
+		{p.moeAssignWeights, "prefill.moe_assign_weights"},
+		{p.moeGate, "prefill.moe_gate"},
+		{p.moeUp, "prefill.moe_up"},
+		{p.moeOut, "prefill.moe_out"},
+		{p.moeQ8, "prefill.moe_q8"},
+		{p.moeDS, "prefill.moe_ds"},
+		{p.xQ8, "prefill.x_q8"},
+		{p.xDS, "prefill.x_ds"},
+		{p.attentionBlas, "prefill.attention_blas"},
+		{p.attentionSplit, "prefill.attention_split"},
+	} {
+		add(item.buf, item.name)
+	}
 	for i, buf := range m.poolK {
 		add(buf, fmt.Sprintf("kv.pool_k[%d]", i))
 	}

@@ -494,8 +494,21 @@ bool measured_direct_shape(uint32_t dtype, int64_t n_in, int64_t n_out, int64_t 
         }
         return n_out == 2560 && (n_in == 4096 || n_in == 9216);
     }
-    return dtype == YUUKA_DTYPE_Q5_K &&
-           ((n_in == 2560 && n_out == 8192) || (n_in == 4096 && n_out == 2560));
+    if (dtype == YUUKA_DTYPE_Q5_K) {
+        // The qwen35moe prompt GEMMs, screened at the release chunk size:
+        // Q/QKV and the recurrent gate, K/V plus the shared expert gate/up,
+        // and the attention output. Other row counts keep the generic tile.
+        if (rows == 512) {
+            if (n_in == 2048 && (n_out == 8192 || n_out == 4096 || n_out == 512)) {
+                return true;
+            }
+            if (n_in == 4096 && n_out == 2048) {
+                return true;
+            }
+        }
+        return (n_in == 2560 && n_out == 8192) || (n_in == 4096 && n_out == 2560);
+    }
+    return false;
 }
 
 } // namespace

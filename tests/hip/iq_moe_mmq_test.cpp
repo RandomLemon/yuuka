@@ -165,6 +165,31 @@ void fill_matrix(std::vector<uint8_t> & packed, uint32_t dtype,
     }
 }
 
+// fill_matrix_wide builds a packed matrix whose rows span n_in values and whose
+// 256-value block scales change across K blocks. The codebook fixture supplies
+// the digits; only the FP16 scale mantissa and the IQ2_S group-scale bytes are
+// varied, so every block stays finite and valid.
+void fill_matrix_wide(std::vector<uint8_t> & packed, uint32_t dtype,
+                      const std::vector<uint8_t> & block, int rows, int n_in,
+                      int salt) {
+    const int blocks = n_in / 256;
+    const uint64_t bytes = block_bytes(dtype);
+    packed.resize(size_t(rows) * size_t(blocks) * bytes);
+    for (int row = 0; row < rows; ++row) {
+        for (int b = 0; b < blocks; ++b) {
+            std::vector<uint8_t> value = packed_row(dtype, block, row + salt + 5 * b);
+            value[0] = uint8_t((value[0] + 17 * b + salt) & 0xFF);
+            if (dtype == YUUKA_DTYPE_IQ2_S) {
+                for (int i = 0; i < 8; ++i) {
+                    value[74 + i] = 0x0F;
+                }
+            }
+            std::memcpy(packed.data() + (size_t(row) * blocks + b) * bytes,
+                        value.data(), bytes);
+        }
+    }
+}
+
 // dequant runs yuuka_dequant_f16 over one packed matrix and returns the decoded
 // values as FP32. An empty result means the call failed.
 std::vector<float> dequant(context & ctx, const std::vector<uint8_t> & packed,
@@ -304,8 +329,8 @@ yuuka_status add_op(yuuka_plan * plan, yuuka_op & op) {
 // SwiGLU tile is already in the buffers, which is how the two down kernels are
 // compared over identical activation digits.
 int run_route(context & ctx, route kind, buffers & b, int rows, int experts, int used,
-              int hidden, int ffn, int tile_j, uint32_t dtype, bool gate_up,
-              std::vector<float> & gate, std::vector<float> & up,
+              int hidden, int ffn, int tile_j, uint32_t dtype, uint32_t down_dtype,
+              bool gate_up, std::vector<float> & gate, std::vector<float> & up,
               std::vector<float> & out) {
     const int slots = rows * used;
     yuuka_plan * plan = nullptr;
@@ -379,7 +404,7 @@ int run_route(context & ctx, route kind, buffers & b, int rows, int experts, int
     op.n[2] = rows;
     op.n[3] = experts;
     op.n[4] = used;
-    op.u[0] = dtype;
+    op.u[0] = down_dtype;
     add(op);
 
     op.code = YUUKA_OP_MOE_REDUCE_ADD;
@@ -497,9 +522,9 @@ int check_case(context & ctx, uint32_t dtype, int tile_j) {
     // different gate/up sums, so its last stage is not the same input problem.
     std::vector<float> gate_mmq, up_mmq, out_mmq, gate_q8, up_q8, out_q8_pipeline;
     if (run_route(ctx, kRouteQ8, b, rows, experts, used, hidden, ffn, tile_j, dtype,
-                  true, gate_q8, up_q8, out_q8_pipeline) != 0 ||
+                  dtype, true, gate_q8, up_q8, out_q8_pipeline) != 0 ||
         run_route(ctx, kRouteMMQ, b, rows, experts, used, hidden, ffn, tile_j, dtype,
-                  true, gate_mmq, up_mmq, out_mmq) != 0) {
+                  dtype, true, gate_mmq, up_mmq, out_mmq) != 0) {
         free_buffers(b);
         return 1;
     }
@@ -562,7 +587,7 @@ int check_case(context & ctx, uint32_t dtype, int tile_j) {
     CHECK_STATUS(yuuka_memcpy_d2h(act_ds.data(), b.act_ds, act_ds.size() * 4));
     std::vector<float> down_q8;
     if (run_route(ctx, kRouteQ8, b, rows, experts, used, hidden, ffn, tile_j, dtype,
-                  false, gate_q8, up_q8, down_q8) != 0) {
+                  dtype, false, gate_q8, up_q8, down_q8) != 0) {
         free_buffers(b);
         return 1;
     }
@@ -603,6 +628,163 @@ int check_case(context & ctx, uint32_t dtype, int tile_j) {
     return 0;
 }
 
+// check_direct_case runs the measured qwen35moe gate/up cell through the direct
+// IQ2_XXS layout: 512 tokens, 17 experts, top-8, hidden 2048, expert FFN 512,
+// and 32-assignment tiles. Expert 16 is empty; the replaced slots make bucket
+// sizes 1, 15, 31, 32, 33, 63, 97, and 127, which covers exact tile boundaries,
+// tails, and multi-tile buckets. Every bucket is shuffled with a fixed seed.
+// All slots are compared with dp4a on the same Q8_1 digits, and sampled
+// channels are compared with the independent host arithmetic over the decoded
+// weights.
+int check_direct_case(context & ctx, uint32_t down_dtype) {
+    constexpr int experts = 17, used = 8, hidden = 2048, ffn = 512, rows = 512;
+    constexpr int tile_j = 32;
+    const uint32_t gate_dtype = YUUKA_DTYPE_IQ2_XXS;
+    const int slots = rows * used;
+    CHECK(down_dtype == YUUKA_DTYPE_IQ2_S || down_dtype == YUUKA_DTYPE_IQ3_S);
+
+    std::vector<std::vector<uint8_t>> packed(3);
+    fill_matrix_wide(packed[0], gate_dtype, ref_block(gate_dtype), experts * ffn,
+                     hidden, 11);
+    fill_matrix_wide(packed[1], gate_dtype, ref_block(gate_dtype), experts * ffn,
+                     hidden, 23);
+    fill_matrix_wide(packed[2], down_dtype, ref_block(down_dtype), experts * hidden,
+                     ffn, 37);
+
+    const std::vector<float> gate_host =
+        dequant(ctx, packed[0], hidden, experts * ffn, gate_dtype);
+    const std::vector<float> up_host =
+        dequant(ctx, packed[1], hidden, experts * ffn, gate_dtype);
+    const std::vector<float> down_host =
+        dequant(ctx, packed[2], ffn, experts * hidden, down_dtype);
+    CHECK(!gate_host.empty() && !up_host.empty() && !down_host.empty());
+
+    std::mt19937 rng(9001u + uint32_t(down_dtype));
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> norm(size_t(rows) * hidden);
+    for (float & v : norm) v = dist(rng);
+
+    const int replace_after[used] = {1, 15, 31, 32, 33, 63, 97, 127};
+    std::vector<int32_t> counts(experts, 0);
+    std::vector<int32_t> assign_rows(size_t(experts) * slots, 0);
+    std::vector<int32_t> assign_slots(size_t(experts) * slots, 0);
+    for (int r = 0; r < rows; ++r) {
+        for (int s = 0; s < used; ++s) {
+            int e = (r + s) % 8;
+            if (r < replace_after[s]) e = 8 + s;
+            const int64_t j = int64_t(e) * slots + counts[e]++;
+            assign_rows[j] = r;
+            assign_slots[j] = s;
+        }
+    }
+    CHECK(counts[16] == 0);
+    for (int e = 0; e < experts; ++e) {
+        std::vector<std::pair<int32_t, int32_t>> entries;
+        entries.reserve(counts[e]);
+        for (int k = 0; k < counts[e]; ++k) {
+            const int64_t j = int64_t(e) * slots + k;
+            entries.emplace_back(assign_rows[j], assign_slots[j]);
+        }
+        std::shuffle(entries.begin(), entries.end(), rng);
+        for (int k = 0; k < counts[e]; ++k) {
+            const int64_t j = int64_t(e) * slots + k;
+            assign_rows[j] = entries[k].first;
+            assign_slots[j] = entries[k].second;
+        }
+    }
+    std::vector<float> weights(size_t(rows) * used, 1.0f);
+
+    buffers b;
+    if (!alloc_buffers(ctx, b, rows, experts, used, hidden, ffn, packed[0], packed[1],
+                       packed[2], norm, weights, counts, assign_rows, assign_slots)) {
+        std::fprintf(stderr, "direct IQ2 buffer allocation failed\n");
+        free_buffers(b);
+        return 1;
+    }
+
+    std::vector<float> gate_mmq, up_mmq, out_mmq, gate_q8, up_q8, out_q8_pipeline;
+    if (run_route(ctx, kRouteQ8, b, rows, experts, used, hidden, ffn, tile_j,
+                  gate_dtype, down_dtype, true, gate_q8, up_q8, out_q8_pipeline) != 0 ||
+        run_route(ctx, kRouteMMQ, b, rows, experts, used, hidden, ffn, tile_j,
+                  gate_dtype, down_dtype, true, gate_mmq, up_mmq, out_mmq) != 0) {
+        free_buffers(b);
+        return 1;
+    }
+    float gate_route = 0.0f, gate_scale = 1.0f, up_route = 0.0f, up_scale = 1.0f;
+    worst_diff(gate_mmq, gate_q8, gate_route, gate_scale);
+    worst_diff(up_mmq, up_q8, up_route, up_scale);
+    CHECK(gate_route <= 1e-5f * gate_scale);
+    CHECK(up_route <= 1e-5f * up_scale);
+
+    std::vector<int8_t> act_q8(size_t(slots) * ffn);
+    std::vector<float> act_ds(size_t(slots) * (ffn / 32) * 2);
+    CHECK_STATUS(yuuka_memcpy_d2h(act_q8.data(), b.act_q8, act_q8.size()));
+    CHECK_STATUS(yuuka_memcpy_d2h(act_ds.data(), b.act_ds, act_ds.size() * 4));
+    std::vector<float> down_q8;
+    if (run_route(ctx, kRouteQ8, b, rows, experts, used, hidden, ffn, tile_j,
+                  gate_dtype, down_dtype, false, gate_q8, up_q8, down_q8) != 0) {
+        free_buffers(b);
+        return 1;
+    }
+    float down_route = 0.0f, down_scale = 1.0f;
+    worst_diff(out_mmq, down_q8, down_route, down_scale);
+    CHECK(down_route <= 1e-5f * down_scale);
+
+    // Sample the first, middle, and last assignment of every nonempty bucket
+    // and check four output channels against the independent host product.
+    const int gate_channels[4] = {0, 1, 7, ffn - 1};
+    const int down_channels[4] = {0, 1, 7, hidden - 1};
+    int sampled = 0;
+    for (int e = 0; e < experts; ++e) {
+        if (counts[e] == 0) {
+            continue;
+        }
+        const int picks[3] = {0, counts[e] / 2, counts[e] - 1};
+        for (int pick : picks) {
+            const int64_t j = int64_t(e) * slots + pick;
+            const int row = assign_rows[j];
+            const int slot = row * used + assign_slots[j];
+            const std::vector<float> x = quantize_q8_1_host(
+                std::vector<float>(norm.begin() + int64_t(row) * hidden,
+                                   norm.begin() + int64_t(row + 1) * hidden));
+            for (int c : gate_channels) {
+                const float * grow = &gate_host[(int64_t(e) * ffn + c) * hidden];
+                const float * urow = &up_host[(int64_t(e) * ffn + c) * hidden];
+                float g = 0.0f;
+                float u = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    g += grow[i] * x[i];
+                    u += urow[i] * x[i];
+                }
+                CHECK(std::fabs(gate_mmq[int64_t(slot) * ffn + c] - g) <=
+                      2e-2f * (1.0f + std::fabs(g)));
+                CHECK(std::fabs(up_mmq[int64_t(slot) * ffn + c] - u) <=
+                      2e-2f * (1.0f + std::fabs(u)));
+            }
+            for (int c : down_channels) {
+                const float * drow = &down_host[(int64_t(e) * hidden + c) * ffn];
+                float value = 0.0f;
+                for (int i = 0; i < ffn; ++i) {
+                    value += float(act_q8[int64_t(slot) * ffn + i]) *
+                             act_ds[int64_t(slot) * (ffn / 32) * 2 + (i / 32) * 2] *
+                             drow[i];
+                }
+                CHECK(std::fabs(out_mmq[int64_t(slot) * hidden + c] - value) <=
+                      2e-2f * (1.0f + std::fabs(value)));
+            }
+            ++sampled;
+        }
+    }
+    free_buffers(b);
+    std::printf("  direct IQ2_XXS gate/up, %s down, M=%d buckets "
+                "1/15/31/32/33/63/97/127 empty=16, %d sampled: "
+                "gate q8 %.3g up %.3g down q8 %.3g\n",
+                down_dtype == YUUKA_DTYPE_IQ2_S ? "IQ2_S" : "IQ3_S", rows, sampled,
+                gate_route, up_route, down_route);
+    std::fflush(stdout);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -620,6 +802,13 @@ int main() {
                 teardown(ctx);
                 return 1;
             }
+        }
+    }
+    for (uint32_t down_dtype :
+         {uint32_t(YUUKA_DTYPE_IQ2_S), uint32_t(YUUKA_DTYPE_IQ3_S)}) {
+        if (check_direct_case(ctx, down_dtype) != 0) {
+            teardown(ctx);
+            return 1;
         }
     }
     teardown(ctx);

@@ -358,10 +358,18 @@ func SelectDecodeGemvPath(dtype tensor.DType, nIn, nOut int64, int8Matvec bool) 
 // fill the device. A shape it rejects keeps the tiled kernel, which is correct
 // for every format.
 func PrefillAttentionMMA(heads, kvHeads, headDim, rows, position int, dtype tensor.DType) bool {
-	if heads != 4*kvHeads || headDim <= 0 || rows <= 0 {
+	if headDim <= 0 || rows <= 0 {
 		return false
 	}
 	if dtype != tensor.F32 && dtype != tensor.F16 {
+		return false
+	}
+	ratio4 := heads == 4*kvHeads
+	// The 8:1 GQA geometry is supported only with F16 KV and width 256, the
+	// shape qwen35moe uses; its two workgroups per KV head are wired in the
+	// native grouped-head kernel.
+	ratio8 := dtype == tensor.F16 && headDim == 256 && heads == 8*kvHeads
+	if !ratio4 && !ratio8 {
 		return false
 	}
 	if headDim != 64 && headDim != 128 && headDim != 256 {

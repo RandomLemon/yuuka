@@ -911,10 +911,9 @@ hipError_t launch_attention_prefill_paged_f32(float * out, const float * q,
     }
     if (prefer_wmma &&
         attention_wmma_supported(heads, kv_heads, head_dim, block_size, dtype)) {
-        launch_attention_prefill_paged_wmma_f32(
+        return launch_attention_prefill_paged_wmma_f32(
             out, q, k_pool, v_pool, block_table, block_size, kv_heads, heads,
             head_dim, kv_dim, rows, position, scale, dtype, dense, stream);
-        return hipSuccess;
     }
     const int vec = (head_dim + 31) / 32;
     const size_t shared =
