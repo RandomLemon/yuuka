@@ -223,7 +223,14 @@ func TestSelectLMHeadPath(t *testing.T) {
 		{"speculative block", tensor.Q6_K, 16, 2560, 248320, true},
 		{"above row cap", tensor.Q6_K, 17, 2560, 248320, false},
 		{"zero rows", tensor.Q6_K, 0, 2560, 248320, false},
-		{"narrow output", tensor.Q6_K, 1, 2560, 512, false},
+		{"narrow output", tensor.Q6_K, 1, 2048, 511, false},
+		{"k-quant 512 output", tensor.Q6_K, 1, 2048, 512, true},
+		{"q4k 511", tensor.Q4_K, 1, 2048, 511, false},
+		{"q5k 512", tensor.Q5_K, 1, 2048, 512, true},
+		{"q6k 512", tensor.Q6_K, 1, 2048, 512, true},
+		{"q8_0 512", tensor.Q8_0, 1, 2048, 512, false},
+		{"f16 512", tensor.F16, 1, 2048, 512, false},
+		{"q4k 1024", tensor.Q4_K, 1, 2048, 1024, true},
 		{"smallest selected width", tensor.Q6_K, 1, 2560, 1024, true},
 		{"width not a K step", tensor.Q6_K, 1, 2560 + 128, 248320, false},
 		{"q8_0", tensor.Q8_0, 1, 2560, 151936, true},
@@ -234,6 +241,32 @@ func TestSelectLMHeadPath(t *testing.T) {
 		got := SelectLMHeadPath(c.dtype, c.rows, c.nIn, c.nOut)
 		if got != c.want {
 			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestSelectDecodeGemvPathKQuant512 pins the decode matvec route for the
+// 512-output projections of the K-quant weights: the streaming kernel serves
+// them, and every other dtype keeps the per-row block because its measured
+// crossover stays at 1024 outputs.
+func TestSelectDecodeGemvPathKQuant512(t *testing.T) {
+	cases := []struct {
+		dtype      tensor.DType
+		nIn, nOut  int64
+		int8Matvec bool
+		want       DecodeGemvPath
+	}{
+		{tensor.Q5_K, 2048, 512, false, DecodeGemvStreaming},
+		{tensor.Q6_K, 2048, 512, false, DecodeGemvStreaming},
+		{tensor.Q4_K, 2048, 511, false, DecodeGemvPerRow},
+		{tensor.Q8_0, 2048, 512, false, DecodeGemvPerRow},
+		{tensor.F16, 2048, 512, false, DecodeGemvPerRow},
+	}
+	for _, c := range cases {
+		got := SelectDecodeGemvPath(c.dtype, c.nIn, c.nOut, c.int8Matvec)
+		if got != c.want {
+			t.Errorf("%v nIn=%d nOut=%d: got %v want %v", c.dtype, c.nIn, c.nOut,
+				got, c.want)
 		}
 	}
 }

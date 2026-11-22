@@ -108,7 +108,7 @@ func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
 	if rows <= 0 || rows > MaxLMHeadRows {
 		return false
 	}
-	if nIn <= 0 || nOut < lmHeadMinOutputs || nIn%256 != 0 {
+	if nIn <= 0 || nOut < lmHeadMinOutputsFor(dtype) || nIn%256 != 0 {
 		return false
 	}
 	switch dtype {
@@ -120,18 +120,26 @@ func SelectLMHeadPath(dtype tensor.DType, rows, nIn, nOut int64) bool {
 	}
 }
 
-// lmHeadMinOutputs is the measured crossover below which the per-row GEMV is
+// lmHeadMinOutputsFor is the measured crossover below which the per-row GEMV is
 // still the better route. The threshold is shared by the one-row decode matvec
-// and the 1-16-row prefill tail, so it stays at the value measured for the
+// and the 1-16-row prefill tail, so it uses the value measured for the
 // multi-row channel-parallel form: at 2560 input values that form wins from 512
 // outputs upward for Q4_K, Q5_K, and Q6_K and from 1536 upward for Q8_0 and F16.
-// After the one-row remap (gemv_row_kernel) the decode sweep measures the
-// streaming route ahead from 256 outputs for every dtype, but the shared
-// predicate cannot use that without a multi-row measurement for the same
-// widths; no supported model has an output projection between 512 and 1536, so
-// the difference is not reachable today. Sweeps: build/yuuka_prefill_sweep
-// (LMHEAD cells) and build/yuuka_gemv_decode_sweep --threshold.
-const lmHeadMinOutputs = 1024
+// The 1024-output cell of Q8_0 and F16 is level with the per-row form and 1536
+// is the measured win, so they keep the higher threshold. After the one-row
+// remap (gemv_row_kernel) the decode sweep measures the streaming route ahead
+// from 256 outputs for every dtype, but the shared predicate cannot use that
+// without a multi-row measurement for the same widths. Sweeps:
+// build/yuuka_prefill_sweep (LMHEAD cells) and
+// build/yuuka_gemv_decode_sweep --threshold.
+func lmHeadMinOutputsFor(dtype tensor.DType) int64 {
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+		return 512
+	default:
+		return 1024
+	}
+}
 
 // DecodeGemvPath is the selected decode matvec implementation.
 type DecodeGemvPath int
