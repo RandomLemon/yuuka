@@ -619,8 +619,10 @@ block dequantization has separate reference tests for `IQ2_XXS`, `IQ2_S`, and
 fixture on the CPU and HIP paths and a scripted partial-accept speculative
 rollback test. Native coverage includes the grouped MoE kernels for F32 and
 Q4_K, the selected and grouped pipelines for IQ2_XXS/IQ2_S/IQ3_S expert
-matrices, and the shared-expert accumulation. The real-model HIP tests use an
-F32 KV pool so the expert arithmetic is compared without KV storage rounding.
+matrices, the Q8_1 int8 expert pipeline (compared against a host computation
+over the dequantized Q8_1 activations), and the shared-expert accumulation. The
+real-model HIP tests use an F32 KV pool so the expert arithmetic is compared
+without KV storage rounding.
 
 Real-model chunked prefill is gated on token behavior, not on a tight logit
 bound. Against the CPU reference the recorded maximum absolute logit difference

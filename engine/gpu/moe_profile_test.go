@@ -19,63 +19,67 @@ import (
 // operation events add overhead and clocks are not pinned.
 func TestGPUProfileMoE(t *testing.T) {
 	reader, tok, model := openMoEModel(t)
-	ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 40))
+	ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 90))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) < 128 {
-		t.Skipf("prompt produced %d tokens, need 128", len(ids))
+	const capacity = 1024
+	chunks := []int{128, 512}
+	if len(ids) < chunks[len(chunks)-1] {
+		t.Skipf("prompt produced %d tokens, need %d", len(ids), chunks[len(chunks)-1])
 	}
-	ids = ids[:128]
-	const capacity = 512
 	rt, err := NewWithKVType(reader, model, capacity, tensor.F16)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
 	defer rt.Close()
-	if err := rt.SetPrefillChunk(128); err != nil {
-		t.Fatal(err)
-	}
 	s := rt.session
-	plan, err := s.prefillPlan(128)
-	if err != nil {
-		t.Fatal(err)
+	var times []hip.OpTime
+	for _, rows := range chunks {
+		if err := rt.SetPrefillChunk(rows); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := s.prefillPlan(rows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunkIDs := ids[:rows]
+
+		// Prefill: one chunk, first the wall clock on the plain path and then
+		// the per-operation attribution.
+		if err := s.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rt.model.device.UploadInt32(rt.model.prefill.tokens, chunkIDs); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if err := plan.Execute(rt.model.stream, 0, 0, true, rt.model.event); err != nil {
+			t.Fatal(err)
+		}
+		if err := rt.model.event.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		wall := time.Since(start)
+
+		if err := s.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rt.model.device.UploadInt32(rt.model.prefill.tokens, chunkIDs); err != nil {
+			t.Fatal(err)
+		}
+		times, err = plan.ExecuteProfiled(rt.model.stream, 0, 0, true, rt.model.event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		logMoEProfile(t, "prefill", rows, wall, times)
 	}
 
-	// Prefill: one chunk, first the wall clock on the plain path and then the
-	// per-operation attribution.
-	if err := s.Reset(); err != nil {
-		t.Fatal(err)
-	}
-	if err := rt.model.device.UploadInt32(rt.model.prefill.tokens, ids); err != nil {
-		t.Fatal(err)
-	}
-	start := time.Now()
-	if err := plan.Execute(rt.model.stream, 0, 0, true, rt.model.event); err != nil {
-		t.Fatal(err)
-	}
-	if err := rt.model.event.Wait(); err != nil {
-		t.Fatal(err)
-	}
-	wall := time.Since(start)
-
-	if err := s.Reset(); err != nil {
-		t.Fatal(err)
-	}
-	if err := rt.model.device.UploadInt32(rt.model.prefill.tokens, ids); err != nil {
-		t.Fatal(err)
-	}
-	times, err := plan.ExecuteProfiled(rt.model.stream, 0, 0, true, rt.model.event)
-	if err != nil {
-		t.Fatal(err)
-	}
-	logMoEProfile(t, "prefill", 128, wall, times)
-
-	// Decode: one step after the chunk, profiled the same way.
+	// Decode: one step after the widest chunk, profiled the same way.
 	if _, err := rt.ProfileStep(ids[len(ids)-1]); err != nil {
 		t.Fatal(err)
 	}
-	start = time.Now()
+	start := time.Now()
 	times, err = rt.ProfileStep(ids[len(ids)-1])
 	if err != nil {
 		t.Fatal(err)

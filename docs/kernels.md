@@ -133,6 +133,7 @@ hard-coded from another GPU.
 | `rmsnorm` / `rope` | All stages | Minimize memory traffic and launches |
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
 | `moe_route` / `moe_gate_up_grouped` / `moe_down_grouped` | Sparse MoE prefill | Top-k routing, per-expert assignment bins, packed expert reads |
+| `moe_gate_up_q8` / `moe_down_q8` | Sparse MoE prefill, IQ experts | Q8_1 activation tile, int8 `dp4a`, sixteen-assignment tile |
 | `moe_gate_up_selected` / `moe_down_selected` / `moe_shared_add` | Sparse MoE decode | One grid per routing slot, no binning, sigmoid-gated shared expert |
 | `sampling` | Output | GPU sampling or a low-cost host path |
 
@@ -195,9 +196,13 @@ over a 512-value step, no shared-memory staging and no barrier inside K.
 
 The rule, in output width at `n_in = 2560` and one row: the streaming family
 wins from 512 outputs for Q4_K/Q5_K/Q6_K and from 1536 for Q8_0/F16 (5.3.1),
-so the selector requires `n_out >= 1024`, a K step of 256 values, a dtype in the
-GEMV family, and 1-16 rows. Within that, a block of exactly one row whose K is a
-multiple of 512 takes the remapped form and everything else takes the
+so the selector requires `n_out >= 512` for the K-quants and `n_out >= 1024`
+for Q8_0/F16, a K step of 256 values, a dtype in the GEMV family, and 1-16 rows.
+The K-quant threshold is the one their 512-output cell measured, which is where
+the routed expert gate and up projections sit; Q8_0 and F16 keep the higher
+threshold because their 1024-output cell is level with the per-row form and 1536
+is their measured win. Within the family, a block of exactly one row whose K is
+a multiple of 512 takes the remapped form and everything else takes the
 channel-parallel form. Shapes outside the family keep the per-row kernel. The
 32-output recurrent projections are the only decode shapes that land on the
 fallback.
@@ -1071,6 +1076,34 @@ The routing and assignment buffers are sized `experts * rows * used`, which is
 safe because one row contributes exactly `used` assignments. A malformed plan
 that would exceed a bucket is rejected at plan construction.
 
+**The Q8_1 expert route.** The FP32 kernels above still pay one int8-to-float
+conversion, one sign select, and one scale multiply per expert weight value,
+which at these shapes is 805 M values per layer. For IQ2_XXS, IQ2_S, and IQ3_S
+experts, a chunk of at least sixteen rows whose `hidden` and expert FFN width are
+both multiples of 256 takes a second grouped family that keeps the digits
+integral (`moe_gate_up_q8`, `moe_down_q8`):
+
+- `quant_q8_1` quantizes the normalized tile once per layer into int8 digits plus
+  one FP32 scale per 32 values, and `silu_mul_quant_q8_1` does the same for the
+  expert SwiGLU product;
+- each block stages sixteen assignment rows of that tile in shared memory for a
+  256-value K step (264-byte row stride, so neighbouring rows miss the same
+  banks) and decodes the gate and up span of the step into eight signed digits
+  with `iq2xxs_dot8`, `iq2s_dot8`, or `iq3s_dot8`;
+- one warp owns one output row and eight warps form a block, so one decoded
+  weight span serves all sixteen assignments: an assignment costs one eight-byte
+  LDS read, two `v_dot4` instructions, and two multiply-adds per eight values,
+  and the two block scales are applied once per span instead of once per value.
+
+The int8 product is exact, so the only difference from the FP32 route is where
+the scales are applied. `tests/hip/iq_moe_test.cpp` runs the full Q8_1 pipeline
+and requires it to match a host computation over the same decoded weights and the
+dequantized Q8_1 activations to 2e-2; the measured difference is 1.5e-6, and the
+two routes select the same experts. Shorter chunks, other widths, and non-IQ
+experts keep the FP32 grouped kernels, which is also what serves the cropped
+one-row FFN of the last layer. The route is a plan-build-time decision
+(`addMoEPrefillFFN`), not a runtime option.
+
 The grouped grid is the prefill form. At one token it would launch
 `experts * ffn` blocks, of which only `used * ffn` correspond to selected
 experts, so the decode plan uses a second family indexed by
@@ -1094,29 +1127,34 @@ IQ span decoders are reached without a per-element dtype switch.
 values and requires the grouped and selected pipelines to agree with a host
 computation over the same decoded expert matrices.
 
-Measured cost (2026-11-19, gfx1151, Qwen3.6-35B-A3B-UD-IQ2_XXS, tables and
+Measured cost (2026-11-22, gfx1151, Qwen3.6-35B-A3B-UD-IQ2_XXS, tables and
 reference comparison in
 [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution)):
 
 | Stage | Stage time | Share of its phase |
 | --- | ---: | ---: |
-| `moe_down_grouped`, 128-row chunk | 89.7 ms | 35.2% of the chunk |
-| `moe_gate_up_grouped`, 128-row chunk | 77.4 ms | 30.4% of the chunk |
+| `moe_gate_up_q8`, 512-row chunk | 159.9 ms | 24.9% of the chunk |
+| `moe_down_q8`, 512-row chunk | 203.3 ms | 31.6% of the chunk |
+| `moe_gate_up_grouped` + `moe_down_grouped`, 128-row chunk | 167.1 ms | 65.6% of the chunk |
+| `moe_gate_up_q8` + `moe_down_q8`, 128-row chunk | 99.4 ms | 53.5% of the chunk |
 | `moe_route`, one row | 12 us per layer | 2.4% of a decode step |
 | `moe_gate_up_selected` + `moe_down_selected`, one token | 3.6 ms | 18.5% of a decode step |
 
-The selected-expert pair now costs 3.6 ms per token for the 1.007 G weight
-values a token decodes, at or below the reference's 4.4 ms for the same stage,
-and the grouped stage streams the 9.06 GB expert weight set at 54 GB/s. What remains is the per-value cost of the FP32 route: one codebook
-fetch per eight values, but also one int8-to-float conversion, one sign select,
-and one scale multiply per value, which the expert stage issues 805 M times per
-layer. The reference avoids that by keeping the decoded values as int8 digits
-and consuming them with `dp4a` against Q8_1-quantized activations, four products
-per instruction. That is the next measured step; it changes the arithmetic of
-the expert path and needs its own correctness pass. The expert matrices remain
-the one tensor family this repository does not route through `gemm_mmq`
-(`packed_value` rejects the IQ types, and `dequant_span_kernel` would
-materialize an FP16 copy of 34 B parameters).
+The routed expert stage reads the 9.06 GB expert weight set of a chunk once per
+tile of sixteen assignments. At 128 rows an expert averages four assignments, so
+the FP32 route already streams the set at 54 GB/s; the int8 route cuts the
+per-value work of the same decode and reaches 91 GB/s. At 512 rows every expert
+is assigned at least one full tile, and the stage moves the same set in 363 ms
+instead of 786 ms (11.5 to 24.9 GB/s), which is 56% of the chunk instead of
+74%. What remains is the weight read itself: the decode is now one codebook
+fetch and two digit packs per eight values, and the dots are `dp4a`, so at 128
+rows the stage is within 2.0x of the reference's 49.7 ms for the same two
+matrices.
+
+The expert matrices remain the one tensor family this repository does not route
+through `gemm_mmq` (`packed_value` rejects the IQ types, and
+`dequant_span_kernel` would materialize an FP16 copy of 34 B parameters). Their
+int8 route is the dedicated kernel pair above instead.
 
 The prefill router projection is the one MoE matmul that does not follow the
 measured prefill dispatch table: an F32 router takes the FP32 batched GEMM
@@ -1169,6 +1207,15 @@ traffic without reducing occupancy:
   one-column-per-thread kernel, which reads and writes the state for every row.
   Both paths keep the row-major state layout shared with the decode kernel.
   [Prepared recurrence measurements](prefill-optimization/acceptance/04b-gdn.md)
+
+  The lane split of the prepared core is a compile-time constant
+  (`kGdnPreparedLanes`). Sweeping it from four lanes to eight and sixteen lanes
+  — 64, 128, and 256 blocks of 128 threads for sixteen heads — moved nothing:
+  61.2-61.8 ms for the 30 recurrent layers of a 512-row chunk at four and eight
+  lanes and 62.2 ms at sixteen, against a 1.0 ms run-to-run spread of a single
+  build. The core is limited by the per-row dependent FMA chain over the
+  register-resident column and by the per-row `q`/`k`/`v` reads, not by the
+  number of blocks, so the selected split stays at four lanes.
 
 ## 9. Gated delta-net
 

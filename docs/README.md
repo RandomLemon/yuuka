@@ -157,7 +157,9 @@ Implemented and tested:
   Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf. On the device the same three codebooks are
   decoded by the MoE expert kernels and by `yuuka_dequant_f16`; no general
   GEMV, GEMM, or LM-head kernel accepts them, and those families keep failing
-  explicitly.
+  explicitly. MoE prefill decodes the expert digits to int8 and dots them
+  against a Q8_1 activation tile with `dp4a` for chunks of at least sixteen
+  rows, and keeps the FP32 form for every other shape and dtype.
 - An opt-in prefill attribution profile (`TestGPUProfilePrefill`) that records
   per-operation time for a 512-token chunk at positions 0, 2048, and 7680.
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences

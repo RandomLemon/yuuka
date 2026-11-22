@@ -16,6 +16,12 @@ At `HEAD` prefill reaches 448-534 tokens/s and decode 55.0-57.4 tokens/s, that
 is 0.29-0.47 of the reference's prefill and 0.83-0.87 of its decode, with
 correctness recorded under [Correctness gates](#correctness-gates).
 
+A later pass ([2026-11-22 record](#optimization-record-2026-11-22)) moves the
+512-output decode mats to the streaming family and the routed expert prefill to
+an int8 `dp4a` route: prefill reaches 723-751 tokens/s and decode 61.8-63.6
+tokens/s, 0.46-0.67 of the reference's prefill and 0.91-0.96 of its decode. The
+reference columns below are the 2026-11-19 measurements of this file.
+
 ## Environment and protocol
 
 | Field | Value |
@@ -214,10 +220,11 @@ step and 0.3% of the chunk.
   (1024 assignments over 256 experts), so one chunk must stream that whole set
   at least once: 37 ms at the 244 GB/s read ceiling
   ([benchmarks.md](../benchmarks.md#isolated-kernels)). The reference measures
-  49.7 ms, that is 182 GB/s, and is therefore memory bound at this length. At
-  `HEAD` the expert stage is 167.1 ms, 54 GB/s of unique weight bytes: it is
-  still decode bound, not bandwidth bound, and the FP32 per-value arithmetic is
-  the reason.
+  49.7 ms, that is 182 GB/s, and is therefore memory bound at this length. The
+  FP32 grouped stage was 167.1 ms, 54 GB/s of unique weight bytes, and was
+  decode bound; the 2026-11-22 int8 route is 99.4 ms at 128 rows (91 GB/s) and
+  363.2 ms at 512 rows (24.9 GB/s), where each expert's sixteen assignments are
+  exactly one tile.
 - Decode reads 8 of 256 experts, 283 MB per token. The reference moves it at
   64 GB/s in the matvec path; `HEAD` at 78 GB/s.
 - The chunk's non-expert stages add up to 87.8 ms at `HEAD` against the
@@ -226,21 +233,23 @@ step and 0.3% of the chunk.
 
 ### What remains
 
-1. **Per-value arithmetic of the expert dot (prefill, 2.6-4.6x on that stage).**
-   One codebook fetch per eight values is already in place, but each value still
-   costs an int8-to-float conversion, a sign select, and a scale multiply before
-   its FP32 product. The reference keeps the values as int8 digits and consumes
-   them with `dp4a` against Q8_1 activations, four products per instruction. That
-   is the next step, and it changes the arithmetic of the expert path, so it
-   needs its own correctness pass and a re-recorded logit gate.
+1. **Expert weight reuse on long chunks (prefill).** The int8 route removed the
+   per-value arithmetic: one codebook fetch and two digit packs per eight values,
+   and two `dp4a` per assignment. What is left is how often the tile re-reads an
+   expert row. At 512 rows each expert averages sixteen assignments, exactly one
+   tile of sixteen, and the stage runs at 24.9 GB/s against the 244 GB/s ceiling
+   and the reference's 182 GB/s. A wider assignment tile or a weight tile shared
+   across every assignment of an expert is the next measured step; the first
+   needs a second accumulator set and the second changes the weight staging.
 2. **The assignment tile on short chunks.** Four assignments fill a tile of
-   eight at 128 rows, so the tile cannot pay for itself; a chunk of 2048 rows
-   already runs at 1.03 ms per row.
+   sixteen at 128 rows, so a tile is decoded once for four assignments, and the
+   int8 route is not selected below sixteen rows at all.
 3. **The decode tail.** 793 planned operations per token at 2.7 ms of small
    kernels; the reference dispatches more operations in less time.
 4. **The gated delta-net chunk**, 16.7 ms of the chunk against the reference's
    3.7 ms, which [kernels.md](../kernels.md#91-chunkwise-form) already records
-   as an open item.
+   as an open item. A lane split of the prepared core was swept and rejected
+   (see the [2026-11-22 record](#optimization-record-2026-11-22)).
 
 ## Optimization record
 
@@ -320,6 +329,74 @@ The current `qwen35` throughput is faster than the F16 rows of
 [benchmarks.md](../benchmarks.md#prefill-prompt-length) because those rows
 predate the streaming LM head, which the qwen35 record already notes.
 
+## Optimization record (2026-11-22)
+
+Two changes followed the attribution of the previous record, and a third
+measurement closed an open question about the gated delta-net parallelism.
+
+**Decode: the 512-output K-quant projections take the streaming matvec.**
+`SelectLMHeadPath` used one output-width threshold of 1024 for every dtype, which
+left the routed expert gate and up projections (512 outputs, K 2048) on the
+per-row GEMV even though the K-quant streaming cell is the measured winner from
+512 outputs. The threshold is now dtype-dependent: 512 for Q4_K/Q5_K/Q6_K and
+1024 for Q8_0/F16, whose 1024-output cell is level with the per-row form and
+whose measured win is at 1536. Both expert projections then select the streaming
+kernel, so the shared gate/up pair also fuses into one SwiGLU launch
+(`gemv_pair`), and the fused and unfused plans still agree to a 0 logit
+difference over eight greedy steps.
+
+| Measurement | before | after |
+| --- | ---: | ---: |
+| decode, 128-token prompt | 56.02 tokens/s | 63.45 |
+| decode, 512-token prompt | 55.98 tokens/s | 63.22 |
+
+The decode row is one build alternation against the other, four runs of
+`--prompt-tokens 128 --decode-tokens 128 --reps 3 --warmup 1`: 56.02 and 56.23
+before, 63.18 and 63.45 after. Prefill on the same alternation stayed inside the
+run-to-run spread (497-526 tokens/s for both builds), which is what the dispatch
+change predicts. After both changes the 2048-token prompt decodes at 61.81
+tokens/s.
+
+**Prefill: int8 `dp4a` expert dots.** The FP32 grouped expert kernels pay, per
+weight value, one codebook byte read, one int8-to-float conversion, one sign
+select, and one scale multiply, and they stage eight assignments per tile.
+`moe_gate_up_q8` and `moe_down_q8` instead quantize the activation tile to Q8_1
+once per layer, stage sixteen assignment rows of int8 digits in shared memory,
+decode the packed IQ digits to signed int8, and dot them with `v_dot4`. The
+route is selected at plan build time for IQ2_XXS/IQ2_S/IQ3_S experts on chunks of
+at least sixteen rows with 256-value widths; every other shape keeps the FP32
+kernels. Correctness is recorded under [Correctness gates](#correctness-gates).
+
+| Measurement | before | after |
+| --- | ---: | ---: |
+| `moe_gate_up_grouped` + `moe_down_grouped`, 128-row chunk | 167.1 ms | 99.4 ms (`*_q8`) |
+| same, 512-row chunk | 786.5 ms | 363.2 ms |
+| `TestGPUProfileMoE`, 512-row chunk wall clock | 1061.4 ms | 644.2-658.1 ms |
+| prefill 128 tokens | 537.1 tokens/s | 733.5 |
+| prefill 512 tokens | 515.1 tokens/s | 751.0 |
+| prefill 2048 tokens | (not re-baselined) | 723.3 |
+| decode, 512-token prompt | 55.98 tokens/s | 63.22 |
+
+The 512-row expert sum is 9% under the target of the pass (400 ms): the two ops
+were 349.2 + 437.3 ms before and are 159.9 + 203.3 ms after, 56% of the chunk
+instead of 74%. The prefill rate no longer falls with prompt length (733.5,
+751.0, 723.3 over a 16x longer prompt): a sixteen-assignment tile covers the four
+assignments an expert averages at 128 rows and the sixteen at 512 rows in one
+decode, and the 2048-token cells need four tiles. What remains is the weight
+read: the stage is within 2.0x of the reference's 49.7 ms for the same two
+matrices at 128 rows.
+
+**Gated delta-net: the lane split is not the lever.** The prepared recurrence
+core splits one 128-value state column across `kGdnPreparedLanes` lanes and
+holds the remaining rows in registers. Sweeping the constant from four lanes to
+eight and sixteen (64, 128, and 256 blocks of 128 threads for sixteen heads)
+moved the 30 recurrent layers of a 512-row chunk by less than the run-to-run
+spread: 61.2-61.8 ms at four and eight lanes, 62.2 ms at sixteen, against 61.2
+and 62.2 ms for two runs of the four-lane build. The constant stays at four and
+the kernel is unchanged; the remaining 2.0 ms per layer is the per-row dependent
+FMA chain and the per-row `q`/`k`/`v` reads, which needs a different
+decomposition than a lane sweep.
+
 ## Correctness gates
 
 Every record above was taken at a commit whose MoE path was verified on the same
@@ -337,6 +414,19 @@ host and model:
   which pins the three IQ codebooks against the CPU reference values and
   requires the grouped and selected expert pipelines to agree with a host
   reference within `1.7e-7`.
+- The Q8_1 expert route is gated by the same test: the full
+  `quant_q8_1` → `moe_gate_up_q8` → `silu_mul_quant_q8_1` → `moe_down_q8`
+  pipeline must match a host computation over the same decoded weights and the
+  dequantized Q8_1 activations to `2e-2` on a 32-row chunk whose two experts
+  each receive sixteen assignments, and it must select the same experts as the
+  FP32 route. The measured difference is `1.5e-6`.
+- The 2026-11-22 pass re-ran the record above unchanged: the first-logit
+  difference against the CPU reference is `0.0029`, the same four golden tokens,
+  and the 64- and 256-row chunks keep the CPU top-1 and the CPU continuation
+  (`[279, 15217, 5388, 13]`) with logit differences of 0.94 and 1.38.
+  `TestGPUChunkedPrefillLongContext` on the same GGUF reports top-1 33075 for
+  chunk sizes 128, 512, and 1024 with a maximum logit difference of 0, so the
+  Q8_1 route is chunk-invariant.
 - `go test ./...`, `go test -race ./...`, and `go test -tags hip ./...` pass.
 - `yuuka run --backend hip` generates ` Paris, a city` with F16 and F32 KV.
 
