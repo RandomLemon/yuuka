@@ -1191,10 +1191,10 @@ row is a whole number of 256-value blocks and the output width fills the
 128-channel tile. The assignment tile width comes from the measured table in
 `moeAssignmentTile`: 16 up to 384 rows, 32 from 512 to 2048, and 64 from 4096.
 The table is the measured winner of each row class in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md), where the
-synthetic tile sweep and the end-to-end A/B are recorded; at 512 rows the two
-widths tie in the synthetic sweep and the real model prefers 32 because its
-routing concentrates more assignments per expert than a random draw.
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile),
+where the tile sweep and the end-to-end numbers are recorded; at 512 rows the two
+widths tie in the sweep and the real model prefers 32 because its routing
+concentrates more assignments per expert than a random draw.
 `Options.ForceMoEQ8` keeps the Q8_1 dp4a route for the same shapes so the two can
 be compared on identical plan inputs. On the real model the route reproduces the
 golden four-token continuation and the chunk-invariant first token of the Q8_1
@@ -1229,23 +1229,20 @@ reference comparison in
 
 | Stage | Stage time | Share of its phase |
 | --- | ---: | ---: |
-| `moe_gate_up_q8`, 512-row chunk | 159.9 ms | 24.9% of the chunk |
-| `moe_down_q8`, 512-row chunk | 203.3 ms | 31.6% of the chunk |
-| `moe_gate_up_grouped` + `moe_down_grouped`, 128-row chunk | 167.1 ms | 65.6% of the chunk |
-| `moe_gate_up_q8` + `moe_down_q8`, 128-row chunk | 99.4 ms | 53.5% of the chunk |
-| `moe_route`, one row | 12 us per layer | 2.4% of a decode step |
-| `moe_gate_up_selected` + `moe_down_selected`, one token | 3.6 ms | 18.5% of a decode step |
+| `moe_gate_up_mmq`, 512-row chunk | 93.8 ms | 22.2% of the chunk |
+| `moe_down_mmq`, 512-row chunk | 49.1 ms | 11.6% of the chunk |
+| `moe_gate_up_mmq` + `moe_down_mmq`, 128-row chunk | 58.6 ms | 42.1% of the chunk |
+| `moe_route`, one row | 12 us per layer | 2.8% of a decode step |
+| `moe_gate_up_selected` + `moe_down_selected`, one token | 3.6 ms | 21.0% of a decode step |
 
 The routed expert stage reads the 9.06 GB expert weight set of a chunk once per
-tile of sixteen assignments. At 128 rows an expert averages four assignments, so
-the FP32 route already streams the set at 54 GB/s; the int8 route cuts the
-per-value work of the same decode and reaches 91 GB/s. At 512 rows every expert
-is assigned at least one full tile, and the stage moves the same set in 363 ms
-instead of 786 ms (11.5 to 24.9 GB/s), which is 56% of the chunk instead of
-74%. What remains is the weight read itself: the decode is now one codebook
-fetch and two digit packs per eight values, and the dots are `dp4a`, so at 128
-rows the stage is within 2.0x of the reference's 49.7 ms for the same two
-matrices.
+assignment tile. The int8 WMMA route decodes one 32-value codebook group per
+thread into int8 digits and dots them with the int8 WMMA, so the stage streams
+the set at 155 GB/s at a 128-row chunk and 64 GB/s at 512 rows, where the same
+weight pass is followed by four times the assignment work (two token tiles of
+MMA, four times the gathered activation bytes, and four times the expert-output
+writes). At 128 rows the stage is within 1.2x of the reference's 49.7 ms for the
+same two matrices; the record attributes the rest of the chunk.
 
 The expert matrices remain the one tensor family this repository does not route
 through `gemm_mmq` (`packed_value` rejects the IQ types, and

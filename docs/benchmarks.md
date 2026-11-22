@@ -621,7 +621,7 @@ Synthetic single-layer shape: 128 experts, top-8, hidden 2048, expert FFN 768,
 Q4_K weights. One route plus grouped gate/up, SwiGLU, grouped down, and weighted
 reduce on one stream. `build/yuuka_moe_sweep`, median of five timed submissions
 after two warmups, 2026-11-19 after the
-[MoE optimization pass](benchmarks/qwen3.6_35b_a3b.md#optimization-record); the
+[MoE optimization pass](benchmarks/qwen3.6_35b_a3b.md); the
 gate/up and down columns run the general-dtype codebook instance, which decodes
 one value per scalar step:
 
@@ -669,13 +669,13 @@ assignments, so a tile of 64 or 128 leaves most columns padded (tile 128:
 4.816 / 6.131 / 7.588 / 7.944 ms total). The assignment tile is therefore a
 dispatch decision, not a constant; the tile table the dispatch uses was measured
 per row class afterwards and is recorded with the target model in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#optimization-record-2026-11-22-int8-wmma-expert-route).
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile).
 
 `--route q8` runs the same shape through the Q8_1 `dp4a` pipeline, and
 `--dtype q4_k|q5_k|q6_k|iq2xxs|iq2s|iq3s` selects the synthetic expert codebook
 for either quantized route, so one binary covers the two quantized forms per
 codebook. Measured 2026-11-22 with the IQ staging of
-[qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#optimization-record-2026-11-22-int8-wmma-expert-route),
+[qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution),
 `--dtype iq2xxs --experts 256 --used 8 --hidden 2048 --ffn 512`, three runs per
 cell with the median reported:
 
@@ -697,9 +697,10 @@ These are kernel-pipeline numbers for a synthetic shape. End-to-end
 prefill tokens and 128 decode tokens, next to llama.cpp on the same protocol,
 is recorded in [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md),
 together with the per-operation attribution of that gap: the two expert kernels
-hold 95% of the prefill chunk and the decode step is one serial router kernel
-plus the selected-expert kernels, while the dense and attention stages are
-within 1.1-1.3x of llama.cpp.
+hold 42% of a 128-row prefill chunk and are within 1.14x of llama.cpp's int8 MMQ
+kernels, while the dense GEMM (1.33x) and the gated delta-net chunk (3.4x) carry
+the remaining chunk gap, and the decode step's largest single difference is the
+LM head and dense matvec family (1.35x).
 
 ## Kernel resource usage
 

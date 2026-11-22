@@ -1,36 +1,24 @@
 # Qwen3.6-35B-A3B (`qwen35moe`) benchmark
 
-**Objective.** Record the end-to-end throughput of the `qwen35moe` HIP path on
-gfx1151 for prompt lengths 128, 512, and 2048 and a 128-token decode, next to
-llama.cpp on the same model, device, KV format, and single-request protocol.
-The record has two parts: the measured gap as first implemented, and the
-optimization pass that followed the attribution.
+**Objective.** Record the `qwen35moe` HIP throughput on gfx1151 for prompt
+lengths 128, 512, and 2048 and for a 128-token decode, next to llama.cpp on the
+same model, device, KV format, and single-request protocol, with the
+per-operation attribution of the difference and the correctness gates the run
+was taken with.
 
-**Status.** Measured on 2026-11-19. The first record at `dd5dbf4` reached
-51.8-61.7 tokens/s prefill and 19.4-19.5 tokens/s decode against llama.cpp's
-1111-1571 and 67.9. [Measured attribution](#measured-attribution) then located
-98% of the prefill gap in the two grouped expert kernels and a third of the
-decode step in the router kernel; the [optimization record](#optimization-record)
-lists the three kernels written against that attribution and their effect.
-At `HEAD` prefill reaches 448-534 tokens/s and decode 55.0-57.4 tokens/s, that
-is 0.29-0.47 of the reference's prefill and 0.83-0.87 of its decode, with
-correctness recorded under [Correctness gates](#correctness-gates).
-
-A later pass ([2026-11-22 record](#optimization-record-2026-11-22)) moves the
-512-output decode mats to the streaming family and the routed expert prefill to
-an int8 `dp4a` route: prefill reaches 723-751 tokens/s and decode 61.8-63.6
-tokens/s, 0.46-0.67 of the reference's prefill and 0.91-0.96 of its decode. The
-[int8 WMMA record](#optimization-record-2026-11-22-int8-wmma-expert-route) then
-replaces the routed-expert route with the grouped int8 WMMA tile: prefill
-reaches 949-1227 tokens/s and decode stays at 63-64 tokens/s, 0.68-0.79 of the
-reference's prefill and 0.96-0.97 of its decode. The reference columns below are
-the 2026-11-19 measurements of this file.
+**Status.** Measured on 2026-11-22 at `ac7c697`. yuuka reaches 954, 1249, and
+1070 tokens/s prefill at 128, 512, and 2048 prompt tokens and 63.5, 63.0, and
+61.9 tokens/s decode, that is 0.87, 0.80, and 0.71 of the reference's prefill and
+0.94, 0.93, and 0.92 of its decode. The grouped int8 WMMA route
+([kernels.md](../kernels.md#81-moe-expert-pipeline)) runs the routed experts; its
+expert stage is within 1.14x of the reference's at a 128-row chunk, and the
+remaining gap is in the dense stages (table below).
 
 ## Environment and protocol
 
 | Field | Value |
 | --- | --- |
-| Date | 2026-11-19 |
+| Date | 2026-11-22 |
 | Model | `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` |
 | Model SHA-256 | `2e8f5f705355c56311432d0a8a5d14a696dbb7e4b197d05c75ba805fc1857bef` |
 | Model size | 10,756,586,464 bytes (10.01 GiB, 2.0625 bpw, 34.66 B parameters) |
@@ -38,400 +26,146 @@ the 2026-11-19 measurements of this file.
 | Quantization | Router and shared-expert gate F32; shared expert Q5_K/Q6_K; expert gate/up IQ2_XXS; expert down IQ2_S (37 layers) and IQ3_S (3 layers) |
 | Device | AMD Radeon 8060S Graphics, `gfx1151`, Wave32, 122,880 MiB reported VRAM |
 | ROCm / HIP | ROCm 10.1.0, HIP 7.16.26385, clang 24.0.0git |
-| Host | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S, 32 threads, 120 GiB shared memory |
+| Host | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S, 32 threads |
 | Kernel | 7.0.14-28-pve |
-| Power profile | GPU DPM `auto` (amdgpu sysfs), CPU governor `performance` |
+| Power profile | GPU DPM `performance` (amdgpu sysfs), CPU governor `performance` (`amd-pstate-epp`) |
 | Go | go1.24.4, `-tags hip` |
-| Commit | `dd5dbf4` |
-| llama.cpp | upstream v1.0.0, `b1b770d90`, ROCm build, `-ngl 99`, flash attention `auto` |
+| Commit | `ac7c697` |
+| llama.cpp | upstream `b1b770d90` (build 12359), ROCm build, `-ngl 99`, `-fa auto` |
 | Tokenizer / chat template | GGUF-embedded Qwen3.6 vocabulary and template |
 | Sampling | Greedy; decode throughput does not depend on which token is drawn |
 | KV format | F16 on both sides (the engine default) |
 | Prefill chunk | 512 tokens on both sides (`--chunk-size 512`, llama.cpp batch 2048 / ubatch 512) |
-| Warmup / repetitions | 1 / 3, median (`yuuka bench`) and mean ± standard deviation (`llama-bench`), no prefix cache |
+| Warmup / repetitions | 1 / 3 (median for `yuuka bench`, mean ± standard deviation for `llama-bench`) |
 | Concurrency | 1 request |
 
 `yuuka bench` reports TTFT from submission and `decode = (decode_tokens - 1) /
-decode p50`, matching the prefill and decode split of `llama-bench`. Numbers are
-observations on one machine, not guarantees; device clock, power, and thermal
-state are not pinned, and the two sides ran sequentially, not interleaved.
+decode p50`, matching the prefill and decode split of `llama-bench` (`pp` and
+`tg`). Numbers are observations on one machine, not guarantees; device clocks,
+power, and thermal state are not pinned beyond the settings above, and the two
+sides ran sequentially, not interleaved. Both were run twice; the two yuuka runs
+differ by at most 2.2%.
 
 ## Results
 
-The first column pair is the record of the correctness implementation at
-`dd5dbf4`; the second pair is the same measurement protocol after the
-[optimization record](#optimization-record). Both use 128 decode tokens for the
-decode row, F16 KV, and one request.
+| Measurement | yuuka run 1 | yuuka run 2 | llama.cpp | ratio (run 1) |
+| --- | ---: | ---: | ---: | ---: |
+| prefill 128 tokens | 954.11 | 933.13 | 1092.23 ± 30.22 | 0.87x |
+| prefill 512 tokens | 1249.15 | 1225.54 | 1561.85 ± 27.04 | 0.80x |
+| prefill 2048 tokens | 1070.01 | 1084.60 | 1512.87 ± 6.66 | 0.71x |
+| decode, 128-token prompt | 63.48 | 63.81 | 67.84 ± 0.79 | 0.94x |
+| decode, 512-token prompt | 63.02 | 63.16 | 67.74 ± 0.74 | 0.93x |
+| decode, 2048-token prompt | 61.94 | 61.82 | 67.16 ± 0.08 | 0.92x |
 
-| Measurement | yuuka `dd5dbf4` | llama.cpp | ratio | yuuka `HEAD` | llama.cpp | ratio |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| prefill 128 tokens | 61.67 | 1111.04 ± 21.79 | 18.0x | 509.50 | 1092.24 ± 35.11 | 2.14x |
-| prefill 512 tokens | 57.39 | 1544.60 ± 16.88 | 26.9x | 533.80 | 1600.79 ± 4.76 | 3.00x |
-| prefill 2048 tokens | 51.79 | 1570.72 ± 16.22 | 30.3x | 448.38 | 1558.81 ± 11.67 | 3.48x |
-| decode, 16 tokens | 19.49 | 67.86 ± 0.79 | 3.5x | 57.38 | 65.98 ± 0.17 | 1.15x |
+The table is tokens/s; the yuuka decode rows are the 128 generated tokens after
+the given prompt length, and the llama.cpp `tg` rows are its 128-token
+continuations after the same prompts.
 
-The `HEAD` rows are `yuuka bench --warmup 1 --reps 3` and
-`llama-bench -r 3`, measured back to back in one session on 2026-11-19; the
-decode ratio uses the 128-token prompt row. Device clocks are not pinned, and
-the 2048-token prefill row moved between 448 and 481 tokens/s across repeated
-runs of the same binary.
+Detail of run 1:
 
-Detail of the first record:
-
-- yuuka prefill p95 was 2.187 s, 8.962 s, and 40.031 s at 128, 512, and 2048
-  tokens; TTFT equals the prefill time because the measurement is single
-  request.
-- yuuka decode measured 6.504 s (19.53 tokens/s), 6.515 s (19.49), and 6.549 s
-  (19.39) at the three prompt lengths, so the decode rate was independent of
-  prompt length within 0.7%.
-- llama.cpp decode measured 67.86 ± 0.79 tokens/s in the 512-token run and
-  66.95 ± 0.03 tokens/s in the 128/2048-token run.
-- yuuka prefill rate fell 16% from 128 to 2048 tokens; llama.cpp rose 41% over
-  the same range, so the gap widened with prompt length.
-
-Detail of the `HEAD` rows:
-
-- yuuka prefill p50 was 0.251 s, 0.959 s, and 4.568 s at 128, 512, and 2048
-  tokens, 0.259 s of it previously.
-- The prefill rate still falls with prompt length (509.5 to 448.4 tokens/s over
-  a 16x longer prompt), because the assignment tile of the grouped kernels
-  bounds the weight decode to one pass per eight assignments while the tile
-  covers only four assignments at 128 rows: a longer chunk re-decodes each
-  expert row ceil(rows * used / experts / 8) times.
-- yuuka decode measured 57.38, 57.34, and 55.01 tokens/s at the three prompt
-  lengths, so it stays flat in prompt length within 4%.
-- Decode is now behind the reference by 15% and prefill by 2.1-3.5x; the
-  remaining prefill gap is the per-value arithmetic of the FP32 expert dot, see
-  [what remains](#what-remains).
+- yuuka prefill p50/p95 was 0.134/0.136 s, 0.410/0.415 s, and 1.914/1.918 s at
+  128, 512, and 2048 tokens. TTFT equals the prefill time because the
+  measurement is single request, and there is no prefix cache.
+- yuuka decode p50 was 2.001 s, 2.015 s, and 2.051 s at the three prompt
+  lengths, so the per-token rate falls 2.4% from the shortest to the longest
+  prompt as attention reads a longer KV context.
+- Prefill rate is 954 tokens/s at 128 rows and 1249 at 512 rows: a 512-row
+  chunk fills the 32-assignment tile of the grouped expert route, while a
+  128-row chunk runs the 16-wide tile at a quarter of its assignment rows. It
+  falls back to 1070 tokens/s at 2048 tokens because that run's four 512-row
+  chunks pay the attention cost of a context that grows to 2048 positions.
+- llama.cpp's prefill rate is flat at 1513-1562 tokens/s from 512 to 2048
+  tokens, so the prefill gap widens from 1.25x to 1.41x over that range.
 
 ## Measured attribution
 
-Measured 2026-11-19 in one session on the same device and GGUF as the table
-above. The yuuka column is `TestGPUProfileMoE`, which attributes one 128-row
-prefill chunk and one decode step per planned operation with HIP events. The
-reference column is a `rocprofv3 --kernel-trace` of
-`llama-bench -p 128 -n 8 -r 1 -ngl 99`, reduced by kernel name, with the
-IQ types resolved from `ggml_type`: 16 is IQ2_XXS, 22 IQ2_S, 21 IQ3_S.
+One 128-row prefill chunk and one decode step, per operation. The yuuka column
+is `TestGPUProfileMoE`, which attributes the planned operations of one chunk and
+one step with HIP events. The reference column is a `rocprofv3 --kernel-trace`
+of `llama-bench -p 128 -n 0 -r 1` for the chunk and `-p 0 -n 16 -r 1` for the
+decode, reduced per kernel name and grouped into the same stages; the IQ types
+are resolved from `ggml_type`: 16 is IQ2_XXS, 22 IQ2_S, 21 IQ3_S, 13 Q5_K, and
+14 Q6_K.
 
-`rocprofv3` inflates a traced run per dispatch. The reference's own traced run
-reported 18.8 ms per decode token against a 25.3 ms kernel sum, so the decode
-reference rows below are scaled to the reference's release step; the prefill
-rows need no correction because the kernels dominate (110.5 traced against a
-116 ms wall clock).
+Neither column is a release measurement. The instrumented yuuka chunk is
+142.5 ms against the 134 ms release prefill (128 tokens at 954 tokens/s), and
+its instrumented decode step is 19.2 ms against the 15.8 ms release step, so the
+yuuka rows are per-operation kernel time and the ratio column compares that.
+The traced llama.cpp chunk sums to 112.9 ms of kernel time against a 117.2 ms
+release prefill, and its traced decode step sums to 12.7 ms against a 14.7 ms
+release step. Both sides are therefore compared as kernel time, with the same
+bias of a few percent on each.
 
-Two sets of yuuka numbers appear below: the correctness implementation of
-`dd5dbf4`, which is the record the [optimization record](#optimization-record)
-answers, and `HEAD`.
+### Prefill, one 128-row chunk
 
-### Prefill, one 128-token chunk
-
-| Stage | `dd5dbf4` ms | `HEAD` ms | share | llama.cpp ms | `HEAD` ratio |
+| Stage | yuuka ms | share | llama.cpp ms | share | yuuka / llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| expert down (IQ2_S, IQ3_S) | 903.0 | 89.7 | 35.2% | 19.6 | 4.6x |
-| expert gate/up (IQ2_XXS) | 1046.6 | 77.4 | 30.4% | 30.1 | 2.6x |
-| dense GEMM (router, attention, shared expert) | 54.5 | 59.5 | 23.3% | 39.7 | 1.5x |
-| gated delta-net chunk | 15.1 | 16.7 | 6.5% | 3.7 | 4.5x |
-| prefill attention | 2.0 | 2.2 | 0.9% | 1.7 | 1.3x |
-| MoE router top-k | 20.8 | 0.7 | 0.3% | 0.3 | 2.3x |
-| norms, elementwise, LM head, activation quantization | 8.7 | 8.7 | 3.4% | 15.4 | 0.6x |
-| **total** | **2051.0** | **254.9** | 100% | **110.5** | **2.3x** |
+| expert gate/up (IQ2_XXS) | 39.37 | 28.3% | 31.15 | 27.6% | 1.26x |
+| expert down (IQ2_S, IQ3_S) | 19.27 | 13.8% | 20.43 | 18.1% | 0.94x |
+| dense GEMM (router, attention and shared-expert projections) | 53.19 | 38.2% | 40.09 | 35.5% | 1.33x |
+| gated delta-net chunk | 14.90 | 10.7% | 4.41 | 3.9% | 3.38x |
+| prefill attention | 1.96 | 1.4% | 1.73 | 1.5% | 1.13x |
+| MoE router top-k | 0.65 | 0.5% | 2.25 | 2.0% | 0.29x |
+| MoE expert reduce | 3.16 | 2.3% | 1.98 | 1.8% | 1.60x |
+| activation quantization (Q8_1) | 2.45 | 1.8% | 2.09 | 1.9% | 1.17x |
+| norms, elementwise, LM head, copies | 4.39 | 3.1% | 8.77 | 7.8% | 0.50x |
+| **total** | **139.33** | 100% | **112.90** | 100% | **1.23x** |
 
-The reference's 110.5 ms is `mul_mat_q<16>` (expert gate/up) 30.1,
-`mul_mat_q<22>` and `<21>` (expert down) 19.6, `mul_mat_q<13>` 22.1,
-rocBLAS 10.8, `mul_mat_q<14>` 6.8, `gated_delta_net_cuda` 3.7,
-`quantize_mmq_q8_1` 2.1, `mm_ids_helper` 1.8,
-`moe_weighted_reduction_f32` 1.9, `topk_moe_cuda` 0.3, attention 1.7, and the
-remaining elementwise kernels 15.4.
+The yuuka rows are `moe_gate_up_mmq` 39.37, `moe_down_mmq` 19.27, `gemm` 53.19,
+`recurrent_chunk` 14.90, `attention_prefill_paged` 1.96, `moe_route` 0.65,
+`moe_reduce_add` 3.16, `quant_q8_1` plus `silu_mul_quant_q8_1` 2.45, and the
+remaining norms, elementwise, LM head, and copy operations 4.39 ms. The
+reference's dense GEMM row is `mul_mat_q<13>`/`<14>` 28.86 plus the rocBLAS
+kernels 11.04 and 0.19 of F32 matvecs, and its last row includes 1.32 ms of
+Q5_K/Q6_K single-row matvecs.
 
-The expert stage is now 167.1 ms of the 254.9 ms chunk instead of 1949.6 ms of
-2051.0 ms, and the router kernel is 0.7 ms instead of 20.8 ms. The dense GEMM,
-the gated delta-net chunk, and the attention kernel are the stages the earlier
-`qwen35` pass already optimized, and they are the largest remaining non-expert
-items.
+The routed expert stage is 58.6 ms of the 139.3 ms chunk against the
+reference's 51.6 ms: gate/up is 26% slower and down is 6% faster, so the two
+expert matrices together are within 1.14x of the reference's int8 MMQ kernels at
+this chunk size. The 26.4 ms the chunk trails by is elsewhere: the dense GEMM is
+13.1 ms behind, the gated delta-net chunk 10.5, the expert gate/up 8.2, the
+expert-output reduction 1.2, quantization 0.4, and attention 0.2, offset by
+yuuka's norms and elementwise stages (4.4 ahead), its router (1.6 ahead), and
+its expert down projection (1.2 ahead). The dense GEMM and the gated delta-net
+chunk are the next targets; this record does not attribute them further.
 
 ### Decode, one token
 
-The yuuka shares come from the profiled step (19.2 ms against a 17.4 ms release
-step); the reference shares come from its trace and are scaled to its release
-step (15.2 ms per token).
-
-| Stage | `dd5dbf4` ms | `HEAD` ms | share | llama.cpp ms | `HEAD` ratio |
+| Stage | yuuka ms | share | llama.cpp ms | share | yuuka / llama.cpp |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| selected expert gate/up + down | 19.2 | 3.2 | 18.5% | 2.9 | 1.1x |
-| MoE router top-k | 17.6 | 0.4 | 2.4% | 0.3 | 1.4x |
-| LM head and dense matvec family | 12.1 | 11.0 | 63.2% | 9.0 | 1.2x |
-| norms, delta-net, attention, KV, reduce | 3.0 | 2.8 | 15.9% | 3.0 | 0.9x |
-| **total** | **52.0** | **17.4** | 100% | **15.2** | **1.15x** |
+| selected expert gate/up (IQ2_XXS) | 2.02 | 11.8% | 1.29 | 10.1% | 1.56x |
+| selected expert down (IQ2_S, IQ3_S) | 1.57 | 9.2% | 1.19 | 9.4% | 1.32x |
+| LM head and dense matvec family | 10.13 | 59.3% | 7.49 | 59.0% | 1.35x |
+| gated delta-net | 0.81 | 4.7% | 0.38 | 3.0% | 2.13x |
+| MoE router top-k | 0.48 | 2.8% | 0.26 | 2.0% | 1.85x |
+| MoE expert reduce | 0.63 | 3.7% | 0.08 | 0.6% | 7.9x |
+| attention | 0.13 | 0.7% | 0.11 | 0.9% | 1.18x |
+| activation quantization (Q8_1) | — | — | 0.38 | 3.0% | — |
+| norms, elementwise, copies | 1.31 | 7.7% | 1.51 | 11.9% | 0.87x |
+| **total** | **17.07** | 100% | **12.69** | 100% | **1.35x** |
 
-The 52.0 ms of `dd5dbf4` is the profiled step; the release step was 51.0 ms.
-Decode is now within 15% of the reference, and every stage is inside 1.6x of it.
-The remaining difference is the number of small operations: 793 planned
-operations per step against the reference's 2979 dispatches, whose per-dispatch
-cost is lower.
+The yuuka rows are `moe_gate_up_selected` 2.02, `moe_down_selected` 1.57,
+`lm_head` with `gemv`, `gemv_pair`, and `gemv_residual` 10.13,
+`recurrent_token` with `conv_l2norm` 0.81, `moe_route` 0.48, `moe_reduce_add`
+0.63, `attention_paged` 0.13, and the remaining norms, rope, KV writes, and
+copies 1.31 ms. The reference's dense matvec row is its
+`mul_mat_vec_q<12..14>` (Q4_K/Q5_K/Q6_K) and `mul_mat_vec_f` kernels; its expert
+matvecs (`mul_mat_vec_q<16>`, `<22>`, `<21>`) are the two rows above. yuuka's
+decode runs the FP32 streaming matvec and decodes the expert digits per value,
+so it has no Q8_1 pass in this step, while the reference spends 0.38 ms
+quantizing the activations its int8 matvecs read.
 
-### Root cause 1: one scalar decode per weight value
+The experts are 3.6 ms of the 17.1 ms step against the reference's 2.5 ms, and
+the largest single difference is the LM head and dense matvec family: 10.13 ms
+across 311 operations against 7.49 ms.
 
-Both expert stages were governed by the same quantity: how fast one packed
-weight value is decoded and consumed. `iq2xxs_value`, `iq2s_value`, and
-`iq3s_value` recompute the block offset and fetch the codebook entry, the sign
-byte, the aux words, and the block scale per element. The compiler lowers those
-`__constant__` tables to per-lane loads because the index is divergent, so one
-value cost about five memory operations and thirty integer operations.
-llama.cpp's `vec_dot_iq2_xxs_q8_1` instead fetches one 8-value codebook entry
-per eight values and accumulates them with two `dp4a` instructions against Q8_1
-activations; its MMQ path additionally stages a decoded int8 tile in shared
-memory once and reuses it across the rows of the tile.
+## Assignment tile
 
-`dd5dbf4` decoded 66 G weight values/s in prefill and 52 G/s in decode; the
-reference's MMQ tile path decodes 648 G values/s in prefill and its `dp4a`
-matvec 229 G values/s in decode. The [optimization record](#optimization-record)
-closed the codebook-fetch half of that difference for decode and most of the
-reuse half for prefill; the per-value arithmetic is what remains.
-
-### Root cause 2: no cross-row weight reuse (prefill only)
-
-The grouped kernels of `dd5dbf4` looped over an expert's binned assignments
-inside the block and re-read and re-decoded the packed row for each one, so a
-chunk decoded `rows * used` weight rows instead of one row per expert: 4x more
-decode work at 128 rows, and the factor grew with the prompt length because
-`rows * used / experts` grows with it. The measured consequence was that the
-per-row expert cost equalled the per-token decode cost:
-
-| Prefill rows | `dd5dbf4` ms/row | `HEAD` ms/row | llama.cpp ms/row |
-| ---: | ---: | ---: | ---: |
-| 128 | 15.8 | 1.99 | 0.91 |
-| 512 | 18.1 | 1.87 | 0.63 |
-| 2048 | 19.0 | 1.03 | 0.63 |
-
-`HEAD` costs 1.99 ms per row at 128 rows because the assignment tile covers
-four assignments while the eight-value tile has to be filled by one pass over
-ceil(count / 8) tiles; the per-row cost falls to 1.03 ms at 2048 rows, where the
-tile pays for itself.
-
-### Root cause 3: a serial router
-
-The decode router kernel was serialization, not arithmetic: it launched one
-block per row and let thread 0 run an `O(used x experts x used)` scan with
-dependent loads, which is 0.44 ms per layer for a single row. The reference
-holds the 256 logits in warp registers and reduces within the warp, 13 us per
-layer. At `HEAD` the router costs 12 us per layer, which is 2.4% of the decode
-step and 0.3% of the chunk.
-
-### Bounds
-
-- The expert weights are 9.06 GB (expert gate/up 5.54 GB of IQ2_XXS, expert down
-  3.53 GB of IQ2_S and IQ3_S). Every expert receives assignments at 128 rows
-  (1024 assignments over 256 experts), so one chunk must stream that whole set
-  at least once: 37 ms at the 244 GB/s read ceiling
-  ([benchmarks.md](../benchmarks.md#isolated-kernels)). The reference measures
-  49.7 ms, that is 182 GB/s, and is therefore memory bound at this length. The
-  FP32 grouped stage was 167.1 ms, 54 GB/s of unique weight bytes, and was
-  decode bound; the 2026-11-22 int8 route is 99.4 ms at 128 rows (91 GB/s) and
-  363.2 ms at 512 rows (24.9 GB/s), where each expert's sixteen assignments are
-  exactly one tile.
-- Decode reads 8 of 256 experts, 283 MB per token. The reference moves it at
-  64 GB/s in the matvec path; `HEAD` at 78 GB/s.
-- The chunk's non-expert stages add up to 87.8 ms at `HEAD` against the
-  reference's 60.8 ms; the dense GEMM and the gated delta-net chunk are 76.2 ms
-  of that.
-
-### What remains
-
-1. **Expert weight reuse on long chunks (prefill).** The int8 route removed the
-   per-value arithmetic: one codebook fetch and two digit packs per eight values,
-   and two `dp4a` per assignment. What is left is how often the tile re-reads an
-   expert row. At 512 rows each expert averages sixteen assignments, exactly one
-   tile of sixteen, and the stage runs at 24.9 GB/s against the 244 GB/s ceiling
-   and the reference's 182 GB/s. A wider assignment tile or a weight tile shared
-   across every assignment of an expert is the next measured step; the first
-   needs a second accumulator set and the second changes the weight staging.
-2. **The assignment tile on short chunks.** Four assignments fill a tile of
-   sixteen at 128 rows, so a tile is decoded once for four assignments, and the
-   int8 route is not selected below sixteen rows at all.
-3. **The decode tail.** 793 planned operations per token at 2.7 ms of small
-   kernels; the reference dispatches more operations in less time.
-4. **The gated delta-net chunk**, 16.7 ms of the chunk against the reference's
-   3.7 ms, which [kernels.md](../kernels.md#91-chunkwise-form) already records
-   as an open item. A lane split of the prepared core was swept and rejected
-   (see the [2026-11-22 record](#optimization-record-2026-11-22)).
-
-## Optimization record
-
-Three kernel changes were written against the attribution above, and each was
-measured with the protocol of this file. The stage rows are direct
-measurements; the decode and prefill rates are the release numbers before and
-after the whole pass, because the intermediate steps were not re-run end to
-end.
-
-**Router: one warp per row.** `moe_route_kernel` was rewritten from a
-single-thread scan to a warp-per-row top-k that keeps the row's experts in lane
-registers, masks the winner out of the register set, and reduces the slots with
-a butterfly max. The routing result is unchanged: the same lowest-index
-tie-break, the same normalization, and the same bucket order.
-
-| Measurement | before | after |
-| --- | ---: | ---: |
-| `moe_route`, one row, per layer | 0.44 ms | 12 us |
-| `moe_route`, 128-row chunk, 40 layers | 20.8 ms | 0.7 ms |
-
-**Expert decode: eight values per codebook fetch.** `iq2xxs_span8`,
-`iq2s_span8`, and `iq3s_span8` decode eight consecutive values from one codebook
-entry (two for IQ3_S) and hoist the block offset, the sign word, and the scale,
-instead of decoding one value per table fetch. The selected-expert kernels were
-restructured to one warp per output row with a warp reduction, so the block-wide
-tree reduction and its barriers are gone. The decoded values are the same
-expressions the per-value decoders evaluate.
-
-| Measurement | before | after |
-| --- | ---: | ---: |
-| `moe_gate_up_selected` + `moe_down_selected`, per token | 19.2 ms | 3.6 ms |
-
-**Expert prefill: decode once per assignment tile.** The grouped kernels now
-walk an expert's assignment list in tiles and reuse one decoded weight span
-across the tile, which removes the per-assignment re-decode of
-`dd5dbf4`. With the span decoder in place they also issue one codebook fetch per
-eight values. `kAssignTileIQ` is eight for the IQ codebooks and four for the
-general dtypes, whose scalar decoder needs the registers; the tile is a template
-parameter, so the two forms are separate instantiations.
-
-| Measurement | before | after |
-| --- | ---: | ---: |
-| `moe_gate_up_grouped` + `moe_down_grouped`, 128-row chunk | 1949.6 ms | 167.1 ms |
-| prefill 128 tokens | 61.7 tokens/s | 509.5 tokens/s |
-| prefill 512 tokens | 57.4 tokens/s | 533.8 tokens/s |
-| prefill 2048 tokens | 51.8 tokens/s | 448.4 tokens/s |
-| synthetic grouped pipeline, 128 experts, 32 rows | 21.6 ms | 11.1 ms |
-| decode, 16 tokens | 19.5 tokens/s | 57.4 tokens/s |
-
-The synthetic row is `build/yuuka_moe_sweep`
-([benchmarks.md](../benchmarks.md#grouped-moe-pipeline)), which uses Q4_K expert
-weights and therefore the generic codebook instance. The routing kernel is 20x
-faster there, and the generic gate/up instance still spills 30 VGPRs, which is
-why its gain is smaller than the IQ path's.
-
-**Effect on the dense `qwen35` path.** The pass touches three files: the MoE
-kernels, the IQ span helpers that only the MoE kernels call, and one plan
-validation rule. The dense model was A/B'd anyway, because it shares the
-library. `Qwen3.5-4B-Q4_K_M` on the same device, one request, F16 KV, warmup 1
-and median of 3, four alternations of the two builds per cell:
-
-| Cell | before the pass | at `HEAD` | delta |
-| --- | ---: | ---: | ---: |
-| prefill 128 | 1810.4 tokens/s | 1811.6 | +0.1% |
-| prefill 512 | 2212.2 tokens/s | 2206.7 | -0.2% |
-| prefill 2048 | 2292.1 tokens/s | 2281.3 | -0.5% |
-| decode 128 after pp128 | 60.5 tokens/s | 60.6 | +0.1% |
-| decode 128 after pp2048 | 59.1 tokens/s | 59.2 | +0.1% |
-
-The last column is inside the run-to-run spread: the prefill 2048 cells ranged
-2166-2303 and 2166-2299 across the four alternations. The per-operation
-attribution says the same thing structurally: `TestGPUProfileDecode` plans 355
-operations in both builds (17.15 ms and 17.25 ms profiled) and
-`TestGPUProfilePrefill` plans 581 operations for a 512-row chunk at every
-position it profiles, with per-operation counts and 0.5-3% timing differences.
-The current `qwen35` throughput is faster than the F16 rows of
-[benchmarks.md](../benchmarks.md#prefill-prompt-length) because those rows
-predate the streaming LM head, which the qwen35 record already notes.
-
-## Optimization record (2026-11-22)
-
-Two changes followed the attribution of the previous record, and a third
-measurement closed an open question about the gated delta-net parallelism.
-
-**Decode: the 512-output K-quant projections take the streaming matvec.**
-`SelectLMHeadPath` used one output-width threshold of 1024 for every dtype, which
-left the routed expert gate and up projections (512 outputs, K 2048) on the
-per-row GEMV even though the K-quant streaming cell is the measured winner from
-512 outputs. The threshold is now dtype-dependent: 512 for Q4_K/Q5_K/Q6_K and
-1024 for Q8_0/F16, whose 1024-output cell is level with the per-row form and
-whose measured win is at 1536. Both expert projections then select the streaming
-kernel, so the shared gate/up pair also fuses into one SwiGLU launch
-(`gemv_pair`), and the fused and unfused plans still agree to a 0 logit
-difference over eight greedy steps.
-
-| Measurement | before | after |
-| --- | ---: | ---: |
-| decode, 128-token prompt | 56.02 tokens/s | 63.45 |
-| decode, 512-token prompt | 55.98 tokens/s | 63.22 |
-
-The decode row is one build alternation against the other, four runs of
-`--prompt-tokens 128 --decode-tokens 128 --reps 3 --warmup 1`: 56.02 and 56.23
-before, 63.18 and 63.45 after. Prefill on the same alternation stayed inside the
-run-to-run spread (497-526 tokens/s for both builds), which is what the dispatch
-change predicts. After both changes the 2048-token prompt decodes at 61.81
-tokens/s.
-
-**Prefill: int8 `dp4a` expert dots.** The FP32 grouped expert kernels pay, per
-weight value, one codebook byte read, one int8-to-float conversion, one sign
-select, and one scale multiply, and they stage eight assignments per tile.
-`moe_gate_up_q8` and `moe_down_q8` instead quantize the activation tile to Q8_1
-once per layer, stage sixteen assignment rows of int8 digits in shared memory,
-decode the packed IQ digits to signed int8, and dot them with `v_dot4`. The
-route is selected at plan build time for IQ2_XXS/IQ2_S/IQ3_S experts on chunks of
-at least sixteen rows with 256-value widths; every other shape keeps the FP32
-kernels. Correctness is recorded under [Correctness gates](#correctness-gates).
-
-| Measurement | before | after |
-| --- | ---: | ---: |
-| `moe_gate_up_grouped` + `moe_down_grouped`, 128-row chunk | 167.1 ms | 99.4 ms (`*_q8`) |
-| same, 512-row chunk | 786.5 ms | 363.2 ms |
-| `TestGPUProfileMoE`, 512-row chunk wall clock | 1061.4 ms | 644.2-658.1 ms |
-| prefill 128 tokens | 537.1 tokens/s | 733.5 |
-| prefill 512 tokens | 515.1 tokens/s | 751.0 |
-| prefill 2048 tokens | (not re-baselined) | 723.3 |
-| decode, 512-token prompt | 55.98 tokens/s | 63.22 |
-
-The 512-row expert sum is 9% under the target of the pass (400 ms): the two ops
-were 349.2 + 437.3 ms before and are 159.9 + 203.3 ms after, 56% of the chunk
-instead of 74%. The prefill rate no longer falls with prompt length (733.5,
-751.0, 723.3 over a 16x longer prompt): a sixteen-assignment tile covers the four
-assignments an expert averages at 128 rows and the sixteen at 512 rows in one
-decode, and the 2048-token cells need four tiles. What remains is the weight
-read: the stage is within 2.0x of the reference's 49.7 ms for the same two
-matrices at 128 rows.
-
-**Gated delta-net: the lane split is not the lever.** The prepared recurrence
-core splits one 128-value state column across `kGdnPreparedLanes` lanes and
-holds the remaining rows in registers. Sweeping the constant from four lanes to
-eight and sixteen (64, 128, and 256 blocks of 128 threads for sixteen heads)
-moved the 30 recurrent layers of a 512-row chunk by less than the run-to-run
-spread: 61.2-61.8 ms at four and eight lanes, 62.2 ms at sixteen, against 61.2
-and 62.2 ms for two runs of the four-lane build. The constant stays at four and
-the kernel is unchanged; the remaining 2.0 ms per layer is the per-row dependent
-FMA chain and the per-row `q`/`k`/`v` reads, which needs a different
-decomposition than a lane sweep.
-
-## Optimization record (2026-11-22, int8 WMMA expert route)
-
-The [attribution above](#what-remains) put the expert stage at 99.4 ms (128-row
-chunk) and 363.2 ms (512-row chunk) on the Q8_1 `dp4a` route, 91 and 25 GB/s of
-the 9.06 GB unique expert bytes against the reference's 182 GB/s. The grouped
-int8 WMMA tile of the dense prefill GEMM was already in the tree
-([kernels.md](../kernels.md#81-moe-expert-pipeline)); this pass took it to the
-IQ codebooks, tuned its weight decode, and made it the default route for the
-dtypes it serves.
-
-**The route.** `moe_gate_up_mmq` and `moe_down_mmq` keep the Q8_1 activation
-tile and the routed buckets and replace the per-assignment `dp4a` with
-16x16x16 int8 WMMA over an assignment tile. One block owns one expert and one
-128-channel tile and walks the expert's bucket in tiles of `n[5]` assignments,
-so one decoded weight tile serves the whole assignment tile.
-
-**The IQ decode.** The first form decoded eight values per codebook fetch and
-applied the codebook signs value by value. It now decodes one 32-value group per
-thread with `iq2xxs_dot32`, `iq2s_dot32`, and `iq3s_dot32`: the group header is
-fetched once instead of once per WMMA half, and the signs are applied word-wise
-with `(v ^ mask) + (mask & 0x01010101)`, which is exact because no codebook entry
-holds a zero digit (`tensor.TestIQGridDigitsAreNonZero`). A thread that owns a
-whole group also writes both halves' lane slots, so the group is decoded once
-rather than twice.
-
-**The assignment tile.** The tile width is now a measured table instead of the
-bucket mean: 16 up to 384 rows, 32 from 512 to 2048, and 64 from 4096. The table
-below is the same harness and protocol as
-[benchmarks.md](../benchmarks.md#grouped-moe-pipeline), three runs per cell with
-the median reported, at the shape of this model (256 experts, top-8, hidden
-2048, expert FFN 512, IQ2_XXS gate/up and down):
+The grouped int8 WMMA route walks an expert's assignment bucket in tiles of
+`n[5]` rows, and the tile width is a dispatch table measured with
+`build/yuuka_moe_sweep --route mmq --dtype iq2xxs --experts 256 --used 8
+--hidden 2048 --ffn 512`, three runs per cell, median reported. The stage
+columns are one profiled submission after three warmups:
 
 | Chunk rows | Tile | Gate/up ms | Down ms | Total ms |
 | ---: | ---: | ---: | ---: | ---: |
@@ -447,115 +181,44 @@ the median reported, at the shape of this model (256 experts, top-8, hidden
 | 2048 | 32 | 6.135 | 5.487 | 13.365 |
 | 4096 | 64 | 10.580 | 12.673 | 26.351 |
 
-The synthetic sweep ties at 512 rows, so that boundary came from the same-session
-A/B below: routing in the real model concentrates more assignments per expert
-than a random draw, and the 16-wide tile then needs a second weight pass. The
-128-wide tile loses everywhere because the narrow channel tile doubles the block
-count, and 16 wins below 512 rows because a wider tile doubles the token tiles of
-MMA for a bucket that one 16-wide tile already covers.
-
-**Same-session A/B.** `TestGPUProfileMoE` with `YUUKA_TEST_MOE_ROUTE=q8|mmq`, one
-session per route, F16 KV, same prompt:
-
-| Measurement | Q8_1 `dp4a` | int8 WMMA | ratio |
-| --- | ---: | ---: | ---: |
-| expert stage, 128-row chunk | 98.8 ms | 58.4 | 1.69x |
-| expert stage, 512-row chunk | 354.8 ms | 142.1 | 2.50x |
-| `moe_gate_up` (`*_q8` / `*_mmq`), 512-row chunk | 160.2 ms | 93.1 | 1.72x |
-| `moe_down` (`*_q8` / `*_mmq`), 512-row chunk | 194.6 ms | 49.0 | 3.97x |
-| chunk wall clock, 128 rows | 182.9 ms | 141.6 | 1.29x |
-| chunk wall clock, 512 rows | 644.1 ms | 415.3 | 1.55x |
-| decode step wall clock | 19.28 ms | 19.26 | 1.00x |
-
-Two runs per route in one session, so the stage sums move by a few percent
-between runs; the ratios are stable within 4%.
-
-**End to end.** `yuuka bench --backend hip --warmup 1 --reps 3`, F16 KV, greedy,
-one request, chunk 512:
-
-| Measurement | previous record | this pass | ratio | llama.cpp |
-| --- | ---: | ---: | ---: | ---: |
-| prefill 128 tokens | 733.5 | 949.3 | 1.29x | 1092.24 |
-| prefill 512 tokens | 751.0 | 1226.9 | 1.63x | 1600.79 |
-| prefill 2048 tokens | 723.3 | 1065.1 | 1.47x | 1558.81 |
-| decode, 128-token prompt | 63.5 | 63.0-64.0 | 1.00x | 65.98 |
-
-The prefill cells moved 1.29-1.63x; the 2048-token cell is the slowest of the
-three because its four 512-row chunks pay the growing attention cost, which this
-pass does not touch. Decode is unchanged to within run-to-run noise, as the
-expert decode kernels were not touched.
-
-### Targets and what was missed
-
-The pass targeted an expert stage of 60 ms at 128 rows and 90 ms at 512 rows,
-that is the 37 ms weight-read floor with a small margin.
-
-| Item | Before | Target | Measured | Result |
-| --- | ---: | ---: | ---: | --- |
-| expert stage, 128 rows | 99.4 ms | <= 60 | 58.4 | met |
-| expert stage, 512 rows | 363.2 ms | <= 90 | 142.1 | missed, 2.5x better than before |
-| prefill 128 | 733.5 tok/s | >= 900 | 949.3 | met |
-| prefill 512 | 751.0 tok/s | >= 1100 | 1226.9 | met |
-| prefill 2048 | 723.3 tok/s | >= 1100 | 1065.1 | missed, 1.47x better than before |
-| decode | 63.5 tok/s | no regression | 63.0-64.0 | met |
-| first-token logit diff vs CPU | 0.0029 | <= 0.0035 | 0.0029 | met |
-
-The two misses have separate causes, and neither is the weight read:
-
-- **512-row expert stage.** Unique expert bytes per chunk pass are the same at
-  128 and 512 rows (one weight pass per expert either way), so the difference is
-  not bandwidth but the work around it: 150 GB/s of unique weight bytes at 128
-  rows against 61 GB/s at 512 rows. A diagnostic run of the same kernel with the
-  weight staging disabled puts the split per layer at 0.65 ms of activation
-  gather, MMA, and epilogue work against 0.96 ms of weight staging for a 128-row
-  chunk, and 1.25 against 1.20 ms at 512 rows. The 512-row chunk doubles the
-  activation work because a 32-wide assignment tile is two token tiles of MMA,
-  quadruples the gathered activation bytes, and quadruples the expert-output
-  traffic (gate/up write 16.8 MB and down writes 33.5 MB per layer at 512 rows
-  against 4.2 and 8.4 MB at 128 rows). The next lever is the fused
-  gate/up/SwiGLU/quantize epilogue, which removes the 16.8 MB write and read of
-  the gate/up tiles per layer; that is the optional PR4 of this plan and is not
-  claimed here. A wider channel tile (two accumulator fragment sets per warp,
-  halving the block count and the activation re-gather) is the other candidate;
-  it was not measured, and the channel tile still follows the assignment tile as
-  the warp decomposition requires.
-- **2048-token prefill.** The 512-row chunk that composes it is 1226.9 tok/s on
-  its own; the 2048-token run pays the attention cost of a 4x longer context in
-  its later chunks. The attention kernels are recorded in
-  [kernels.md](../kernels.md#75-fp16-mma-paged-prefill-attention) and are outside this pass.
+`SelectMoEPrefillPath` uses this table: 16 up to 384 rows, 32 from 512 to 2048,
+and 64 from 4096. The synthetic sweep ties between 16 and 32 at 512 rows, and
+`TestGPUProfileMoE` decides that boundary: with 16 the 512-row expert stage is
+157.6 ms and with 32 it is 142.1 ms, because routing in the real model
+concentrates more assignments per expert than a random draw and a 16-wide tile
+then needs a second weight pass. The 128-wide tile loses at every row count
+because it halves the channel tile and doubles the block count.
 
 ## Correctness gates
 
-Every record above was taken at a commit whose MoE path was verified on the same
+Every number above was taken at a commit whose MoE path was verified on the same
 host and model:
 
-- GPU decode keeps the CPU top-1 token, stays within `0.0029` maximum absolute
-  logit difference of the CPU reference on the first prompt token (0.0027 before
-  the optimization), and emits the four llama.cpp golden tokens
-  `[11751, 11, 264, 3177]` (` Paris, a city`).
+- GPU decode keeps the CPU top-1 token, stays within `0.00286746` maximum
+  absolute logit difference of the CPU reference on the first prompt token, and
+  emits the four llama.cpp golden tokens `[11751, 11, 264, 3177]`
+  (` Paris, a city`) (`TestGPUMoEGoldenGeneration`).
+- The int8 WMMA expert route and the Q8_1 `dp4a` route produce identical
+  first-token logits (maximum difference 0) and the same golden continuation on
+  the same prompt (`TestGPUMoEMmqMatchesQ8`), so the route the dispatch selects
+  does not change model behavior.
+- A 1024-token prompt prefilled at chunk sizes 128, 512, and 1024 keeps top-1
+  `33075` with a maximum logit difference of 0, so the grouped expert route is
+  chunk invariant (`TestGPUChunkedPrefillLongContext`).
 - A 256-token prompt at 64- and 256-row chunks keeps the CPU top-1 token and
-  reproduces the CPU greedy continuation; the recorded logit differences are
-  0.65 and 1.25 after the optimization, against 0.96 and 1.04 before it ([testing.md](../testing.md) explains why prefill is gated on
-  tokens rather than on a tight logit bound).
-- `ctest --test-dir build` passes 11/11, including `hip_iq_moe_correctness`,
-  which pins the three IQ codebooks against the CPU reference values and
-  requires the grouped and selected expert pipelines to agree with a host
-  reference within `1.7e-7`.
-- The Q8_1 expert route is gated by the same test: the full
-  `quant_q8_1` → `moe_gate_up_q8` → `silu_mul_quant_q8_1` → `moe_down_q8`
-  pipeline must match a host computation over the same decoded weights and the
-  dequantized Q8_1 activations to `2e-2` on a 32-row chunk whose two experts
-  each receive sixteen assignments, and it must select the same experts as the
-  FP32 route. The measured difference is `1.5e-6`.
-- The 2026-11-22 pass re-ran the record above unchanged: the first-logit
-  difference against the CPU reference is `0.0029`, the same four golden tokens,
-  and the 64- and 256-row chunks keep the CPU top-1 and the CPU continuation
-  (`[279, 15217, 5388, 13]`) with logit differences of 0.94 and 1.38.
-  `TestGPUChunkedPrefillLongContext` on the same GGUF reports top-1 33075 for
-  chunk sizes 128, 512, and 1024 with a maximum logit difference of 0, so the
-  Q8_1 route is chunk-invariant.
-- `go test ./...`, `go test -race ./...`, and `go test -tags hip ./...` pass.
-- `yuuka run --backend hip` generates ` Paris, a city` with F16 and F32 KV.
+  reproduces the CPU greedy continuation `[279, 15217, 5388, 13]` with logit
+  differences of 1.07 and 1.14 against the 2.0 gate
+  (`TestGPUMoEChunkedPrefill`; [testing.md](../testing.md) explains why prefill
+  is gated on tokens rather than on a tight logit bound).
+- `ctest --test-dir build` passes 13/13, including `hip_iq_moe_correctness`
+  (the three IQ codebooks against the CPU reference values and the grouped and
+  selected pipelines within `1.8e-7` of a host computation),
+  `hip_iq_moe_mmq_correctness` (the int8 WMMA IQ route against the `dp4a` route
+  at a `1e-5` relative bound and against the dequantized decode at `2e-2`, for
+  all three codebooks at assignment tiles 16/32/64/128), and
+  `hip_moe_mmq_correctness` (the K-quant form of the same route).
+- `go build ./...`, `go vet ./...`, `go test ./...`, `go test -race ./...`, and
+  `go test -tags hip ./...` pass.
 
 ## Reproduction
 
@@ -564,39 +227,62 @@ cd /path/to/yuuka
 go build -tags hip -o /tmp/yuuka-hip ./cmd/yuuka
 MODEL=/path/to/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
 
-/tmp/yuuka-hip bench --model "$MODEL" --backend hip \
-  --prompt-tokens 512 --decode-tokens 128 --reps 3 --warmup 1
+# Throughput. F16 KV and a 512-token chunk are the defaults.
+for p in 128 512 2048; do
+  /tmp/yuuka-hip bench --model "$MODEL" --backend hip \
+    --prompt-tokens "$p" --decode-tokens 128 --warmup 1 --reps 3
+done
 
-# Measured attribution: one 128-row chunk plus one decode step per operation.
+# Reference, same protocol.
+cd /path/to/llama.cpp/build/bin
+for p in 128 512 2048; do
+  LD_LIBRARY_PATH=. ./llama-bench -m "$MODEL" -p "$p" -n 128 -r 3 -ngl 99
+done
+
+# yuuka attribution: one 128-row chunk plus one decode step per operation.
+cd /path/to/yuuka
 YUUKA_TEST_MOE_MODEL="$MODEL" go test -tags hip ./engine/gpu \
   -run TestGPUProfileMoE -count=1 -v
 
 # Reference attribution. rocprofv3 cannot write its database from a Go process,
 # so the reference is traced as a native binary and reduced by kernel name.
-cd /path/to/llama.cpp/build/bin
-LD_LIBRARY_PATH=. ./llama-bench -m "$MODEL" -p 128,512,2048 -n 128 -r 3 -ngl 99
-mkdir -p /tmp/ref && cd /tmp/ref && LD_LIBRARY_PATH=/path/to/llama.cpp/build/bin \
-  rocprofv3 --kernel-trace -f csv -o ref -d /tmp/ref -- \
-  /path/to/llama.cpp/build/bin/llama-bench -m "$MODEL" -p 128 -n 8 -r 1 -ngl 99
+mkdir -p /tmp/ref && cd /tmp/ref
+LD_LIBRARY_PATH=/path/to/llama.cpp/build/bin rocprofv3 --kernel-trace -f csv \
+  -o pp -d /tmp/ref -- \
+  /path/to/llama.cpp/build/bin/llama-bench -m "$MODEL" -p 128 -n 0 -r 1 -ngl 99
+LD_LIBRARY_PATH=/path/to/llama.cpp/build/bin rocprofv3 --kernel-trace -f csv \
+  -o tg -d /tmp/ref -- \
+  /path/to/llama.cpp/build/bin/llama-bench -m "$MODEL" -p 0 -n 16 -r 1 -ngl 99
+
+# Assignment tile sweep.
+cd /path/to/yuuka
+for j in 16 32 64 128; do
+  build/yuuka_moe_sweep --route mmq --dtype iq2xxs --experts 256 --used 8 \
+    --hidden 2048 --ffn 512 --rows 128,512,1024,2048,4096 --tile-j "$j"
+done
 ```
 
-Reduce the reference trace by summing `End_Timestamp - Start_Timestamp` per
-`Kernel_Name`, splitting the dispatch sequence on gaps wider than 3 ms into the
-prefill chunk and the decode steps.
+For the reference trace, sum `End_Timestamp - Start_Timestamp` per `Kernel_Name`
+and split the dispatch sequence on gaps wider than 3 ms: the prefill chunk is
+the single large group, and the decode group holds one `topk_moe_cuda` dispatch
+per layer per step, which gives the step count.
 
 ## Known limits
 
 - Single request only; fused multi-request MoE decode does not exist, so this is
   not a serving-throughput number.
-- No IQ kernel specialization, weight-row reuse across assignments, or int8
-  prefill route for the expert matrices; each of those is a candidate for a
-  later optimization pass measured against this table.
 - The attribution covers one chunk size (128 rows) and one decode step at a
-  short context. The prefill rows are direct measurements; the reference decode
-  rows carry the per-dispatch correction described above, so they are estimates
-  within a few percent, not traced values.
-- Prompt lengths above 2048 tokens, other KV formats, and other IQ2_XXS
-  `qwen35moe` GGUFs are not measured.
+  short context. The throughput rows are direct measurements; the attribution
+  rows are kernel time from an instrumented run, as described above.
+- Prompt lengths above 2048 tokens, other KV formats, and other `qwen35moe`
+  GGUFs are not measured for this model.
+- The routed expert stage streams 9.06 GB of unique weight bytes at 155 GB/s for
+  a 128-row chunk and 64 GB/s for a 512-row chunk, against the 244 GB/s read
+  ceiling of [benchmarks.md](../benchmarks.md). The 512-row loss is the work
+  around the weight pass (two token tiles of MMA, four times the gathered
+  activation bytes, and four times the expert-output writes), not the read
+  itself; the fused gate/up/SwiGLU/quantize epilogue that would remove the
+  intermediate gate/up tiles is not implemented.
 - The prefill protocol of the repository is owned by
   [benchmarks.md](../benchmarks.md); this file adds one model to it and does not
   redefine it.
