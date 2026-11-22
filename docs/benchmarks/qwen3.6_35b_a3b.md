@@ -86,8 +86,12 @@ at 8192 in the release block; the confirmation block was 300.2/297.7 and
 `TestGPUProfileMoEPrefillLong` executes every 512-row chunk at its populated
 absolute position for the same 8192-token stream, so this table charges attention
 and recurrence the context they carry in the release run. It is a diagnostic:
-events add submission overhead and clocks are not pinned. The frozen and
-optimized libs are the same binaries as the release blocks.
+events add submission overhead and clocks are not pinned. Both columns run the
+current plan code against the frozen and optimized shared libraries, so the
+table isolates kernel changes. The plan-level changes (the prepared recurrent
+span and the shared-expert quantizer reuse) are present in both columns; their
+effect appears in the release baseline totals, which are 416.9 ms at 512 and
+11705.2 ms at 8192 against the profiled 386.7 and 11106.0 ms.
 
 | Stage | Base 512 | New 512 | Base 2048 | New 2048 | Base 8192 | New 8192 | 8192 saved |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -109,9 +113,12 @@ direct IQ2_XXS layout; 1086.3 ms is 67.9 ms per 512-row chunk against 88.9 ms
 before. The 19.1 ms increase in expert reduce is within the run-to-run stage
 spread and was not optimized.
 
-The recurrent chunk is unchanged because the prepared four-lane core is bound
-and measured neutral on this geometry; the state and logits are bitwise
-identical to the frozen build when attention is forced to the tiled kernel. The
+The recurrent row is neutral in this table because both columns already bind
+the prepared four-lane core from the current plan; the frozen release baseline
+ran the inline recurrence, so the plan-level saving is in the release baseline
+totals above rather than in the row. When attention is forced to the tiled
+kernel, the optimized build produces the same logits and `Session.Snapshot`
+digest as the frozen build, so the recurrence change is state-identical. The
 Q6_K dense trial and contiguous expert-store trials from the plan were not
 needed once the three speed gates passed.
 
