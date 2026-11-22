@@ -136,38 +136,30 @@ const MoEMMQMaxTileJ = 128
 // SelectMoEPrefillPath returns the routed-expert prefill route and, for the
 // int8 WMMA route, its assignment tile width.
 //
-// The tile width follows the average number of assignments an expert receives:
-// a chunk of rows tokens with top-k used over experts experts bins
-// ceil(rows*used/experts) rows per expert, and each tile of TileJ assignments
-// streams the expert's weight rows once. Taking the smallest power of two that
-// covers that average keeps one weight pass per expert at every measured chunk
-// size, which is what the route is for; a bucket that overflows it costs one
-// more pass and is still correct.
-//
-// Both quantized routes require at least MoEPrefillMinRows rows: below that the
-// Q8_1 activation pass and the grouped tile cost more than they save, which is
-// also why the one-row FFN of the last prefill chunk stays on the FP32 grouped
-// route. Above that, the int8 WMMA route serves the K-quant and the IQ expert
-// dtypes when every weight row is a whole number of 256-value blocks and the
-// output width fills the 128-channel tile. Everything
-// else falls back to the Q8_1 dp4a route for the IQ codebooks and to the FP32
-// grouped route otherwise. The thresholds are plan-build-time decisions; the
-// measured stage times that motivate them are in docs/benchmarks.md and
+// The int8 WMMA route serves the K-quant and the IQ expert dtypes when every
+// weight row is a whole number of 256-value blocks and the output width fills
+// the 128-channel tile; its assignment tile width comes from the measured table
+// in moeAssignmentTile. Both quantized routes require at least
+// MoEPrefillMinRows rows: below that the Q8_1 activation pass and the grouped
+// tile cost more than they save, which is also why the one-row FFN of the last
+// prefill chunk stays on the FP32 grouped route. Everything else falls back to
+// the Q8_1 dp4a route for the IQ codebooks and to the FP32 grouped route
+// otherwise. These are plan-build-time decisions; the measured stage times that
+// motivate them are in docs/benchmarks.md and
 // docs/benchmarks/qwen3.6_35b_a3b.md.
 //
-// allowMMQ gates the route itself. It is false unless the caller enables the
-// opt-in option, because the tile-width table below is a derivation rather than
-// a measured dispatch table yet: docs/kernels.md records the tile sweep as the
-// next measurement, and the default dispatch must not change before it lands.
-func SelectMoEPrefillPath(dtype tensor.DType, rows, used, experts, nIn, nOut int64, allowMMQ bool) (MoEPrefillPath, int64) {
+// forceQ8 keeps the Q8_1 dp4a route for the routed experts (Options.ForceMoEQ8).
+// It exists so the two routes can be compared on identical plan inputs and does
+// not change what a production session runs.
+func SelectMoEPrefillPath(dtype tensor.DType, rows, used, experts, nIn, nOut int64, forceQ8 bool) (MoEPrefillPath, int64) {
 	if rows <= 0 || used <= 0 || experts <= 0 || nIn <= 0 || nOut <= 0 {
 		return MoEPrefillF32Grouped, 0
 	}
 	if rows < MoEPrefillMinRows {
 		return MoEPrefillF32Grouped, 0
 	}
-	if allowMMQ && MoEMMQDType(dtype) && nIn%256 == 0 && nOut%128 == 0 {
-		return MoEPrefillMMQ, moeAssignmentTile(rows, used, experts)
+	if !forceQ8 && MoEMMQDType(dtype) && nIn%256 == 0 && nOut%128 == 0 {
+		return MoEPrefillMMQ, moeAssignmentTile(rows)
 	}
 	switch dtype {
 	case tensor.IQ2XXS, tensor.IQ2S, tensor.IQ3S:
@@ -197,13 +189,34 @@ func MoEMMQDType(dtype tensor.DType) bool {
 // work than they save, and the FP32 grouped route is the measured choice.
 const MoEPrefillMinRows = 16
 
-// moeAssignmentTile returns the smallest measured assignment tile that covers
-// the average bucket of one expert, clamped to the instantiated range.
-func moeAssignmentTile(rows, used, experts int64) int64 {
-	mean := (rows*used + experts - 1) / experts
-	tileJ := int64(16)
-	for tileJ < MoEMMQMaxTileJ && tileJ < mean {
-		tileJ *= 2
+// moeTileTable is the measured assignment-tile table of the int8 WMMA expert
+// route: a chunk of at least minRows rows stages tileJ assignments per weight
+// pass. Each entry is the smallest width that won its row class in the sweep of
+// docs/benchmarks/qwen3.6_35b_a3b.md at the qwen35moe shape (256 experts, top-8,
+// hidden 2048, expert FFN 512, IQ2_XXS gate/up): 16 through 384 rows, 32 from
+// 512 to 2048, and 64 from 4096. A wider tile than the bucket mean needs costs
+// one weight pass per expert, which is cheap; a tile narrower than the bucket
+// costs one more pass, which is not, so the table sits at the measured size
+// rather than at the bucket mean.
+var moeTileTable = [...]struct {
+	minRows int64
+	tileJ   int64
+}{
+	{1, 16},
+	{512, 32},
+	{4096, 64},
+}
+
+// moeAssignmentTile returns the measured assignment tile for a chunk of rows.
+// The table is measured at the shape the benchmark record covers; a model whose
+// bucket mean differs by more than 2x keeps the smallest measured width, which
+// costs extra passes, never correctness.
+func moeAssignmentTile(rows int64) int64 {
+	tileJ := moeTileTable[0].tileJ
+	for _, entry := range moeTileTable {
+		if rows >= entry.minRows {
+			tileJ = entry.tileJ
+		}
 	}
 	return tileJ
 }

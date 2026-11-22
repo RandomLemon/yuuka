@@ -11,18 +11,18 @@ import (
 )
 
 // moERouteOptions returns the Options that select the routed-expert prefill
-// route under test. YUUKA_TEST_MOE_ROUTE=mmq builds the grouped int8 WMMA expert
-// route, "q8" (or unset) keeps the released Q8_1 dp4a route, and any other value
-// fails instead of silently profiling another route. The switch exists so the
-// same model, chunk, and prompt can be attributed under both routes in one test
-// run; it never changes a default.
+// route under test. YUUKA_TEST_MOE_ROUTE=mmq (or unset) keeps the measured int8
+// WMMA route, "q8" forces the Q8_1 dp4a route through Options.ForceMoEQ8, and
+// any other value fails instead of silently profiling another route. The switch
+// exists so the same model, chunk, and prompt can be attributed under both
+// routes in one test run; it never changes a default.
 func moERouteOptions(t *testing.T) Options {
 	t.Helper()
 	opts := Options{}
 	switch route := os.Getenv("YUUKA_TEST_MOE_ROUTE"); route {
-	case "", "q8":
-	case "mmq":
-		opts.MoEMMQ = true
+	case "", "mmq":
+	case "q8":
+		opts.ForceMoEQ8 = true
 	default:
 		t.Fatalf("YUUKA_TEST_MOE_ROUTE=%q is not 'mmq' or 'q8'", route)
 	}
@@ -31,10 +31,10 @@ func moERouteOptions(t *testing.T) Options {
 
 // moERouteName names the routed-expert route the options select, for test logs.
 func moERouteName(opts Options) string {
-	if opts.MoEMMQ {
-		return "mmq"
+	if opts.ForceMoEQ8 {
+		return "q8"
 	}
-	return "q8"
+	return "mmq"
 }
 
 // TestGPUMoEMmqMatchesQ8 runs the same prompt through both routed-expert

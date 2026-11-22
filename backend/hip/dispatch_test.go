@@ -111,49 +111,60 @@ func TestSelectMoEPrefillPath(t *testing.T) {
 		used      int64
 		experts   int64
 		nIn, nOut int64
-		allowMMQ  bool
+		forceQ8   bool
 		want      MoEPrefillPath
 		wantTile  int64
 	}{
-		// The opt-in is the only thing that enables the WMMA route, so a
-		// K-quant MoE chunk keeps the FP32 grouped path by default.
-		{"q4k chunk default", tensor.Q4_K, 512, 8, 256, 2048, 512, false,
+		// The int8 WMMA route is the measured default for every dtype it
+		// decodes; the assignment tile comes from the measured table.
+		{"q4k chunk 512", tensor.Q4_K, 512, 8, 256, 2048, 512, false,
+			MoEPrefillMMQ, 32},
+		{"q4k chunk forced q8", tensor.Q4_K, 512, 8, 256, 2048, 512, true,
 			MoEPrefillF32Grouped, 0},
-		{"q4k chunk opt-in", tensor.Q4_K, 512, 8, 256, 2048, 512, true,
-			MoEPrefillMMQ, 16},
-		{"q6k chunk 2048", tensor.Q6_K, 2048, 8, 256, 2048, 512, true,
+		{"q6k chunk 2048", tensor.Q6_K, 2048, 8, 256, 2048, 512, false,
+			MoEPrefillMMQ, 32},
+		{"q6k chunk 4096", tensor.Q6_K, 4096, 8, 256, 2048, 512, false,
 			MoEPrefillMMQ, 64},
-		{"q4k short chunk", tensor.Q4_K, 16, 8, 256, 2048, 512, true,
+		{"q4k chunk 384", tensor.Q4_K, 384, 8, 256, 2048, 512, false,
 			MoEPrefillMMQ, 16},
-		{"q4k below minimum rows", tensor.Q4_K, 8, 8, 256, 2048, 512, true,
-			MoEPrefillF32Grouped, 0},
-		{"q4k odd K width", tensor.Q4_K, 512, 8, 256, 2000, 512, true,
-			MoEPrefillF32Grouped, 0},
-		// The IQ codebooks take the WMMA route once the opt-in is on, at every
-		// dtype and at the tile width the average bucket derives.
-		{"iq2xxs chunk", tensor.IQ2XXS, 512, 8, 256, 2048, 512, true,
+		{"q4k chunk 1024", tensor.Q4_K, 1024, 8, 256, 2048, 512, false,
+			MoEPrefillMMQ, 32},
+		{"q4k short chunk", tensor.Q4_K, 16, 8, 256, 2048, 512, false,
 			MoEPrefillMMQ, 16},
-		{"iq2s chunk 2048", tensor.IQ2S, 2048, 8, 256, 2048, 512, true,
+		{"q4k below minimum rows", tensor.Q4_K, 8, 8, 256, 2048, 512, false,
+			MoEPrefillF32Grouped, 0},
+		{"q4k odd K width", tensor.Q4_K, 512, 8, 256, 2000, 512, false,
+			MoEPrefillF32Grouped, 0},
+		{"q4k output tail", tensor.Q4_K, 512, 8, 256, 2048, 500, false,
+			MoEPrefillF32Grouped, 0},
+		// The IQ codebooks take the same route at the same measured tiles.
+		{"iq2xxs chunk 128", tensor.IQ2XXS, 128, 8, 256, 2048, 512, false,
+			MoEPrefillMMQ, 16},
+		{"iq2xxs chunk 512", tensor.IQ2XXS, 512, 8, 256, 2048, 512, false,
+			MoEPrefillMMQ, 32},
+		{"iq2s chunk 2048", tensor.IQ2S, 2048, 8, 256, 2048, 512, false,
+			MoEPrefillMMQ, 32},
+		{"iq3s chunk 8192", tensor.IQ3S, 8192, 8, 256, 2048, 512, false,
 			MoEPrefillMMQ, 64},
-		{"iq3s odd width", tensor.IQ3S, 512, 8, 256, 2048, 500, true,
+		{"iq3s odd width", tensor.IQ3S, 512, 8, 256, 2048, 500, false,
 			MoEPrefillF32Grouped, 0},
-		{"iq2s short chunk", tensor.IQ2S, 16, 8, 256, 2048, 512, true,
+		{"iq2s short chunk", tensor.IQ2S, 16, 8, 256, 2048, 512, false,
 			MoEPrefillMMQ, 16},
-		// Without the opt-in every dtype keeps its released route.
-		{"iq2xxs chunk default", tensor.IQ2XXS, 512, 8, 256, 2048, 512, false,
+		// The forced Q8_1 route is what the route A/B harnesses use.
+		{"iq2xxs chunk forced q8", tensor.IQ2XXS, 512, 8, 256, 2048, 512, true,
 			MoEPrefillQ8, 0},
 		// The cropped one-row FFN of the last prefill chunk keeps the FP32
 		// grouped route; the quantized tile would be almost entirely padding.
-		{"iq2xxs cropped row", tensor.IQ2XXS, 1, 8, 256, 2048, 512, true,
+		{"iq2xxs cropped row", tensor.IQ2XXS, 1, 8, 256, 2048, 512, false,
 			MoEPrefillF32Grouped, 0},
 		{"q4k cropped row", tensor.Q4_K, 1, 8, 256, 2048, 512, true,
 			MoEPrefillF32Grouped, 0},
-		{"f16 experts", tensor.F16, 512, 8, 256, 2048, 512, true,
+		{"f16 experts", tensor.F16, 512, 8, 256, 2048, 512, false,
 			MoEPrefillF32Grouped, 0},
 	}
 	for _, c := range cases {
 		got, tile := SelectMoEPrefillPath(c.dtype, c.rows, c.used, c.experts, c.nIn,
-			c.nOut, c.allowMMQ)
+			c.nOut, c.forceQ8)
 		t.Logf("%s: path=%s tile=%d", c.name, got, tile)
 		if got != c.want {
 			t.Errorf("%s: got path %s, want %s", c.name, got, c.want)

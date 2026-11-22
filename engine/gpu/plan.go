@@ -1152,16 +1152,16 @@ func (m *Model) addMoEPrefillFFN(plan *hip.Plan, prefix string, postNorm weight,
 		return err
 	}
 	// Both quantized expert routes need a Q8_1 activation tile and one whole
-	// activation tile per K step; the int8 WMMA route additionally needs a
-	// measured assignment tile width, which SelectMoEPrefillPath derives from
-	// the average bucket of one expert. The two ends of the FFN select their
-	// route independently, but the plan keeps them on the same quantized form:
-	// a mixed pair (one end quantized, the other not) has no measured plan and
-	// keeps the FP32 grouped path.
+	// activation tile per K step; the int8 WMMA route additionally needs an
+	// assignment tile width, which SelectMoEPrefillPath takes from its measured
+	// table. The two ends of the FFN select their route independently, but the
+	// plan keeps them on the same quantized form: a mixed pair (one end
+	// quantized, the other not) has no measured plan and keeps the FP32 grouped
+	// path.
 	gatePath, gateTile := hip.SelectMoEPrefillPath(gate.dtype, rows, used, experts,
-		hidden, ffn, m.moEMMQ)
+		hidden, ffn, m.forceMoEQ8)
 	downPath, downTile := hip.SelectMoEPrefillPath(down.dtype, rows, used, experts,
-		ffn, hidden, m.moEMMQ)
+		ffn, hidden, m.forceMoEQ8)
 	quantized := gatePath == downPath &&
 		(gatePath == hip.MoEPrefillMMQ || gatePath == hip.MoEPrefillQ8)
 	if quantized {

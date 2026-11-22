@@ -140,13 +140,12 @@ type Options struct {
 	// is measured slower end to end on gfx1151, and it exists so the two
 	// arithmetics can be compared on identical plans (no default path changes).
 	Int8Matvec bool
-	// MoEMMQ selects the grouped int8 WMMA expert prefill route for K-quant
-	// experts instead of the grouped FP32 route. It is off by default because
-	// the assignment-tile dispatch table has no recorded sweep yet: the route
-	// and its correctness gates exist, and turning it on waits for the measured
-	// tile table (docs/kernels.md, docs/benchmarks/qwen3.6_35b_a3b.md). It is
-	// used by the MoE benchmark harnesses, not by a released default path.
-	MoEMMQ bool
+	// ForceMoEQ8 keeps the grouped Q8_1 dp4a route for the routed-expert prefill
+	// where SelectMoEPrefillPath would take the int8 WMMA route. It exists so the
+	// two routes can be compared on identical plan inputs; production sessions
+	// leave it false, and the int8 WMMA route is the measured default for the
+	// shapes it serves (docs/kernels.md, docs/benchmarks/qwen3.6_35b_a3b.md).
+	ForceMoEQ8 bool
 	// PrequantizedInt8 submits one Q8_1 quantization operation per activation
 	// group instead of letting each int8 matvec block quantize the row itself.
 	// It exists so the two activation sources can be measured against each other;
@@ -207,7 +206,7 @@ type Model struct {
 	forceTiledAttention  bool
 	forceDecodeGemv      bool
 	int8Matvec           bool
-	moEMMQ               bool
+	forceMoEQ8           bool
 	prequantizedInt8     bool
 	legacyDeltaNet       bool
 	noResidualFusion     bool
@@ -274,7 +273,7 @@ func Open(reader *gguf.Reader, model *qwen35.Model, opts Options) (*Model, error
 		forceTiledAttention:  opts.ForceTiledAttention,
 		forceDecodeGemv:      opts.ForceDecodeGemv,
 		int8Matvec:           opts.Int8Matvec,
-		moEMMQ:               opts.MoEMMQ,
+		forceMoEQ8:           opts.ForceMoEQ8,
 		prequantizedInt8:     opts.PrequantizedInt8,
 		legacyDeltaNet:       opts.LegacyDeltaNet,
 		noResidualFusion:     opts.NoResidualFusion,
