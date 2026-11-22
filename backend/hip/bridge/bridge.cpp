@@ -1935,14 +1935,18 @@ yuuka_status validate_moe_gate_up_q8_plan_op(const yuuka_op & op) {
 }
 
 // check_moe_mmq_dtype reports whether the int8 WMMA expert kernels decode the
-// dtype. They stage the K-quant codebooks through the shared MMQ tile staging,
-// so the IQ codebooks stay on the dp4a route until they have a decoder in that
-// layout.
+// dtype. They stage the K-quants through the shared MMQ tile staging and the IQ
+// codebooks through the dot8 decoders of kernels/hip/iq_decode.cuh, so the
+// served set is the union of both decode families. Every codebook packs
+// 256-value blocks, which is why the K width must be a whole number of them.
 bool check_moe_mmq_dtype(uint64_t n_in, uint32_t dtype) {
     switch (dtype) {
         case YUUKA_DTYPE_Q4_K:
         case YUUKA_DTYPE_Q5_K:
         case YUUKA_DTYPE_Q6_K:
+        case YUUKA_DTYPE_IQ2_XXS:
+        case YUUKA_DTYPE_IQ2_S:
+        case YUUKA_DTYPE_IQ3_S:
             return n_in % 256 == 0;
         default:
             return false;
@@ -1958,7 +1962,7 @@ bool check_moe_mmq_tile(uint64_t tile_j) {
 
 // validate_moe_gate_up_mmq_plan_op checks the grouped gate/up projection over a
 // Q8_1 activation tile with the int8 WMMA expert kernels. It mirrors
-// validate_moe_gate_up_q8_plan_op with the K-quant dtype set, 128-value K
+// validate_moe_gate_up_q8_plan_op with the K-quant and IQ dtype set, 128-value K
 // steps, and the assignment tile width in n[5].
 yuuka_status validate_moe_gate_up_mmq_plan_op(const yuuka_op & op) {
     const uint64_t hidden = op.n[0];

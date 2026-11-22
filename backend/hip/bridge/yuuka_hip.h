@@ -507,10 +507,11 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  * Int8 WMMA expert family. These are the grouped kernels over the same Q8_1
  * activation tile, with the assignment bucket walked in tiles of n[5] rows and
  * the int8 weights dotted by 16x16x16 WMMA instead of dp4a. They accept the
- * K-quant expert dtypes (Q4_K, Q5_K, Q6_K) and require hidden, ffn, and the
- * output width to be multiples of 128, which covers the K step and the 16-128
- * channel tile. The assignment inputs are the MOE_ROUTE outputs; n[5] is the
- * assignment tile width, one of 16, 32, 64, 128, and it is a plan-build-time
+ * K-quant expert dtypes (Q4_K, Q5_K, Q6_K) and the IQ2_XXS, IQ2_S, and IQ3_S
+ * codebooks, and require the K width to be a whole number of 256-value blocks
+ * and the output width to be a multiple of 128, which covers the K step and the
+ * 16-128 channel tile. The assignment inputs are the MOE_ROUTE outputs; n[5] is
+ * the assignment tile width, one of 16, 32, 64, 128, and it is a plan-build-time
  * dispatch decision, not a runtime option.
  *   MOE_GATE_UP_MMQ: buf0 norm_qs int8[rows,hidden], buf1 norm_ds
  *                    float2[rows,hidden/32], buf2 gate_exps, buf3 up_exps,

@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 11
+const RequiredABI = 12
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -1765,18 +1765,31 @@ func (p *Plan) AddMoEDownQ8(actQ8, actDS, downExps, counts, assignRows, assignSl
 	return p.add(op)
 }
 
-// checkMoEMMQDType reports whether the int8 WMMA expert route decodes the
-// dtype. The route stages the K-quant codebooks through the shared MMQ tile
-// staging, so the IQ codebooks stay on the Q8_1 dp4a route until they have a
-// decoder in that layout.
-func checkMoEMMQDType(dtype tensor.DType, width int64) error {
+// checkMoEMMQWeight reports whether the int8 WMMA expert route decodes the
+// expert dtype and can stage a whole row. The route stages the K-quants through
+// the shared MMQ tile staging and the IQ codebooks through the dot8 decoders of
+// kernels/hip/iq_decode.cuh; both pack 256-value blocks, so a K width that is
+// not a whole number of blocks has no decoder in this layout and must keep the
+// Q8_1 or FP32 grouped route.
+func checkMoEMMQWeight(dtype tensor.DType, nIn int64) error {
 	switch dtype {
-	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K,
+		tensor.IQ2XXS, tensor.IQ2S, tensor.IQ3S:
 	default:
-		return fmt.Errorf("hip: MMQ expert route serves K-quant experts only, got %s", dtype)
+		return fmt.Errorf("hip: MMQ expert route serves K-quant and IQ2_XXS/IQ2_S/IQ3_S experts, got %s", dtype)
 	}
-	if width%128 != 0 {
-		return fmt.Errorf("hip: MMQ expert width %d is not a multiple of 128", width)
+	if nIn%256 != 0 {
+		return fmt.Errorf("hip: MMQ expert K width %d is not a multiple of 256", nIn)
+	}
+	return nil
+}
+
+// checkMoEMMQOutput reports whether the output width fills the 128-channel tile
+// the route stages. A narrower tail has no staged channel tile, so such a shape
+// keeps the Q8_1 or FP32 grouped route instead of running a partial tile.
+func checkMoEMMQOutput(nOut int64) error {
+	if nOut%128 != 0 {
+		return fmt.Errorf("hip: MMQ expert output width %d is not a multiple of 128", nOut)
 	}
 	return nil
 }
@@ -1806,10 +1819,10 @@ func (p *Plan) AddMoEGateUpMMQ(normQ8, normDS, gateExps, upExps, counts, assignR
 	if !MoEMMQTile(tileJ) {
 		return fmt.Errorf("hip: MMQ assignment tile %d is not a measured width", tileJ)
 	}
-	if err := checkMoEMMQDType(dtype, hidden); err != nil {
+	if err := checkMoEMMQWeight(dtype, hidden); err != nil {
 		return err
 	}
-	if err := checkMoEMMQDType(dtype, ffn); err != nil {
+	if err := checkMoEMMQOutput(ffn); err != nil {
 		return err
 	}
 	if err := p.check(normQ8, normDS, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut); err != nil {
@@ -1852,10 +1865,10 @@ func (p *Plan) AddMoEDownMMQ(actQ8, actDS, downExps, counts, assignRows, assignS
 	if !MoEMMQTile(tileJ) {
 		return fmt.Errorf("hip: MMQ assignment tile %d is not a measured width", tileJ)
 	}
-	if err := checkMoEMMQDType(dtype, ffn); err != nil {
+	if err := checkMoEMMQWeight(dtype, ffn); err != nil {
 		return err
 	}
-	if err := checkMoEMMQDType(dtype, hidden); err != nil {
+	if err := checkMoEMMQOutput(hidden); err != nil {
 		return err
 	}
 	if err := p.check(actQ8, actDS, downExps, counts, assignRows, assignSlots, out); err != nil {

@@ -6,8 +6,9 @@
 // expert GEMM (kernels/hip/moe/moe_mmq.hip) stage the same rocWMMA fragment
 // layouts and decode the same K-quant weight blocks, so those helpers live
 // here instead of in either kernel. The MoE kernel adds its own gather and
-// scatter around them; the layout itself must not diverge, because both read
-// the staged bytes with the same fragment loads.
+// scatter around them, and passes its IQ span decoder through the stage_weights
+// hook; the layout itself must not diverge, because both read the staged bytes
+// with the same fragment loads.
 //
 // The layout was measured on gfx1151 against the CPU product:
 //   - a 16x16 int8 fragment is 256 bytes, loaded as eight bytes per lane,
@@ -183,15 +184,23 @@ __device__ __forceinline__ int2 stage_weight_span(const uint8_t * row, int64_t k
     return value;
 }
 
-// stage_weights decodes the kTileI x kStepK weight tile in fragment order.
+// stage_weights_with decodes the kTileI x kStepK weight tile in fragment order.
 // Each warp owns whole 512-byte fragment-pair regions and each lane fills one
 // 16-byte slot of a region, so a warp's stores cover one contiguous region and
 // never conflict in the LDS banks. Rows past n_out are zeroed so a partially
 // filled channel tile contributes nothing.
-template <uint32_t DType, int kTileI, int kStepK, int kThreads>
-__device__ __forceinline__ void stage_weights(int8_t * tile_a, float * scale_a,
-                                              const uint8_t * w, uint64_t row_bytes,
-                                              int64_t n0, int64_t n_out, int64_t k0) {
+//
+// span(row, k, scale_a, row_index) decodes the eight values that start at a
+// multiple of eight inside a packed row and returns them packed as int8, so the
+// K-quant and the IQ codebooks share this mapping and differ only in their span
+// decoder and scale-slot rule. The routing itself must not be restated per
+// decode family; see the header comment.
+template <int kTileI, int kStepK, int kThreads, typename SpanFn>
+__device__ __forceinline__ void stage_weights_with(int8_t * tile_a, float * scale_a,
+                                                   const uint8_t * w,
+                                                   uint64_t row_bytes, int64_t n0,
+                                                   int64_t n_out, int64_t k0,
+                                                   SpanFn span) {
     constexpr int kWarps = kThreads / 32;
     constexpr int kPairsPerStep = kStepK / 32;
     constexpr int kRowGroups = kTileI / kFragRows;
@@ -220,12 +229,23 @@ __device__ __forceinline__ void stage_weights(int8_t * tile_a, float * scale_a,
         // The two 16-value slices of the pair fill bytes 0..7 and 8..15.
         const int64_t k = k0 + pair * 32 + half * kSpan;
         const int row_index = group * kFragRows + row_in_frag;
-        const int2 low = stage_weight_span<DType, kTileI, kStepK>(row, k, scale_a,
-                                                                  row_index);
-        const int2 high = stage_weight_span<DType, kTileI, kStepK>(row, k + 16,
-                                                                   scale_a, row_index);
+        const int2 low = span(row, k, scale_a, row_index);
+        const int2 high = span(row, k + 16, scale_a, row_index);
         *reinterpret_cast<int4 *>(dst) = make_int4(low.x, low.y, high.x, high.y);
     }
+}
+
+// stage_weights is the dense K-quant form of stage_weights_with: the span
+// decoder is the shared K-quant one, so the dense GEMM keeps a single call.
+template <uint32_t DType, int kTileI, int kStepK, int kThreads>
+__device__ __forceinline__ void stage_weights(int8_t * tile_a, float * scale_a,
+                                              const uint8_t * w, uint64_t row_bytes,
+                                              int64_t n0, int64_t n_out, int64_t k0) {
+    stage_weights_with<kTileI, kStepK, kThreads>(
+        tile_a, scale_a, w, row_bytes, n0, n_out, k0,
+        [](const uint8_t * row, int64_t k, float * scales, int row_index) {
+            return stage_weight_span<DType, kTileI, kStepK>(row, k, scales, row_index);
+        });
 }
 
 } // namespace yuuka_mmq

@@ -620,9 +620,11 @@ int check_case(context & ctx, uint32_t dtype, int rows, int tile_j) {
     return 0;
 }
 
-// check_rejects pins the plan validation: an IQ codebook, a width that is not a
-// multiple of 128, and an unmeasured assignment tile are rejected instead of
-// running another route.
+// check_rejects pins the plan validation: a dtype without a decoder in this tile
+// layout, a K width that is not a whole number of 256-value blocks, a channel
+// tile that is not a multiple of 128, and an unmeasured assignment tile are
+// rejected instead of running another route. The IQ codebooks are accepted by
+// the same op and are pinned end to end by tests/hip/iq_moe_mmq_test.cpp.
 int check_rejects(context & ctx) {
     const int experts = 8, used = 2, hidden = 256, ffn = 256, rows = 16;
     const int slots = rows * used;
@@ -663,7 +665,7 @@ int check_rejects(context & ctx) {
     op.n[3] = experts;
     op.n[4] = used;
     op.n[5] = 16;
-    op.u[0] = YUUKA_DTYPE_IQ2_XXS;
+    op.u[0] = YUUKA_DTYPE_Q8_0;
     CHECK(yuuka_plan_add(plan, &op) != YUUKA_OK);
     op.u[0] = YUUKA_DTYPE_Q4_K;
     op.n[1] = 192;  // not a multiple of 128
@@ -672,6 +674,8 @@ int check_rejects(context & ctx) {
     op.n[5] = 24;  // not a measured assignment tile
     CHECK(yuuka_plan_add(plan, &op) != YUUKA_OK);
     op.n[5] = 16;
+    CHECK(yuuka_plan_add(plan, &op) == YUUKA_OK);
+    op.u[0] = YUUKA_DTYPE_IQ2_S;
     CHECK(yuuka_plan_add(plan, &op) == YUUKA_OK);
     yuuka_plan_destroy(plan);
 

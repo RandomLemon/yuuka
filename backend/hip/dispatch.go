@@ -110,7 +110,8 @@ const (
 	MoEPrefillQ8
 	// MoEPrefillMMQ is the grouped int8 WMMA route: the same Q8_1 activation
 	// tile dotted by 16x16x16 int8 WMMA over an assignment tile of TileJ rows,
-	// so one decoded weight tile serves the whole assignment tile.
+	// so one decoded weight tile serves the whole assignment tile. It decodes
+	// the K-quants and the IQ2_XXS/IQ2_S/IQ3_S codebooks.
 	MoEPrefillMMQ
 )
 
@@ -146,7 +147,9 @@ const MoEMMQMaxTileJ = 128
 // Both quantized routes require at least MoEPrefillMinRows rows: below that the
 // Q8_1 activation pass and the grouped tile cost more than they save, which is
 // also why the one-row FFN of the last prefill chunk stays on the FP32 grouped
-// route. Everything
+// route. Above that, the int8 WMMA route serves the K-quant and the IQ expert
+// dtypes when every weight row is a whole number of 256-value blocks and the
+// output width fills the 128-channel tile. Everything
 // else falls back to the Q8_1 dp4a route for the IQ codebooks and to the FP32
 // grouped route otherwise. The thresholds are plan-build-time decisions; the
 // measured stage times that motivate them are in docs/benchmarks.md and
@@ -163,8 +166,7 @@ func SelectMoEPrefillPath(dtype tensor.DType, rows, used, experts, nIn, nOut int
 	if rows < MoEPrefillMinRows {
 		return MoEPrefillF32Grouped, 0
 	}
-	mmqDType := dtype == tensor.Q4_K || dtype == tensor.Q5_K || dtype == tensor.Q6_K
-	if allowMMQ && mmqDType && nIn%128 == 0 && nOut%128 == 0 {
+	if allowMMQ && MoEMMQDType(dtype) && nIn%256 == 0 && nOut%128 == 0 {
 		return MoEPrefillMMQ, moeAssignmentTile(rows, used, experts)
 	}
 	switch dtype {
@@ -174,6 +176,20 @@ func SelectMoEPrefillPath(dtype tensor.DType, rows, used, experts, nIn, nOut int
 		}
 	}
 	return MoEPrefillF32Grouped, 0
+}
+
+// MoEMMQDType reports whether the int8 WMMA expert route decodes a weight
+// dtype: the K-quants through the shared MMQ tile staging and the IQ codebooks
+// through its IQ span decoder. The shape rules are separate; see
+// SelectMoEPrefillPath.
+func MoEMMQDType(dtype tensor.DType) bool {
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K,
+		tensor.IQ2XXS, tensor.IQ2S, tensor.IQ3S:
+		return true
+	default:
+		return false
+	}
 }
 
 // MoEPrefillMinRows is the smallest chunk either quantized expert route serves.

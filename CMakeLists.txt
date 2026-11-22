@@ -147,6 +147,11 @@ if(YUUKA_ENABLE_HIP)
         add_test(NAME hip_moe_mmq_correctness COMMAND yuuka_hip_moe_mmq_test)
         set_tests_properties(hip_moe_mmq_correctness PROPERTIES SKIP_RETURN_CODE 77)
 
+        add_executable(yuuka_hip_iq_moe_mmq_test tests/hip/iq_moe_mmq_test.cpp)
+        target_link_libraries(yuuka_hip_iq_moe_mmq_test PRIVATE yuuka_hip)
+        add_test(NAME hip_iq_moe_mmq_correctness COMMAND yuuka_hip_iq_moe_mmq_test)
+        set_tests_properties(hip_iq_moe_mmq_correctness PROPERTIES SKIP_RETURN_CODE 77)
+
         add_executable(yuuka_hip_deltanet_test tests/hip/deltanet_test.cpp)
         target_link_libraries(yuuka_hip_deltanet_test PRIVATE yuuka_hip)
         add_test(NAME hip_deltanet_correctness COMMAND yuuka_hip_deltanet_test)

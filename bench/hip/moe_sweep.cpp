@@ -1,10 +1,12 @@
 // Measures the grouped MoE routing and expert pipeline at production-like
-// shapes. The weights are packed Q4_K and are never dequantized on the host.
+// shapes. The weights stay packed and are never dequantized on the host.
 //
-// --route selects the expert kernels: fp32 is the grouped FP32 pipeline,
-// mmq is the grouped int8 WMMA pipeline over the Q8_1 activation tile.
-// --tile-j selects the MMQ assignment tile width and --rows overrides the
-// row sweep, so the same binary covers the prompt-chunk attributions.
+// --route selects the expert kernels: fp32 is the grouped FP32 pipeline, q8 is
+// the grouped Q8_1 dp4a pipeline, and mmq is the grouped int8 WMMA pipeline over
+// the Q8_1 activation tile. --dtype selects the synthetic expert codebook, so
+// the same binary covers the K-quant and the IQ2_XXS/IQ2_S/IQ3_S expert routes.
+// --tile-j selects the MMQ assignment tile width and --rows overrides the row
+// sweep, so the same binary covers the prompt-chunk attributions.
 
 #include "yuuka_hip.h"
 
@@ -64,15 +66,49 @@ void put_half(uint8_t * dst, float value) {
     *reinterpret_cast<uint16_t *>(dst) = half;
 }
 
-uint64_t q4k_row_bytes(uint64_t width) { return (width / 256) * 144; }
+uint64_t block_bytes(std::string_view dtype) {
+    if (dtype == "q4_k") return 144;
+    if (dtype == "q5_k") return 176;
+    if (dtype == "q6_k") return 210;
+    if (dtype == "iq2xxs") return 66;
+    if (dtype == "iq2s") return 82;
+    if (dtype == "iq3s") return 110;
+    return 0;
+}
 
-void fill_q4k(uint8_t * data, uint64_t bytes, std::mt19937 & rng) {
-    for (uint64_t off = 0; off + 144 <= bytes; off += 144) {
+uint32_t dtype_id(std::string_view dtype) {
+    if (dtype == "q4_k") return YUUKA_DTYPE_Q4_K;
+    if (dtype == "q5_k") return YUUKA_DTYPE_Q5_K;
+    if (dtype == "q6_k") return YUUKA_DTYPE_Q6_K;
+    if (dtype == "iq2xxs") return YUUKA_DTYPE_IQ2_XXS;
+    if (dtype == "iq2s") return YUUKA_DTYPE_IQ2_S;
+    return YUUKA_DTYPE_IQ3_S;
+}
+
+uint64_t row_bytes(uint64_t width, std::string_view dtype) {
+    return (width / 256) * block_bytes(dtype);
+}
+
+// fill_packed writes well-formed blocks with a finite FP16 block scale, so the
+// decode stays in range; the quantized payload is random because the measurement
+// only needs the weight-read volume and the decode cost, and every codebook byte
+// pattern is a valid entry. Q6_K and IQ3_S carry signed and ranged fields, so
+// their scale bytes are clamped to the documented range.
+void fill_packed(uint8_t * data, uint64_t bytes, std::string_view dtype,
+                 std::mt19937 & rng) {
+    const uint64_t block = block_bytes(dtype);
+    for (uint64_t off = 0; off + block <= bytes; off += block) {
         uint8_t * blk = data + off;
-        put_half(blk, 0.02f);
-        put_half(blk + 2, 0.01f);
-        for (int i = 0; i < 12; ++i) blk[4 + i] = uint8_t(rng() & 0xff);
-        for (int i = 0; i < 128; ++i) blk[16 + i] = uint8_t(rng() & 0xff);
+        for (uint64_t i = 0; i < block; ++i) blk[i] = uint8_t(rng() & 0xff);
+        if (dtype == "q4_k" || dtype == "q5_k") {
+            put_half(blk, 0.02f);
+            put_half(blk + 2, 0.01f);
+        } else if (dtype == "q6_k") {
+            for (int i = 0; i < 16; ++i) blk[192 + i] = uint8_t(rng() & 0x0F);
+            put_half(blk + 208, 0.02f);
+        } else {
+            put_half(blk, 0.02f);
+        }
     }
 }
 
@@ -100,6 +136,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const char * route = "fp32";
+    const char * dtype = "q4_k";
     int tile_j = 16;
     std::vector<int> row_sweep{1, 2, 4, 8, 16, 32};
     for (int arg = 1; arg < argc; ++arg) {
@@ -108,6 +145,8 @@ int main(int argc, char ** argv) {
             route = argv[++arg];
         } else if (flag == "--tile-j" && arg + 1 < argc) {
             tile_j = std::atoi(argv[++arg]);
+        } else if (flag == "--dtype" && arg + 1 < argc) {
+            dtype = argv[++arg];
         } else if (flag == "--rows" && arg + 1 < argc) {
             row_sweep.clear();
             std::string text(argv[++arg]);
@@ -127,29 +166,44 @@ int main(int argc, char ** argv) {
             }
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--route fp32|mmq] [--tile-j 16|32|64|128] "
+                         "usage: %s [--route fp32|q8|mmq] [--dtype q4_k|q5_k|q6_k|"
+                         "iq2xxs|iq2s|iq3s] [--tile-j 16|32|64|128] "
                          "[--rows 16,32,64]\n",
                          argv[0]);
             return 2;
         }
     }
     const bool mmq = std::string_view(route) == "mmq";
-    if (!mmq && std::string_view(route) != "fp32") {
+    const bool q8 = std::string_view(route) == "q8";
+    if (!mmq && !q8 && std::string_view(route) != "fp32") {
         std::fprintf(stderr, "unsupported route %s\n", route);
+        return 2;
+    }
+    const uint64_t block = block_bytes(dtype);
+    if (block == 0) {
+        std::fprintf(stderr, "unsupported dtype %s\n", dtype);
+        return 2;
+    }
+    // The Q8_1 route decodes the IQ codebooks only; the WMMA route and the FP32
+    // route serve every codebook this harness packs.
+    if (q8 && std::string_view(dtype).substr(0, 2) != "iq") {
+        std::fprintf(stderr, "the q8 route serves the IQ codebooks only, got %s\n",
+                     dtype);
         return 2;
     }
 
     const int experts = 128, used = 8, hidden = 2048, ffn = 768;
-    const uint64_t hidden_row = q4k_row_bytes(hidden);
-    const uint64_t ffn_row = q4k_row_bytes(ffn);
+    const uint64_t hidden_row = row_bytes(hidden, dtype);
+    const uint64_t ffn_row = row_bytes(ffn, dtype);
+    const uint32_t weight_dtype = dtype_id(dtype);
     std::mt19937 rng(7);
 
     std::vector<uint8_t> gate(experts * ffn * hidden_row);
     std::vector<uint8_t> up(gate.size());
     std::vector<uint8_t> down(experts * hidden * ffn_row);
-    fill_q4k(gate.data(), gate.size(), rng);
-    fill_q4k(up.data(), up.size(), rng);
-    fill_q4k(down.data(), down.size(), rng);
+    fill_packed(gate.data(), gate.size(), dtype, rng);
+    fill_packed(up.data(), up.size(), dtype, rng);
+    fill_packed(down.data(), down.size(), dtype, rng);
 
     yuuka_buffer * gate_buf = alloc(device, gate.size());
     yuuka_buffer * up_buf = alloc(device, up.size());
@@ -163,8 +217,8 @@ int main(int argc, char ** argv) {
     CHECK_STATUS(yuuka_memcpy_h2d(down_buf, down.data(), down.size()));
 
     std::printf("device: %s\n", "gfx1151");
-    std::printf("shape: experts=%d used=%d hidden=%d ffn=%d dtype=Q4_K route=%s",
-                experts, used, hidden, ffn, route);
+    std::printf("shape: experts=%d used=%d hidden=%d ffn=%d dtype=%s route=%s",
+                experts, used, hidden, ffn, dtype, route);
     if (mmq) {
         std::printf(" tile_j=%d", tile_j);
     }
@@ -186,19 +240,21 @@ int main(int argc, char ** argv) {
         yuuka_buffer * act_out = alloc(device, uint64_t(rows) * used * ffn * 4);
         yuuka_buffer * expert_out = alloc(device, uint64_t(rows) * used * hidden * 4);
         yuuka_buffer * x = alloc(device, uint64_t(rows) * hidden * 4);
-        yuuka_buffer * norm_q8 = mmq ? alloc(device, uint64_t(rows) * hidden) : nullptr;
+        const bool quantized = mmq || q8;
+        yuuka_buffer * norm_q8 =
+            quantized ? alloc(device, uint64_t(rows) * hidden) : nullptr;
         yuuka_buffer * norm_ds =
-            mmq ? alloc(device, uint64_t(rows) * (hidden / 32) * 8) : nullptr;
+            quantized ? alloc(device, uint64_t(rows) * (hidden / 32) * 8) : nullptr;
         yuuka_buffer * act_q8 =
-            mmq ? alloc(device, uint64_t(rows) * used * ffn) : nullptr;
+            quantized ? alloc(device, uint64_t(rows) * used * ffn) : nullptr;
         yuuka_buffer * act_ds =
-            mmq ? alloc(device, uint64_t(rows) * used * (ffn / 32) * 8) : nullptr;
+            quantized ? alloc(device, uint64_t(rows) * used * (ffn / 32) * 8) : nullptr;
         if (logits == nullptr || norm == nullptr || ids == nullptr || weights == nullptr ||
             counts == nullptr || assign_rows == nullptr || assign_slots == nullptr ||
             assign_weights == nullptr || gate_out == nullptr || up_out == nullptr ||
             act_out == nullptr || expert_out == nullptr || x == nullptr ||
-            (mmq && (norm_q8 == nullptr || norm_ds == nullptr || act_q8 == nullptr ||
-                     act_ds == nullptr))) {
+            (quantized && (norm_q8 == nullptr || norm_ds == nullptr ||
+                           act_q8 == nullptr || act_ds == nullptr))) {
             std::fprintf(stderr, "activation allocation failed\n");
             return 1;
         }
@@ -228,7 +284,7 @@ int main(int argc, char ** argv) {
         op.n[2] = used;
         CHECK_STATUS(yuuka_plan_add(plan, &op));
 
-        if (mmq) {
+        if (quantized) {
             op = yuuka_op{};
             op.code = YUUKA_OP_QUANT_Q8_1;
             op.buf[0] = norm;
@@ -239,7 +295,7 @@ int main(int argc, char ** argv) {
             CHECK_STATUS(yuuka_plan_add(plan, &op));
 
             op = yuuka_op{};
-            op.code = YUUKA_OP_MOE_GATE_UP_MMQ;
+            op.code = mmq ? YUUKA_OP_MOE_GATE_UP_MMQ : YUUKA_OP_MOE_GATE_UP_Q8;
             op.buf[0] = norm_q8;
             op.buf[1] = norm_ds;
             op.buf[2] = gate_buf;
@@ -254,8 +310,10 @@ int main(int argc, char ** argv) {
             op.n[2] = rows;
             op.n[3] = experts;
             op.n[4] = used;
-            op.n[5] = tile_j;
-            op.u[0] = YUUKA_DTYPE_Q4_K;
+            if (mmq) {
+                op.n[5] = tile_j;
+            }
+            op.u[0] = weight_dtype;
             CHECK_STATUS(yuuka_plan_add(plan, &op));
 
             op = yuuka_op{};
@@ -269,7 +327,7 @@ int main(int argc, char ** argv) {
             CHECK_STATUS(yuuka_plan_add(plan, &op));
 
             op = yuuka_op{};
-            op.code = YUUKA_OP_MOE_DOWN_MMQ;
+            op.code = mmq ? YUUKA_OP_MOE_DOWN_MMQ : YUUKA_OP_MOE_DOWN_Q8;
             op.buf[0] = act_q8;
             op.buf[1] = act_ds;
             op.buf[2] = down_buf;
@@ -282,8 +340,10 @@ int main(int argc, char ** argv) {
             op.n[2] = rows;
             op.n[3] = experts;
             op.n[4] = used;
-            op.n[5] = tile_j;
-            op.u[0] = YUUKA_DTYPE_Q4_K;
+            if (mmq) {
+                op.n[5] = tile_j;
+            }
+            op.u[0] = weight_dtype;
             CHECK_STATUS(yuuka_plan_add(plan, &op));
         } else {
             op = yuuka_op{};
@@ -301,7 +361,7 @@ int main(int argc, char ** argv) {
             op.n[2] = rows;
             op.n[3] = experts;
             op.n[4] = used;
-            op.u[0] = YUUKA_DTYPE_Q4_K;
+            op.u[0] = weight_dtype;
             CHECK_STATUS(yuuka_plan_add(plan, &op));
 
             op = yuuka_op{};
@@ -325,7 +385,7 @@ int main(int argc, char ** argv) {
             op.n[2] = rows;
             op.n[3] = experts;
             op.n[4] = used;
-            op.u[0] = YUUKA_DTYPE_Q4_K;
+            op.u[0] = weight_dtype;
             CHECK_STATUS(yuuka_plan_add(plan, &op));
         }
 
@@ -355,8 +415,10 @@ int main(int argc, char ** argv) {
             switch (op_codes[i]) {
                 case YUUKA_OP_MOE_ROUTE: route_ns += double(op_times[i]); break;
                 case YUUKA_OP_MOE_GATE_UP:
+                case YUUKA_OP_MOE_GATE_UP_Q8:
                 case YUUKA_OP_MOE_GATE_UP_MMQ: gate_ns += double(op_times[i]); break;
                 case YUUKA_OP_MOE_DOWN:
+                case YUUKA_OP_MOE_DOWN_Q8:
                 case YUUKA_OP_MOE_DOWN_MMQ: down_ns += double(op_times[i]); break;
                 case YUUKA_OP_MOE_REDUCE_ADD: reduce_ns += double(op_times[i]); break;
                 default: break;

@@ -16,7 +16,9 @@ import (
 // TestGPUProfileMoE attributes one qwen35moe prefill chunk and one decode step
 // per planned operation. It is opt-in through YUUKA_TEST_MOE_MODEL because it
 // loads the full model, and it is a diagnostic, not a benchmark: the per
-// operation events add overhead and clocks are not pinned.
+// operation events add overhead and clocks are not pinned. YUUKA_TEST_MOE_ROUTE
+// selects the routed-expert route so the same chunk can be attributed under the
+// Q8_1 dp4a and the int8 WMMA route in the same session.
 func TestGPUProfileMoE(t *testing.T) {
 	reader, tok, model := openMoEModel(t)
 	ids, err := tok.Encode(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 90))
@@ -28,11 +30,17 @@ func TestGPUProfileMoE(t *testing.T) {
 	if len(ids) < chunks[len(chunks)-1] {
 		t.Skipf("prompt produced %d tokens, need %d", len(ids), chunks[len(chunks)-1])
 	}
-	rt, err := NewWithKVType(reader, model, capacity, tensor.F16)
+	// YUUKA_TEST_MOE_ROUTE selects the routed-expert route, so one session can
+	// attribute the same chunk under the Q8_1 and the int8 WMMA route.
+	opts := moERouteOptions(t)
+	opts.KVType = tensor.F16
+	opts.KVTypeSet = true
+	rt, err := newRuntime(reader, model, capacity, opts)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
 	defer rt.Close()
+	t.Logf("routed-expert route: %s", moERouteName(opts))
 	s := rt.session
 	var times []hip.OpTime
 	for _, rows := range chunks {

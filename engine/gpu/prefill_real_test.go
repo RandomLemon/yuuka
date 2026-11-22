@@ -20,7 +20,9 @@ import (
 // a 1024-token real-model prompt produce the same greedy token and logits
 // within 0.05. The reference run was bitwise identical, but this test does not
 // require bitwise equality. It is opt-in through YUUKA_TEST_MODEL because it
-// loads and prefills the full model several times.
+// loads and prefills the full model several times. On a MoE model,
+// YUUKA_TEST_MOE_ROUTE selects the routed-expert route, so the same chunk
+// invariance gate runs over the Q8_1 dp4a and the int8 WMMA expert route.
 func TestGPUChunkedPrefillLongContext(t *testing.T) {
 	path := os.Getenv("YUUKA_TEST_MODEL")
 	if path == "" {
@@ -48,11 +50,15 @@ func TestGPUChunkedPrefillLongContext(t *testing.T) {
 	}
 	ids = ids[:1024]
 	const capacity = 1024 + 8
-	rt, err := New(reader, model, capacity)
+	opts := moERouteOptions(t)
+	opts.KVType = DefaultKVType
+	opts.KVTypeSet = true
+	rt, err := newRuntime(reader, model, capacity, opts)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
 	defer rt.Close()
+	t.Logf("routed-expert route: %s", moERouteName(opts))
 
 	var reference []float32
 	for _, chunk := range []int{128, 512, 1024} {

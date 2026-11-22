@@ -1,5 +1,6 @@
 #include "../common.cuh"
 #include "../gemm/mmq_tile.cuh"
+#include "../iq_decode.cuh"
 #include "../quant.cuh"
 #include "../yuuka_kernels.h"
 
@@ -20,7 +21,9 @@
 // int8 WMMA, an assignment tile per weight tile, and a device-side per-expert
 // loop over the bucket. The staging, tile shape, scale layout, and scatter are
 // this repository's; the codebooks and their scale granularity are documented
-// in docs/kernels.md section 8.1.
+// in docs/kernels.md section 8.1. The IQ codebooks decode through the dot8
+// forms of kernels/hip/iq_decode.cuh, so the digits are the ones the dp4a route
+// and the FP32 reference path see.
 //
 // Two properties are load bearing:
 //   - the bucket counts stay on the device, so the launch is HIP-Graph
@@ -37,12 +40,84 @@ using yuuka_mmq::kPairBytes;
 using yuuka_mmq::kSpan;
 using yuuka_mmq::set_fragment;
 using yuuka_mmq::stage_weights;
+using yuuka_mmq::stage_weights_with;
 
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
 // The int8 WMMA is 16 rows wide, so an assignment tile is a multiple of 16.
 constexpr int kMinTileJ = 16;
 constexpr int kMaxTileJ = 128;
+
+// is_iq_codebook reports whether DType is one of the IQ codebooks the MoE
+// kernels decode. They carry codebook indices instead of plain nibbles, so
+// their digits come from the iq*_dot8 decoders in kernels/hip/iq_decode.cuh.
+template <uint32_t DType>
+constexpr bool is_iq_codebook() {
+    return DType == YUUKA_DTYPE_IQ2_XXS || DType == YUUKA_DTYPE_IQ2_S ||
+           DType == YUUKA_DTYPE_IQ3_S;
+}
+
+// iq_scale_per_16 reports whether a codebook carries one weight scale per 16
+// values instead of one per 32. IQ2_S stores the scale of a 32-value group in
+// the two nibbles of one byte, the low nibble for the first 16 values and the
+// high nibble for the second, so applying its scale per 32 values would be
+// wrong. IQ2_XXS and IQ3_S hold one scale per 32-value group.
+template <uint32_t DType>
+constexpr bool iq_scale_per_16() {
+    return DType == YUUKA_DTYPE_IQ2_S;
+}
+
+// stage_iq_weight_span decodes eight IQ expert values into packed int8 digits
+// and stages the codebook block scale of the 16-value slice they belong to.
+// The digits are the same ones the iq*_span8 forms produce, because the dot8
+// forms read the same codebook entry, sign word, and scale expression.
+template <uint32_t DType, int kTileI, int kStepK>
+__device__ __forceinline__ int2 stage_iq_weight_span(const uint8_t * row, int64_t k,
+                                                     float * scale_a, int row_index) {
+    int32_t w[2];
+    float scale = 0.0f;
+    if constexpr (DType == YUUKA_DTYPE_IQ2_XXS) {
+        iq2xxs_dot8(row + (k / 256) * 66, static_cast<int>(k % 256), w, scale);
+    } else if constexpr (DType == YUUKA_DTYPE_IQ2_S) {
+        iq2s_dot8(row + (k / 256) * 82, static_cast<int>(k % 256), w, scale);
+    } else {
+        static_assert(DType == YUUKA_DTYPE_IQ3_S,
+                      "the IQ expert staging serves IQ2_XXS, IQ2_S, and IQ3_S");
+        iq3s_dot8(row + (k / 256) * 110, static_cast<int>(k % 256), w, scale);
+    }
+    // The scale tiles are indexed per 16-value slice of the staged K step, so a
+    // per-16 codebook writes the slice of its span and a per-32 codebook fills
+    // both slices of its group with the one scale it carries.
+    const int slice = static_cast<int>((k % kStepK) / 16);
+    if constexpr (iq_scale_per_16<DType>()) {
+        scale_a[slice * kTileI + row_index] = scale;
+    } else {
+        scale_a[(slice & ~1) * kTileI + row_index] = scale;
+        scale_a[((slice & ~1) + 1) * kTileI + row_index] = scale;
+    }
+    return make_int2(w[0], w[1]);
+}
+
+// stage_weight_tile stages the weight tile with the decoder of the dtype's
+// family: the shared K-quant span for Q4_K/Q5_K/Q6_K, and the IQ span above for
+// the codebooks. The fragment mapping is the same call either way.
+template <uint32_t DType, int kTileI, int kStepK>
+__device__ __forceinline__ void stage_weight_tile(int8_t * tile_a, float * scale_a,
+                                                  const uint8_t * w,
+                                                  uint64_t row_bytes, int64_t n0,
+                                                  int64_t n_out, int64_t k0) {
+    if constexpr (is_iq_codebook<DType>()) {
+        stage_weights_with<kTileI, kStepK, kThreads>(
+            tile_a, scale_a, w, row_bytes, n0, n_out, k0,
+            [](const uint8_t * row, int64_t k, float * scales, int row_index) {
+                return stage_iq_weight_span<DType, kTileI, kStepK>(row, k, scales,
+                                                                  row_index);
+            });
+    } else {
+        stage_weights<DType, kTileI, kStepK, kThreads>(tile_a, scale_a, w, row_bytes,
+                                                       n0, n_out, k0);
+    }
+}
 
 // Tile maps the assignment tile width to the warp decomposition. Up to 64
 // assignments every warp owns one output-row fragment group of the 128-channel
@@ -158,9 +233,12 @@ __global__ void moe_gemm_mmq_kernel(
     using T = Tile<kTileJ>;
     using S = Shared<kTileJ, kStepK>;
     constexpr int kPairsPerStep = kStepK / 32;
-    // Q6_K carries one scale per 16 values, Q4_K and Q5_K one per 32 values.
-    constexpr bool kScalePer16 = (DType == YUUKA_DTYPE_Q6_K);
+    // One WMMA slice is 16 K values. Q6_K and IQ2_S carry one weight scale per
+    // slice, Q4_K, Q5_K, IQ2_XXS, and IQ3_S one per 32 values, and only Q4_K and
+    // Q5_K add a per-row minimum term.
+    constexpr bool kScalePer16 = DType == YUUKA_DTYPE_Q6_K || iq_scale_per_16<DType>();
     constexpr int kSlicesPerScale = kScalePer16 ? 1 : 2;
+    constexpr bool kHasMinimum = DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K;
 
     extern __shared__ __align__(16) unsigned char smem[];
     int8_t * tile_a = reinterpret_cast<int8_t *>(smem);
@@ -204,7 +282,7 @@ __global__ void moe_gemm_mmq_kernel(
             }
         }
         for (int64_t k0 = 0; k0 < n_in; k0 += kStepK) {
-            stage_weights<DType, T::kTileI, kStepK, kThreads>(
+            stage_weight_tile<DType, T::kTileI, kStepK>(
                 tile_a, scale_a, weights, row_bytes, n0, n_out, k0);
             stage_activations_gather<kTileJ, kStepK, kActivationBySlot>(
                 tile_b, scale_b, xs, xds, assign_rows, assign_slots, bucket, a0,
@@ -246,7 +324,8 @@ __global__ void moe_gemm_mmq_kernel(
                     // The weight scales belong to this lane's eight rows, so
                     // they load once per scale block and serve every token
                     // fragment. Q4_K and Q5_K also carry a per-row minimum that
-                    // the activation block sum multiplies; Q6_K has no minimum.
+                    // the activation block sum multiplies; Q6_K and the IQ
+                    // codebooks have no minimum.
                     const int block = slice / kSlicesPerScale;
                     const int b32 = kScalePer16 ? (block >> 1) : block;
                     const int slot0 = kScalePer16 ? block : 2 * block;
@@ -256,8 +335,8 @@ __global__ void moe_gemm_mmq_kernel(
                     for (int e = 0; e < 8; ++e) {
                         const int row = row_base + 2 * e + (lane >> 4);
                         wd[e] = scale_a[slot0 * T::kTileI + row];
-                        wm[e] = kScalePer16 ? 0.0f
-                                            : scale_a[(slot0 + 1) * T::kTileI + row];
+                        wm[e] = kHasMinimum ? scale_a[(slot0 + 1) * T::kTileI + row]
+                                            : 0.0f;
                     }
                     #pragma unroll
                     for (int t = 0; t < T::kTokenTiles; ++t) {
@@ -364,6 +443,18 @@ int launch_moe_mmq(float * out, const int8_t * xs, const float2 * xds,
     YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_Q6_K, 32)
     YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_Q6_K, 64)
     YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_Q6_K, 128)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_XXS, 16)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_XXS, 32)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_XXS, 64)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_XXS, 128)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_S, 16)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_S, 32)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_S, 64)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ2_S, 128)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ3_S, 16)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ3_S, 32)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ3_S, 64)
+    YUUKA_MOE_MMQ_CASE(YUUKA_DTYPE_IQ3_S, 128)
     #undef YUUKA_MOE_MMQ_CASE
     // Unreached for a validated plan: the C ABI rejects an unsupported dtype
     // or tile width before the op is submitted.

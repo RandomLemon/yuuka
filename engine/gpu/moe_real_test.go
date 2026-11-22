@@ -62,11 +62,15 @@ func TestGPUMoEGoldenGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rt, err := NewWithKVType(reader, model, capacity, tensor.F32)
+	opts := moERouteOptions(t)
+	opts.KVType = tensor.F32
+	opts.KVTypeSet = true
+	rt, err := newRuntime(reader, model, capacity, opts)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
 	defer rt.Close()
+	t.Logf("routed-expert route: %s", moERouteName(opts))
 	gpuLogits, err := rt.Forward(ids)
 	if err != nil {
 		t.Fatal(err)
@@ -148,11 +152,15 @@ func TestGPUMoEChunkedPrefill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rt, err := NewWithKVType(reader, model, capacity, tensor.F32)
+	opts := moERouteOptions(t)
+	opts.KVType = tensor.F32
+	opts.KVTypeSet = true
+	rt, err := newRuntime(reader, model, capacity, opts)
 	if err != nil {
 		t.Skipf("HIP runtime unavailable: %v", err)
 	}
 	defer rt.Close()
+	t.Logf("routed-expert route: %s", moERouteName(opts))
 	var gpuLogits []float32
 	for _, chunk := range []int{64, 256} {
 		if err := rt.SetPrefillChunk(chunk); err != nil {

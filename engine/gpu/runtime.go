@@ -69,6 +69,7 @@ func newRuntime(reader *gguf.Reader, model *qwen35.Model, capacity int, opts Opt
 		ForceTiledAttention: opts.ForceTiledAttention,
 		ForceDecodeGemv:     opts.ForceDecodeGemv,
 		Int8Matvec:          opts.Int8Matvec,
+		MoEMMQ:              opts.MoEMMQ,
 		PrequantizedInt8:    opts.PrequantizedInt8,
 		LegacyDeltaNet:      opts.LegacyDeltaNet,
 		NoResidualFusion:    opts.NoResidualFusion,

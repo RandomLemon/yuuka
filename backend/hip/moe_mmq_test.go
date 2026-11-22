@@ -55,10 +55,10 @@ func allocMMQMoEBuffers(t *testing.T, dev *Device, hidden, ffn, rows, experts, u
 }
 
 // TestPlanMoEMMQShapeRules pins the add-time rules of the int8 WMMA expert ops:
-// the K-quant dtype set, the 128-value width rule for the K width and the
-// output width, the measured assignment tile widths, and the minimum activation
-// spans. Every rejection must happen before submission so a caller can keep the
-// dp4a or FP32 route.
+// the K-quant and IQ dtype set, the 256-value block rule for the K width and
+// the 128-channel rule for the output width, the measured assignment tile
+// widths, and the minimum activation spans. Every rejection must happen before
+// submission so a caller can keep the dp4a or FP32 route.
 func TestPlanMoEMMQShapeRules(t *testing.T) {
 	dev := openTestDevice(t)
 	plan, err := dev.NewPlan()
@@ -74,14 +74,17 @@ func TestPlanMoEMMQShapeRules(t *testing.T) {
 			b.assignRows, b.assignSlots, b.gate, b.up, h, f, rows, experts, used,
 			tileJ, dtype)
 	}
-	if err := gateUp(tensor.IQ2XXS, hidden, ffn, 16); err == nil {
-		t.Fatal("MMQ gate/up accepted an IQ expert dtype")
+	if err := gateUp(tensor.Q8_0, hidden, ffn, 16); err == nil {
+		t.Fatal("MMQ gate/up accepted a Q8_0 expert dtype")
 	}
 	if err := gateUp(tensor.F32, hidden, ffn, 16); err == nil {
 		t.Fatal("MMQ gate/up accepted an F32 expert dtype")
 	}
+	if err := gateUp(tensor.IQ2XXS, hidden-256+128, ffn, 16); err == nil {
+		t.Fatal("MMQ gate/up accepted an IQ K width that is not a whole number of 256-value blocks")
+	}
 	if err := gateUp(tensor.Q4_K, hidden+64, ffn, 16); err == nil {
-		t.Fatal("MMQ gate/up accepted a K width that is not a multiple of 128")
+		t.Fatal("MMQ gate/up accepted a K width that is not a whole number of 256-value blocks")
 	}
 	if err := gateUp(tensor.Q4_K, hidden, ffn+64, 16); err == nil {
 		t.Fatal("MMQ gate/up accepted an output width that is not a multiple of 128")
@@ -105,11 +108,11 @@ func TestPlanMoEMMQShapeRules(t *testing.T) {
 			b.assignRows, b.assignSlots, b.down, f, h, rows, experts, used, tileJ,
 			dtype)
 	}
-	if err := down(tensor.IQ3S, ffn, hidden, 16); err == nil {
-		t.Fatal("MMQ down accepted an IQ expert dtype")
+	if err := down(tensor.Q8_0, ffn, hidden, 16); err == nil {
+		t.Fatal("MMQ down accepted a Q8_0 expert dtype")
 	}
 	if err := down(tensor.Q6_K, ffn+64, hidden, 16); err == nil {
-		t.Fatal("MMQ down accepted a K width that is not a multiple of 128")
+		t.Fatal("MMQ down accepted a K width that is not a whole number of 256-value blocks")
 	}
 	if err := down(tensor.Q6_K, ffn, hidden, 20); err == nil {
 		t.Fatal("MMQ down accepted an unmeasured assignment tile")
@@ -130,15 +133,21 @@ func TestPlanMoEMMQShapeRules(t *testing.T) {
 	}
 
 	// The shapes the model uses must be accepted and reach the plan with the
-	// assignment tile width in n[5].
+	// assignment tile width in n[5], for a K-quant and an IQ expert dtype.
 	if err := gateUp(tensor.Q4_K, hidden, ffn, 32); err != nil {
 		t.Fatal(err)
 	}
 	if err := down(tensor.Q6_K, ffn, hidden, 64); err != nil {
 		t.Fatal(err)
 	}
-	if got := plan.OpCount(); got != 2 {
-		t.Fatalf("plan holds %d operations, want 2", got)
+	if err := gateUp(tensor.IQ2XXS, hidden, ffn, 16); err != nil {
+		t.Fatal(err)
+	}
+	if err := down(tensor.IQ2S, ffn, hidden, 16); err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.OpCount(); got != 4 {
+		t.Fatalf("plan holds %d operations, want 4", got)
 	}
 	ops := plan.Ops()
 	if ops[0].Code != OpMoEGateUpMMQ || ops[0].N[0] != hidden || ops[0].N[1] != ffn ||
