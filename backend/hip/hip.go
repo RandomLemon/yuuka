@@ -1765,6 +1765,127 @@ func (p *Plan) AddMoEDownQ8(actQ8, actDS, downExps, counts, assignRows, assignSl
 	return p.add(op)
 }
 
+// checkMoEMMQDType reports whether the int8 WMMA expert route decodes the
+// dtype. The route stages the K-quant codebooks through the shared MMQ tile
+// staging, so the IQ codebooks stay on the Q8_1 dp4a route until they have a
+// decoder in that layout.
+func checkMoEMMQDType(dtype tensor.DType, width int64) error {
+	switch dtype {
+	case tensor.Q4_K, tensor.Q5_K, tensor.Q6_K:
+	default:
+		return fmt.Errorf("hip: MMQ expert route serves K-quant experts only, got %s", dtype)
+	}
+	if width%128 != 0 {
+		return fmt.Errorf("hip: MMQ expert width %d is not a multiple of 128", width)
+	}
+	return nil
+}
+
+// MoEMMQTile reports whether tileJ is one of the measured assignment tile
+// widths of the int8 WMMA expert route. The route is selected from a measured
+// table, so a width outside this set is a planning error.
+func MoEMMQTile(tileJ int64) bool {
+	switch tileJ {
+	case 16, 32, 64, 128:
+		return true
+	default:
+		return false
+	}
+}
+
+// AddMoEGateUpMMQ appends the grouped gate/up expert projections over a Q8_1
+// activation tile with the int8 WMMA route. normQ8 holds the int8 digits of
+// [rows, hidden] and normDS their float2 block scales; counts and assignments
+// come from AddMoERoute, and gateOut and upOut are [rows*used, ffn]. Both expert
+// matrices must share dtype. tileJ is the assignment tile width the kernel
+// walks the bucket with; it must be one of the measured widths.
+func (p *Plan) AddMoEGateUpMMQ(normQ8, normDS, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut *Buffer, hidden, ffn, rows, experts, used, tileJ int64, dtype tensor.DType) error {
+	if hidden <= 0 || ffn <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid MMQ MoE gate/up dimensions")
+	}
+	if !MoEMMQTile(tileJ) {
+		return fmt.Errorf("hip: MMQ assignment tile %d is not a measured width", tileJ)
+	}
+	if err := checkMoEMMQDType(dtype, hidden); err != nil {
+		return err
+	}
+	if err := checkMoEMMQDType(dtype, ffn); err != nil {
+		return err
+	}
+	if err := p.check(normQ8, normDS, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut); err != nil {
+		return err
+	}
+	if want := rows * hidden; int64(normQ8.bytes) < want {
+		return fmt.Errorf("hip: MMQ norm tile holds %d bytes, want %d", normQ8.bytes, want)
+	}
+	if want := rows * (hidden / 32) * 8; int64(normDS.bytes) < want {
+		return fmt.Errorf("hip: MMQ norm scales hold %d bytes, want %d", normDS.bytes, want)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_GATE_UP_MMQ}
+	op.buf[0] = normQ8.ptr
+	op.buf[1] = normDS.ptr
+	op.buf[2] = gateExps.ptr
+	op.buf[3] = upExps.ptr
+	op.buf[4] = counts.ptr
+	op.buf[5] = assignRows.ptr
+	op.buf[6] = assignSlots.ptr
+	op.buf[7] = gateOut.ptr
+	op.buf[8] = upOut.ptr
+	op.n[0] = C.uint64_t(hidden)
+	op.n[1] = C.uint64_t(ffn)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(experts)
+	op.n[4] = C.uint64_t(used)
+	op.n[5] = C.uint64_t(tileJ)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddMoEDownMMQ appends the grouped expert down projections over the Q8_1
+// SwiGLU tile with the int8 WMMA route. actQ8 holds the int8 digits of
+// [rows*used, ffn] and actDS their float2 block scales; out is
+// [rows*used, hidden]. The activation row of an assignment is its slot.
+func (p *Plan) AddMoEDownMMQ(actQ8, actDS, downExps, counts, assignRows, assignSlots, out *Buffer, ffn, hidden, rows, experts, used, tileJ int64, dtype tensor.DType) error {
+	if ffn <= 0 || hidden <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid MMQ MoE down dimensions")
+	}
+	if !MoEMMQTile(tileJ) {
+		return fmt.Errorf("hip: MMQ assignment tile %d is not a measured width", tileJ)
+	}
+	if err := checkMoEMMQDType(dtype, ffn); err != nil {
+		return err
+	}
+	if err := checkMoEMMQDType(dtype, hidden); err != nil {
+		return err
+	}
+	if err := p.check(actQ8, actDS, downExps, counts, assignRows, assignSlots, out); err != nil {
+		return err
+	}
+	slots := rows * used
+	if want := slots * ffn; int64(actQ8.bytes) < want {
+		return fmt.Errorf("hip: MMQ down activation tile holds %d bytes, want %d", actQ8.bytes, want)
+	}
+	if want := slots * (ffn / 32) * 8; int64(actDS.bytes) < want {
+		return fmt.Errorf("hip: MMQ down activation scales hold %d bytes, want %d", actDS.bytes, want)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_DOWN_MMQ}
+	op.buf[0] = actQ8.ptr
+	op.buf[1] = actDS.ptr
+	op.buf[2] = downExps.ptr
+	op.buf[3] = counts.ptr
+	op.buf[4] = assignRows.ptr
+	op.buf[5] = assignSlots.ptr
+	op.buf[6] = out.ptr
+	op.n[0] = C.uint64_t(ffn)
+	op.n[1] = C.uint64_t(hidden)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(experts)
+	op.n[4] = C.uint64_t(used)
+	op.n[5] = C.uint64_t(tileJ)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
 // AddMoEReduceAdd appends weighted accumulation of per-slot expert outputs into
 // the residual stream x. expertOut is [rows*used, hidden] and weights is
 // [rows, used].

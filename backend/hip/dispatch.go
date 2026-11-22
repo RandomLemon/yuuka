@@ -96,6 +96,102 @@ func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 	return PrefillWMMA
 }
 
+// MoEPrefillPath is the selected routed-expert prefill implementation.
+type MoEPrefillPath int
+
+const (
+	// MoEPrefillF32Grouped is the grouped kernel over FP32 activations. It
+	// serves every dtype the MoE kernels decode but pays the scalar decode and
+	// dot per weight value, so it is the fallback for shapes the quantized
+	// routes do not cover.
+	MoEPrefillF32Grouped MoEPrefillPath = iota
+	// MoEPrefillQ8 is the grouped Q8_1 dp4a route. It serves the IQ codebooks
+	// and the shapes whose K or output width does not fit the WMMA tile.
+	MoEPrefillQ8
+	// MoEPrefillMMQ is the grouped int8 WMMA route: the same Q8_1 activation
+	// tile dotted by 16x16x16 int8 WMMA over an assignment tile of TileJ rows,
+	// so one decoded weight tile serves the whole assignment tile.
+	MoEPrefillMMQ
+)
+
+// String returns the diagnostic name of a MoE prefill path.
+func (p MoEPrefillPath) String() string {
+	switch p {
+	case MoEPrefillF32Grouped:
+		return "fp32-grouped"
+	case MoEPrefillQ8:
+		return "q8-dp4a"
+	case MoEPrefillMMQ:
+		return "mmq"
+	default:
+		return "unknown"
+	}
+}
+
+// MoEMMQMaxTileJ is the widest measured assignment tile of the int8 WMMA
+// expert route.
+const MoEMMQMaxTileJ = 128
+
+// SelectMoEPrefillPath returns the routed-expert prefill route and, for the
+// int8 WMMA route, its assignment tile width.
+//
+// The tile width follows the average number of assignments an expert receives:
+// a chunk of rows tokens with top-k used over experts experts bins
+// ceil(rows*used/experts) rows per expert, and each tile of TileJ assignments
+// streams the expert's weight rows once. Taking the smallest power of two that
+// covers that average keeps one weight pass per expert at every measured chunk
+// size, which is what the route is for; a bucket that overflows it costs one
+// more pass and is still correct.
+//
+// Both quantized routes require at least MoEPrefillMinRows rows: below that the
+// Q8_1 activation pass and the grouped tile cost more than they save, which is
+// also why the one-row FFN of the last prefill chunk stays on the FP32 grouped
+// route. Everything
+// else falls back to the Q8_1 dp4a route for the IQ codebooks and to the FP32
+// grouped route otherwise. The thresholds are plan-build-time decisions; the
+// measured stage times that motivate them are in docs/benchmarks.md and
+// docs/benchmarks/qwen3.6_35b_a3b.md.
+//
+// allowMMQ gates the route itself. It is false unless the caller enables the
+// opt-in option, because the tile-width table below is a derivation rather than
+// a measured dispatch table yet: docs/kernels.md records the tile sweep as the
+// next measurement, and the default dispatch must not change before it lands.
+func SelectMoEPrefillPath(dtype tensor.DType, rows, used, experts, nIn, nOut int64, allowMMQ bool) (MoEPrefillPath, int64) {
+	if rows <= 0 || used <= 0 || experts <= 0 || nIn <= 0 || nOut <= 0 {
+		return MoEPrefillF32Grouped, 0
+	}
+	if rows < MoEPrefillMinRows {
+		return MoEPrefillF32Grouped, 0
+	}
+	mmqDType := dtype == tensor.Q4_K || dtype == tensor.Q5_K || dtype == tensor.Q6_K
+	if allowMMQ && mmqDType && nIn%128 == 0 && nOut%128 == 0 {
+		return MoEPrefillMMQ, moeAssignmentTile(rows, used, experts)
+	}
+	switch dtype {
+	case tensor.IQ2XXS, tensor.IQ2S, tensor.IQ3S:
+		if nIn%256 == 0 && nOut%256 == 0 {
+			return MoEPrefillQ8, 0
+		}
+	}
+	return MoEPrefillF32Grouped, 0
+}
+
+// MoEPrefillMinRows is the smallest chunk either quantized expert route serves.
+// Below it the 16-row assignment tile and the Q8_1 activation pass waste more
+// work than they save, and the FP32 grouped route is the measured choice.
+const MoEPrefillMinRows = 16
+
+// moeAssignmentTile returns the smallest measured assignment tile that covers
+// the average bucket of one expert, clamped to the instantiated range.
+func moeAssignmentTile(rows, used, experts int64) int64 {
+	mean := (rows*used + experts - 1) / experts
+	tileJ := int64(16)
+	for tileJ < MoEMMQMaxTileJ && tileJ < mean {
+		tileJ *= 2
+	}
+	return tileJ
+}
+
 // SelectLMHeadPath reports whether the streaming LM head kernel is selected for
 // an output projection. The kernel serves 1..16 rows and streams every packed
 // weight row once, which is what makes both output tails bandwidth bound

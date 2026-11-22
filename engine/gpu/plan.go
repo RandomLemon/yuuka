@@ -1077,21 +1077,11 @@ func (m *Model) addPrefillSwiGLU(plan *hip.Plan, gate, up, down weight, norm *hi
 	return m.prefillMatmulPath(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows, downPath)
 }
 
-// isIQExpertDType reports whether an expert matrix uses one of the IQ codebooks
-// whose 256-value blocks the int8 expert route decodes to int8 digits.
-func isIQExpertDType(dtype tensor.DType) bool {
-	switch dtype {
-	case tensor.IQ2XXS, tensor.IQ2S, tensor.IQ3S:
-		return true
-	default:
-		return false
-	}
-}
-
 // addMoEPrefillFFN builds one MoE sub-layer for a prompt chunk. The routed
 // experts use the grouped kernels, which schedule one grid over all experts and
-// let each expert read its binned assignment range; the shared expert reuses the
-// dense prefill SwiGLU and its sigmoid gate.
+// let each expert read its binned assignment range; SelectMoEPrefillPath picks
+// the quantized or FP32 form. The shared expert reuses the dense prefill
+// SwiGLU and its sigmoid gate.
 func (m *Model) addMoEPrefillFFN(plan *hip.Plan, prefix string, postNorm weight, rows, dispatchRows int64) error {
 	cfg := m.config
 	p := &m.prefill
@@ -1161,18 +1151,30 @@ func (m *Model) addMoEPrefillFFN(plan *hip.Plan, prefix string, postNorm weight,
 		p.moeAssignRows, p.moeAssignSlots, p.moeAssignWeights, rows, experts, used); err != nil {
 		return err
 	}
-	// The int8 route needs a whole 256-value K step and a whole sixteen-
-	// assignment tile. It also needs both expert matrices in an IQ codebook,
-	// which is what the dp4a decoders serve; every other shape or dtype keeps
-	// the FP32 grouped path.
-	q8 := rows >= 16 && hidden%256 == 0 && ffn%256 == 0 &&
-		gate.dtype == up.dtype && isIQExpertDType(gate.dtype) &&
-		isIQExpertDType(down.dtype)
-	if q8 {
+	// Both quantized expert routes need a Q8_1 activation tile and one whole
+	// activation tile per K step; the int8 WMMA route additionally needs a
+	// measured assignment tile width, which SelectMoEPrefillPath derives from
+	// the average bucket of one expert. The two ends of the FFN select their
+	// route independently, but the plan keeps them on the same quantized form:
+	// a mixed pair (one end quantized, the other not) has no measured plan and
+	// keeps the FP32 grouped path.
+	gatePath, gateTile := hip.SelectMoEPrefillPath(gate.dtype, rows, used, experts,
+		hidden, ffn, m.moEMMQ)
+	downPath, downTile := hip.SelectMoEPrefillPath(down.dtype, rows, used, experts,
+		ffn, hidden, m.moEMMQ)
+	quantized := gatePath == downPath &&
+		(gatePath == hip.MoEPrefillMMQ || gatePath == hip.MoEPrefillQ8)
+	if quantized {
 		if err := plan.AddQuantizeQ8_1At(p.norm, 0, p.xQ8, p.xDS, hidden, rows); err != nil {
 			return err
 		}
-		if err := plan.AddMoEGateUpQ8(p.xQ8, p.xDS, gate.buf, up.buf, p.moeCounts,
+		if gatePath == hip.MoEPrefillMMQ {
+			if err := plan.AddMoEGateUpMMQ(p.xQ8, p.xDS, gate.buf, up.buf, p.moeCounts,
+				p.moeAssignRows, p.moeAssignSlots, p.moeGate, p.moeUp, hidden, ffn,
+				rows, experts, used, gateTile, gate.dtype); err != nil {
+				return err
+			}
+		} else if err := plan.AddMoEGateUpQ8(p.xQ8, p.xDS, gate.buf, up.buf, p.moeCounts,
 			p.moeAssignRows, p.moeAssignSlots, p.moeGate, p.moeUp, hidden, ffn,
 			rows, experts, used, gate.dtype); err != nil {
 			return err
@@ -1181,7 +1183,13 @@ func (m *Model) addMoEPrefillFFN(plan *hip.Plan, prefix string, postNorm weight,
 			p.moeDS, 0, ffn, rows*used); err != nil {
 			return err
 		}
-		if err := plan.AddMoEDownQ8(p.moeQ8, p.moeDS, down.buf, p.moeCounts,
+		if downPath == hip.MoEPrefillMMQ {
+			if err := plan.AddMoEDownMMQ(p.moeQ8, p.moeDS, down.buf, p.moeCounts,
+				p.moeAssignRows, p.moeAssignSlots, p.moeOut, ffn, hidden, rows,
+				experts, used, downTile, down.dtype); err != nil {
+				return err
+			}
+		} else if err := plan.AddMoEDownQ8(p.moeQ8, p.moeDS, down.buf, p.moeCounts,
 			p.moeAssignRows, p.moeAssignSlots, p.moeOut, ffn, hidden, rows,
 			experts, used, down.dtype); err != nil {
 			return err

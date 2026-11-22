@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 11
+#define YUUKA_HIP_ABI_VERSION 12
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -149,7 +149,9 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_DOWN_SELECTED = 45,
     YUUKA_OP_MOE_SHARED_ADD = 46,
     YUUKA_OP_MOE_GATE_UP_Q8 = 47,
-    YUUKA_OP_MOE_DOWN_Q8 = 48
+    YUUKA_OP_MOE_DOWN_Q8 = 48,
+    YUUKA_OP_MOE_GATE_UP_MMQ = 49,
+    YUUKA_OP_MOE_DOWN_MMQ = 50
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -501,6 +503,24 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                float2[rows*used,ffn/32], buf2 down_exps, buf3 counts,
  *                buf4 assign_rows, buf5 assign_slots, buf6 out [rows*used,hidden];
  *                n={ffn,hidden,rows,experts,used}; u[0]=dtype
+ *
+ * Int8 WMMA expert family. These are the grouped kernels over the same Q8_1
+ * activation tile, with the assignment bucket walked in tiles of n[5] rows and
+ * the int8 weights dotted by 16x16x16 WMMA instead of dp4a. They accept the
+ * K-quant expert dtypes (Q4_K, Q5_K, Q6_K) and require hidden, ffn, and the
+ * output width to be multiples of 128, which covers the K step and the 16-128
+ * channel tile. The assignment inputs are the MOE_ROUTE outputs; n[5] is the
+ * assignment tile width, one of 16, 32, 64, 128, and it is a plan-build-time
+ * dispatch decision, not a runtime option.
+ *   MOE_GATE_UP_MMQ: buf0 norm_qs int8[rows,hidden], buf1 norm_ds
+ *                    float2[rows,hidden/32], buf2 gate_exps, buf3 up_exps,
+ *                    buf4 counts, buf5 assign_rows, buf6 assign_slots,
+ *                    buf7 gate_out [rows*used,ffn], buf8 up_out [rows*used,ffn];
+ *                    n={hidden,ffn,rows,experts,used,tile_j}; u[0]=dtype
+ *   MOE_DOWN_MMQ: buf0 act_qs int8[rows*used,ffn], buf1 act_ds
+ *                 float2[rows*used,ffn/32], buf2 down_exps, buf3 counts,
+ *                 buf4 assign_rows, buf5 assign_slots, buf6 out [rows*used,hidden];
+ *                 n={ffn,hidden,rows,experts,used,tile_j}; u[0]=dtype
  *
  * Graph capture executes a plan with device-resident dynamic parameters.
  * Position-dependent ops must have a dynamic-parameter kernel; plans containing

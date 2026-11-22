@@ -102,3 +102,58 @@ func TestSelectPrefillPath(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectMoEPrefillPath(t *testing.T) {
+	cases := []struct {
+		name      string
+		dtype     tensor.DType
+		rows      int64
+		used      int64
+		experts   int64
+		nIn, nOut int64
+		allowMMQ  bool
+		want      MoEPrefillPath
+		wantTile  int64
+	}{
+		// The opt-in is the only thing that enables the WMMA route, so a
+		// K-quant MoE chunk keeps the FP32 grouped path by default.
+		{"q4k chunk default", tensor.Q4_K, 512, 8, 256, 2048, 512, false,
+			MoEPrefillF32Grouped, 0},
+		{"q4k chunk opt-in", tensor.Q4_K, 512, 8, 256, 2048, 512, true,
+			MoEPrefillMMQ, 16},
+		{"q6k chunk 2048", tensor.Q6_K, 2048, 8, 256, 2048, 512, true,
+			MoEPrefillMMQ, 64},
+		{"q4k short chunk", tensor.Q4_K, 16, 8, 256, 2048, 512, true,
+			MoEPrefillMMQ, 16},
+		{"q4k below minimum rows", tensor.Q4_K, 8, 8, 256, 2048, 512, true,
+			MoEPrefillF32Grouped, 0},
+		{"q4k odd K width", tensor.Q4_K, 512, 8, 256, 2000, 512, true,
+			MoEPrefillF32Grouped, 0},
+		// The IQ codebooks stay on the dp4a route until they have a decoder in
+		// the MMQ tile layout.
+		{"iq2xxs chunk", tensor.IQ2XXS, 512, 8, 256, 2048, 512, true,
+			MoEPrefillQ8, 0},
+		{"iq3s odd width", tensor.IQ3S, 512, 8, 256, 2048, 500, true,
+			MoEPrefillF32Grouped, 0},
+		// The cropped one-row FFN of the last prefill chunk keeps the FP32
+		// grouped route; the quantized tile would be almost entirely padding.
+		{"iq2xxs cropped row", tensor.IQ2XXS, 1, 8, 256, 2048, 512, true,
+			MoEPrefillF32Grouped, 0},
+		{"q4k cropped row", tensor.Q4_K, 1, 8, 256, 2048, 512, true,
+			MoEPrefillF32Grouped, 0},
+		{"f16 experts", tensor.F16, 512, 8, 256, 2048, 512, true,
+			MoEPrefillF32Grouped, 0},
+	}
+	for _, c := range cases {
+		got, tile := SelectMoEPrefillPath(c.dtype, c.rows, c.used, c.experts, c.nIn,
+			c.nOut, c.allowMMQ)
+		t.Logf("%s: path=%s tile=%d", c.name, got, tile)
+		if got != c.want {
+			t.Errorf("%s: got path %s, want %s", c.name, got, c.want)
+			continue
+		}
+		if c.want == MoEPrefillMMQ && tile != c.wantTile {
+			t.Errorf("%s: got tile %d, want %d", c.name, tile, c.wantTile)
+		}
+	}
+}

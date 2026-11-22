@@ -375,6 +375,28 @@ void launch_moe_down_grouped_q8(const int8_t * act_qs, const float2 * act_ds,
                                 uint64_t ffn_row_bytes, uint32_t dtype,
                                 hipStream_t stream);
 
+/* Int8 WMMA (MMQ) expert kernels. Same Q8_1 activation tile and assignment
+ * bucket as the dp4a family, but the expert rows are dotted by 16x16x16 int8
+ * WMMA over an assignment tile of tile_j rows (16, 32, 64, or 128), so one
+ * decoded weight tile serves the whole assignment tile. They serve the K-quant
+ * expert dtypes and require hidden/ffn to be multiples of 128. Both return
+ * YUUKA_OK or an error; an unsupported dtype/tile combination is an error, not
+ * a silent fallback. */
+int launch_moe_gate_up_mmq(const int8_t * norm_qs, const float2 * norm_ds,
+                           const void * gate_exps, const void * up_exps,
+                           const int32_t * counts, const int32_t * assign_rows,
+                           const int32_t * assign_slots, float * gate_out,
+                           float * up_out, int rows, int experts, int used,
+                           int hidden, int ffn, uint64_t hidden_row_bytes,
+                           uint32_t dtype, int tile_j, hipStream_t stream);
+int launch_moe_down_mmq(const int8_t * act_qs, const float2 * act_ds,
+                        const void * down_exps, const int32_t * counts,
+                        const int32_t * assign_rows,
+                        const int32_t * assign_slots, float * out, int rows,
+                        int experts, int used, int hidden, int ffn,
+                        uint64_t ffn_row_bytes, uint32_t dtype, int tile_j,
+                        hipStream_t stream);
+
 /* Selected-expert MoE kernels. The decode path reads the routing ids and
  * launches one grid over the rows*used selected slots, so an expert row is only
  * scheduled for a token that selected it. */

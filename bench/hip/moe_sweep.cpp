@@ -1,5 +1,10 @@
 // Measures the grouped MoE routing and expert pipeline at production-like
 // shapes. The weights are packed Q4_K and are never dequantized on the host.
+//
+// --route selects the expert kernels: fp32 is the grouped FP32 pipeline,
+// mmq is the grouped int8 WMMA pipeline over the Q8_1 activation tile.
+// --tile-j selects the MMQ assignment tile width and --rows overrides the
+// row sweep, so the same binary covers the prompt-chunk attributions.
 
 #include "yuuka_hip.h"
 
@@ -7,7 +12,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <random>
 #include <vector>
 
@@ -78,7 +86,7 @@ yuuka_buffer * alloc(yuuka_device * device, uint64_t bytes) {
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     yuuka_device * device = nullptr;
     if (yuuka_device_open(0, &device) != YUUKA_OK) {
         std::fprintf(stderr, "SKIP: no HIP device: %s\n", yuuka_last_error());
@@ -91,6 +99,46 @@ int main() {
         std::fprintf(stderr, "stream or event creation failed\n");
         return 1;
     }
+    const char * route = "fp32";
+    int tile_j = 16;
+    std::vector<int> row_sweep{1, 2, 4, 8, 16, 32};
+    for (int arg = 1; arg < argc; ++arg) {
+        const std::string_view flag(argv[arg]);
+        if (flag == "--route" && arg + 1 < argc) {
+            route = argv[++arg];
+        } else if (flag == "--tile-j" && arg + 1 < argc) {
+            tile_j = std::atoi(argv[++arg]);
+        } else if (flag == "--rows" && arg + 1 < argc) {
+            row_sweep.clear();
+            std::string text(argv[++arg]);
+            size_t start = 0;
+            while (start <= text.size()) {
+                const size_t comma = text.find(',', start);
+                const std::string part = text.substr(start, comma == std::string::npos
+                                                                ? std::string::npos
+                                                                : comma - start);
+                if (!part.empty()) {
+                    row_sweep.push_back(std::atoi(part.c_str()));
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
+        } else {
+            std::fprintf(stderr,
+                         "usage: %s [--route fp32|mmq] [--tile-j 16|32|64|128] "
+                         "[--rows 16,32,64]\n",
+                         argv[0]);
+            return 2;
+        }
+    }
+    const bool mmq = std::string_view(route) == "mmq";
+    if (!mmq && std::string_view(route) != "fp32") {
+        std::fprintf(stderr, "unsupported route %s\n", route);
+        return 2;
+    }
+
     const int experts = 128, used = 8, hidden = 2048, ffn = 768;
     const uint64_t hidden_row = q4k_row_bytes(hidden);
     const uint64_t ffn_row = q4k_row_bytes(ffn);
@@ -115,11 +163,15 @@ int main() {
     CHECK_STATUS(yuuka_memcpy_h2d(down_buf, down.data(), down.size()));
 
     std::printf("device: %s\n", "gfx1151");
-    std::printf("shape: experts=%d used=%d hidden=%d ffn=%d dtype=Q4_K\n",
-                experts, used, hidden, ffn);
+    std::printf("shape: experts=%d used=%d hidden=%d ffn=%d dtype=Q4_K route=%s",
+                experts, used, hidden, ffn, route);
+    if (mmq) {
+        std::printf(" tile_j=%d", tile_j);
+    }
+    std::printf("\n");
     std::printf("rows,route_ms,gate_up_ms,down_ms,reduce_ms,total_ms,tokens_per_s\n");
 
-    for (int rows : {1, 2, 4, 8, 16, 32}) {
+    for (int rows : row_sweep) {
         const uint64_t bucket = uint64_t(experts) * rows * used * 4;
         yuuka_buffer * logits = alloc(device, uint64_t(rows) * experts * 4);
         yuuka_buffer * norm = alloc(device, uint64_t(rows) * hidden * 4);
@@ -134,10 +186,19 @@ int main() {
         yuuka_buffer * act_out = alloc(device, uint64_t(rows) * used * ffn * 4);
         yuuka_buffer * expert_out = alloc(device, uint64_t(rows) * used * hidden * 4);
         yuuka_buffer * x = alloc(device, uint64_t(rows) * hidden * 4);
+        yuuka_buffer * norm_q8 = mmq ? alloc(device, uint64_t(rows) * hidden) : nullptr;
+        yuuka_buffer * norm_ds =
+            mmq ? alloc(device, uint64_t(rows) * (hidden / 32) * 8) : nullptr;
+        yuuka_buffer * act_q8 =
+            mmq ? alloc(device, uint64_t(rows) * used * ffn) : nullptr;
+        yuuka_buffer * act_ds =
+            mmq ? alloc(device, uint64_t(rows) * used * (ffn / 32) * 8) : nullptr;
         if (logits == nullptr || norm == nullptr || ids == nullptr || weights == nullptr ||
             counts == nullptr || assign_rows == nullptr || assign_slots == nullptr ||
             assign_weights == nullptr || gate_out == nullptr || up_out == nullptr ||
-            act_out == nullptr || expert_out == nullptr || x == nullptr) {
+            act_out == nullptr || expert_out == nullptr || x == nullptr ||
+            (mmq && (norm_q8 == nullptr || norm_ds == nullptr || act_q8 == nullptr ||
+                     act_ds == nullptr))) {
             std::fprintf(stderr, "activation allocation failed\n");
             return 1;
         }
@@ -167,47 +228,106 @@ int main() {
         op.n[2] = used;
         CHECK_STATUS(yuuka_plan_add(plan, &op));
 
-        op = yuuka_op{};
-        op.code = YUUKA_OP_MOE_GATE_UP;
-        op.buf[0] = norm;
-        op.buf[1] = gate_buf;
-        op.buf[2] = up_buf;
-        op.buf[3] = counts;
-        op.buf[4] = assign_rows;
-        op.buf[5] = assign_slots;
-        op.buf[6] = gate_out;
-        op.buf[7] = up_out;
-        op.n[0] = hidden;
-        op.n[1] = ffn;
-        op.n[2] = rows;
-        op.n[3] = experts;
-        op.n[4] = used;
-        op.u[0] = YUUKA_DTYPE_Q4_K;
-        CHECK_STATUS(yuuka_plan_add(plan, &op));
+        if (mmq) {
+            op = yuuka_op{};
+            op.code = YUUKA_OP_QUANT_Q8_1;
+            op.buf[0] = norm;
+            op.buf[1] = norm_q8;
+            op.buf[2] = norm_ds;
+            op.n[0] = hidden;
+            op.n[1] = rows;
+            CHECK_STATUS(yuuka_plan_add(plan, &op));
 
-        op = yuuka_op{};
-        op.code = YUUKA_OP_SILU_MUL;
-        op.buf[0] = gate_out;
-        op.buf[1] = up_out;
-        op.buf[2] = act_out;
-        op.n[0] = uint64_t(rows) * used * ffn;
-        CHECK_STATUS(yuuka_plan_add(plan, &op));
+            op = yuuka_op{};
+            op.code = YUUKA_OP_MOE_GATE_UP_MMQ;
+            op.buf[0] = norm_q8;
+            op.buf[1] = norm_ds;
+            op.buf[2] = gate_buf;
+            op.buf[3] = up_buf;
+            op.buf[4] = counts;
+            op.buf[5] = assign_rows;
+            op.buf[6] = assign_slots;
+            op.buf[7] = gate_out;
+            op.buf[8] = up_out;
+            op.n[0] = hidden;
+            op.n[1] = ffn;
+            op.n[2] = rows;
+            op.n[3] = experts;
+            op.n[4] = used;
+            op.n[5] = tile_j;
+            op.u[0] = YUUKA_DTYPE_Q4_K;
+            CHECK_STATUS(yuuka_plan_add(plan, &op));
 
-        op = yuuka_op{};
-        op.code = YUUKA_OP_MOE_DOWN;
-        op.buf[0] = act_out;
-        op.buf[1] = down_buf;
-        op.buf[2] = counts;
-        op.buf[3] = assign_rows;
-        op.buf[4] = assign_slots;
-        op.buf[5] = expert_out;
-        op.n[0] = ffn;
-        op.n[1] = hidden;
-        op.n[2] = rows;
-        op.n[3] = experts;
-        op.n[4] = used;
-        op.u[0] = YUUKA_DTYPE_Q4_K;
-        CHECK_STATUS(yuuka_plan_add(plan, &op));
+            op = yuuka_op{};
+            op.code = YUUKA_OP_SILU_MUL_QUANT_Q8_1;
+            op.buf[0] = gate_out;
+            op.buf[1] = up_out;
+            op.buf[2] = act_q8;
+            op.buf[3] = act_ds;
+            op.n[0] = ffn;
+            op.n[1] = uint64_t(rows) * used;
+            CHECK_STATUS(yuuka_plan_add(plan, &op));
+
+            op = yuuka_op{};
+            op.code = YUUKA_OP_MOE_DOWN_MMQ;
+            op.buf[0] = act_q8;
+            op.buf[1] = act_ds;
+            op.buf[2] = down_buf;
+            op.buf[3] = counts;
+            op.buf[4] = assign_rows;
+            op.buf[5] = assign_slots;
+            op.buf[6] = expert_out;
+            op.n[0] = ffn;
+            op.n[1] = hidden;
+            op.n[2] = rows;
+            op.n[3] = experts;
+            op.n[4] = used;
+            op.n[5] = tile_j;
+            op.u[0] = YUUKA_DTYPE_Q4_K;
+            CHECK_STATUS(yuuka_plan_add(plan, &op));
+        } else {
+            op = yuuka_op{};
+            op.code = YUUKA_OP_MOE_GATE_UP;
+            op.buf[0] = norm;
+            op.buf[1] = gate_buf;
+            op.buf[2] = up_buf;
+            op.buf[3] = counts;
+            op.buf[4] = assign_rows;
+            op.buf[5] = assign_slots;
+            op.buf[6] = gate_out;
+            op.buf[7] = up_out;
+            op.n[0] = hidden;
+            op.n[1] = ffn;
+            op.n[2] = rows;
+            op.n[3] = experts;
+            op.n[4] = used;
+            op.u[0] = YUUKA_DTYPE_Q4_K;
+            CHECK_STATUS(yuuka_plan_add(plan, &op));
+
+            op = yuuka_op{};
+            op.code = YUUKA_OP_SILU_MUL;
+            op.buf[0] = gate_out;
+            op.buf[1] = up_out;
+            op.buf[2] = act_out;
+            op.n[0] = uint64_t(rows) * used * ffn;
+            CHECK_STATUS(yuuka_plan_add(plan, &op));
+
+            op = yuuka_op{};
+            op.code = YUUKA_OP_MOE_DOWN;
+            op.buf[0] = act_out;
+            op.buf[1] = down_buf;
+            op.buf[2] = counts;
+            op.buf[3] = assign_rows;
+            op.buf[4] = assign_slots;
+            op.buf[5] = expert_out;
+            op.n[0] = ffn;
+            op.n[1] = hidden;
+            op.n[2] = rows;
+            op.n[3] = experts;
+            op.n[4] = used;
+            op.u[0] = YUUKA_DTYPE_Q4_K;
+            CHECK_STATUS(yuuka_plan_add(plan, &op));
+        }
 
         op = yuuka_op{};
         op.code = YUUKA_OP_MOE_REDUCE_ADD;
@@ -234,8 +354,10 @@ int main() {
         for (uint64_t i = 0; i < op_count; ++i) {
             switch (op_codes[i]) {
                 case YUUKA_OP_MOE_ROUTE: route_ns += double(op_times[i]); break;
-                case YUUKA_OP_MOE_GATE_UP: gate_ns += double(op_times[i]); break;
-                case YUUKA_OP_MOE_DOWN: down_ns += double(op_times[i]); break;
+                case YUUKA_OP_MOE_GATE_UP:
+                case YUUKA_OP_MOE_GATE_UP_MMQ: gate_ns += double(op_times[i]); break;
+                case YUUKA_OP_MOE_DOWN:
+                case YUUKA_OP_MOE_DOWN_MMQ: down_ns += double(op_times[i]); break;
                 case YUUKA_OP_MOE_REDUCE_ADD: reduce_ns += double(op_times[i]); break;
                 default: break;
             }
@@ -259,7 +381,8 @@ int main() {
         yuuka_plan_destroy(plan);
         for (yuuka_buffer * buffer : {logits, norm, ids, weights, counts, assign_rows,
                                       assign_slots, assign_weights, gate_out, up_out,
-                                      act_out, expert_out, x}) {
+                                      act_out, expert_out, x, norm_q8, norm_ds, act_q8,
+                                      act_ds}) {
             yuuka_buffer_free(buffer);
         }
     }

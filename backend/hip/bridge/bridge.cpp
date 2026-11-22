@@ -1934,6 +1934,146 @@ yuuka_status validate_moe_gate_up_q8_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// check_moe_mmq_dtype reports whether the int8 WMMA expert kernels decode the
+// dtype. They stage the K-quant codebooks through the shared MMQ tile staging,
+// so the IQ codebooks stay on the dp4a route until they have a decoder in that
+// layout.
+bool check_moe_mmq_dtype(uint64_t n_in, uint32_t dtype) {
+    switch (dtype) {
+        case YUUKA_DTYPE_Q4_K:
+        case YUUKA_DTYPE_Q5_K:
+        case YUUKA_DTYPE_Q6_K:
+            return n_in % 256 == 0;
+        default:
+            return false;
+    }
+}
+
+// check_moe_mmq_tile reports whether the assignment tile width is one of the
+// measured instantiations. A width outside this set is a planning error, not a
+// reason to silently run another tile.
+bool check_moe_mmq_tile(uint64_t tile_j) {
+    return tile_j == 16 || tile_j == 32 || tile_j == 64 || tile_j == 128;
+}
+
+// validate_moe_gate_up_mmq_plan_op checks the grouped gate/up projection over a
+// Q8_1 activation tile with the int8 WMMA expert kernels. It mirrors
+// validate_moe_gate_up_q8_plan_op with the K-quant dtype set, 128-value K
+// steps, and the assignment tile width in n[5].
+yuuka_status validate_moe_gate_up_mmq_plan_op(const yuuka_op & op) {
+    const uint64_t hidden = op.n[0];
+    const uint64_t ffn = op.n[1];
+    const uint64_t rows = op.n[2];
+    const uint64_t experts = op.n[3];
+    const uint64_t used = op.n[4];
+    const uint64_t tile_j = op.n[5];
+    const uint32_t dtype = op.u[0];
+    if (hidden == 0 || ffn == 0 || rows == 0 || experts == 0 || used == 0 ||
+        used > experts || hidden % 128 != 0 || ffn % 128 != 0 ||
+        !check_moe_mmq_dtype(hidden, dtype) || !check_moe_mmq_tile(tile_j)) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "invalid MMQ MoE gate/up dimensions, dtype, or tile width");
+    }
+    for (int i = 0; i < 9; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "MMQ MoE gate/up buffer %d is null", i);
+        }
+    }
+    uint64_t hidden_row = 0;
+    uint64_t weight_rows = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t norm_qs_bytes = 0;
+    uint64_t norm_ds_bytes = 0;
+    uint64_t row_used = 0;
+    uint64_t out_elems = 0;
+    uint64_t out_bytes = 0;
+    uint64_t bucket_rows = 0;
+    uint64_t bucket_bytes = 0;
+    uint64_t count_bytes = 0;
+    if (!moe_row_bytes(hidden, dtype, &hidden_row) ||
+        __builtin_mul_overflow(ffn, experts, &weight_rows) ||
+        __builtin_mul_overflow(weight_rows, hidden_row, &weight_bytes) ||
+        __builtin_mul_overflow(rows, hidden, &norm_qs_bytes) ||
+        __builtin_mul_overflow(rows * (hidden / 32), uint64_t(8), &norm_ds_bytes) ||
+        __builtin_mul_overflow(rows, used, &row_used) ||
+        __builtin_mul_overflow(row_used, ffn, &out_elems) ||
+        !checked_float_bytes(out_elems, &out_bytes) ||
+        __builtin_mul_overflow(row_used, experts, &bucket_rows) ||
+        !checked_float_bytes(bucket_rows, &bucket_bytes) ||
+        !checked_float_bytes(experts, &count_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MMQ MoE gate/up dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, norm_qs_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, norm_ds_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[4], 0, count_bytes) ||
+        !buffer_range_ok(op.buf[5], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[6], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[7], 0, out_bytes) ||
+        !buffer_range_ok(op.buf[8], 0, out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MMQ MoE gate/up buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
+// validate_moe_down_mmq_plan_op checks the grouped down projection over the
+// Q8_1 SwiGLU activations, with the same dtype, width, and tile rules.
+yuuka_status validate_moe_down_mmq_plan_op(const yuuka_op & op) {
+    const uint64_t ffn = op.n[0];
+    const uint64_t hidden = op.n[1];
+    const uint64_t rows = op.n[2];
+    const uint64_t experts = op.n[3];
+    const uint64_t used = op.n[4];
+    const uint64_t tile_j = op.n[5];
+    const uint32_t dtype = op.u[0];
+    if (ffn == 0 || hidden == 0 || rows == 0 || experts == 0 || used == 0 ||
+        used > experts || ffn % 128 != 0 || hidden % 128 != 0 ||
+        !check_moe_mmq_dtype(ffn, dtype) || !check_moe_mmq_tile(tile_j)) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "invalid MMQ MoE down dimensions, dtype, or tile width");
+    }
+    for (int i = 0; i < 7; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT, "MMQ MoE down buffer %d is null", i);
+        }
+    }
+    uint64_t ffn_row = 0;
+    uint64_t weight_rows = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t row_used = 0;
+    uint64_t act_bytes = 0;
+    uint64_t act_ds_bytes = 0;
+    uint64_t out_elems = 0;
+    uint64_t out_bytes = 0;
+    uint64_t bucket_rows = 0;
+    uint64_t bucket_bytes = 0;
+    uint64_t count_bytes = 0;
+    if (!moe_row_bytes(ffn, dtype, &ffn_row) ||
+        __builtin_mul_overflow(hidden, experts, &weight_rows) ||
+        __builtin_mul_overflow(weight_rows, ffn_row, &weight_bytes) ||
+        __builtin_mul_overflow(rows, used, &row_used) ||
+        __builtin_mul_overflow(row_used, ffn, &act_bytes) ||
+        __builtin_mul_overflow(row_used * (ffn / 32), uint64_t(8), &act_ds_bytes) ||
+        __builtin_mul_overflow(row_used, hidden, &out_elems) ||
+        !checked_float_bytes(out_elems, &out_bytes) ||
+        __builtin_mul_overflow(row_used, experts, &bucket_rows) ||
+        !checked_float_bytes(bucket_rows, &bucket_bytes) ||
+        !checked_float_bytes(experts, &count_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MMQ MoE down dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, act_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, act_ds_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, weight_bytes) ||
+        !buffer_range_ok(op.buf[3], 0, count_bytes) ||
+        !buffer_range_ok(op.buf[4], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[5], 0, bucket_bytes) ||
+        !buffer_range_ok(op.buf[6], 0, out_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT, "MMQ MoE down buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 // validate_moe_down_q8_plan_op checks the grouped down projection over the Q8_1
 // SwiGLU activations, with the same dtype and width rules.
 yuuka_status validate_moe_down_q8_plan_op(const yuuka_op & op) {
@@ -2873,6 +3013,58 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                 op_ptr<const int32_t>(op, 4), op_ptr<const int32_t>(op, 5),
                 op_ptr<float>(op, 6), rows, experts, used, hidden, ffn,
                 ffn_row_bytes, op.u[0], stream);
+            break;
+        }
+
+        case YUUKA_OP_MOE_GATE_UP_MMQ: {
+            const int hidden = int(op.n[0]);
+            const int ffn = int(op.n[1]);
+            const int rows = int(op.n[2]);
+            const int experts = int(op.n[3]);
+            const int used = int(op.n[4]);
+            const int tile_j = int(op.n[5]);
+            uint64_t hidden_row_bytes = 0;
+            if (!moe_row_bytes(uint64_t(hidden), op.u[0], &hidden_row_bytes)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "MMQ MoE gate/up row size overflow");
+            }
+            const int status = yuuka::launch_moe_gate_up_mmq(
+                op_ptr<const int8_t>(op, 0),
+                reinterpret_cast<const float2 *>(op_ptr<const void>(op, 1)),
+                op_ptr<const void>(op, 2), op_ptr<const void>(op, 3),
+                op_ptr<const int32_t>(op, 4), op_ptr<const int32_t>(op, 5),
+                op_ptr<const int32_t>(op, 6), op_ptr<float>(op, 7),
+                op_ptr<float>(op, 8), rows, experts, used, hidden, ffn,
+                hidden_row_bytes, op.u[0], tile_j, stream);
+            if (status != YUUKA_OK) {
+                return fail(YUUKA_ERR_UNSUPPORTED,
+                            "MMQ MoE gate/up route is not instantiated");
+            }
+            break;
+        }
+        case YUUKA_OP_MOE_DOWN_MMQ: {
+            const int ffn = int(op.n[0]);
+            const int hidden = int(op.n[1]);
+            const int rows = int(op.n[2]);
+            const int experts = int(op.n[3]);
+            const int used = int(op.n[4]);
+            const int tile_j = int(op.n[5]);
+            uint64_t ffn_row_bytes = 0;
+            if (!moe_row_bytes(uint64_t(ffn), op.u[0], &ffn_row_bytes)) {
+                return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                            "MMQ MoE down row size overflow");
+            }
+            const int status = yuuka::launch_moe_down_mmq(
+                op_ptr<const int8_t>(op, 0),
+                reinterpret_cast<const float2 *>(op_ptr<const void>(op, 1)),
+                op_ptr<const void>(op, 2), op_ptr<const int32_t>(op, 3),
+                op_ptr<const int32_t>(op, 4), op_ptr<const int32_t>(op, 5),
+                op_ptr<float>(op, 6), rows, experts, used, hidden, ffn,
+                ffn_row_bytes, op.u[0], tile_j, stream);
+            if (status != YUUKA_OK) {
+                return fail(YUUKA_ERR_UNSUPPORTED,
+                            "MMQ MoE down route is not instantiated");
+            }
             break;
         }
         default:
@@ -3923,7 +4115,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MOE_DOWN_Q8) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MOE_DOWN_MMQ) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -4032,6 +4224,12 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_MOE_DOWN_Q8:
                 status = validate_moe_down_q8_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_GATE_UP_MMQ:
+                status = validate_moe_gate_up_mmq_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_DOWN_MMQ:
+                status = validate_moe_down_mmq_plan_op(*op);
                 break;
             case YUUKA_OP_RMSNORM:
                 status = validate_rmsnorm_plan_op(*op);
