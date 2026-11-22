@@ -31,7 +31,7 @@ are kept for the stage comparison.
 | ROCm / HIP | ROCm 10.1.0, HIP 7.16.26385, clang 24.0.0git |
 | Host | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S, 32 threads |
 | Kernel | 7.0.14-28-pve |
-| Power profile | GPU DPM `performance` (amdgpu sysfs), CPU governor `performance` (`amd-pstate-epp`) |
+| Power profile | GPU DPM `auto` (amdgpu sysfs `power_dpm_force_performance_level`), CPU governor `performance` (`amd-pstate-epp`) |
 | Go | go1.24.4, `-tags hip` |
 | Optimized commit | `d0253fde1e9172143b9923a838b1ac393cd3d639` |
 | Frozen baseline commit | `1bc54d18b8911723498df6f2e76a72b8492d9e6f` |
@@ -52,7 +52,8 @@ times the same saved tokens through `llama_batch` with `n_batch = n_ubatch =
 requires both reversed-order pairs and the pooled median to exceed 1.00x.
 A first confirm block started at 56 °C and its 512-token first process was
 discarded as thermally contaminated; the accepted confirmation block started at
-47 °C. Numbers are observations on one machine, not guarantees.
+47 °C. The GPU ran with DPM `auto`, so the clock snapshots in the raw log span
+2.17-2.40 GHz. Numbers are observations on one machine, not guarantees.
 
 ## Matched release comparison
 
