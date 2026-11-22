@@ -503,6 +503,14 @@ The test has no pass/fail gate: every MoE stage that has a recorded constant is
 gated by the real-model tests of the same package
 (`TestGPUMoEGoldenGeneration`, `TestGPUMoEChunkedPrefill`,
 `TestTinyGPUMoEMatchesCPU`), and the profile is a ranking tool.
+`TestGPUProfileMoEPrefillLong` runs the same per-operation profile over the
+fixed 8192-token stream at the release chunk, executing every chunk at its
+populated absolute position and grouping dense GEMMs by tensor leaf, dtype,
+path, and shape. Its `continuation` subtest prints the final logits and
+`Session.Snapshot` SHA-256 digests for two 512-row calls, which is how a
+recurrence change is compared with a frozen build;
+`YUUKA_TEST_MOE_FORCE_TILED=1` holds the attention arithmetic on the tiled
+kernel for that comparison.
 
 `build/yuuka_gemv_decode_sweep --recurrent` is the RECURRENT cell of the decode
 matvec table: it builds one recurrent layer from the five separate operators and
