@@ -620,7 +620,11 @@ fixture on the CPU and HIP paths and a scripted partial-accept speculative
 rollback test. Native coverage includes the grouped MoE kernels for F32 and
 Q4_K, the selected and grouped pipelines for IQ2_XXS/IQ2_S/IQ3_S expert
 matrices, the Q8_1 int8 expert pipeline (compared against a host computation
-over the dequantized Q8_1 activations), and the shared-expert accumulation. The
+over the dequantized Q8_1 activations), the int8 WMMA expert pipeline for Q4_K
+and Q6_K experts at assignment tiles 16, 32, 64, and 128 with partially filled
+buckets (`hip_moe_mmq_correctness`, projections compared against a host
+computation over the dequantized weights and the same Q8_1 values), and the
+shared-expert accumulation. The
 real-model HIP tests use an F32 KV pool so the expert arithmetic is compared
 without KV storage rounding.
 

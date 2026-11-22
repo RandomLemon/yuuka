@@ -45,7 +45,10 @@ The repository contains an end-to-end single-node implementation:
 - HIP C ABI, plan executor, and kernels for the full `qwen35` and `qwen35moe`
   decode and chunked prefill graphs. MoE prefill runs the grouped expert
   kernels, which have an int8 `dp4a` form over a Q8_1 activation tile for the
-  IQ2_XXS/IQ2_S/IQ3_S experts and an FP32 form for every other dtype and shape;
+  IQ2_XXS/IQ2_S/IQ3_S experts, an FP32 form for every other dtype and shape,
+  and an opt-in int8 WMMA (`moe_gate_up_mmq` / `moe_down_mmq`) form for the
+  K-quant expert dtypes whose assignment-tile table is still a derivation
+  rather than a measurement, so `Options.MoEMMQ` gates it;
   MoE decode runs the selected-expert kernels.
 - rocWMMA/rocBLAS prefill GEMM, an int8 MMQ prefill GEMM for K-quant weights, a
   streaming prefill LM head over a row block of up to 16 rows, causal GQA Flash

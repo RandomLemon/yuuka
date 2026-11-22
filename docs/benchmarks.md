@@ -639,6 +639,38 @@ for gate/up, 0.401-8.838 for down, and 1.023-21.607 ms in total. The route
 kernel now costs 20-40x less and no longer appears in the total; the expert
 columns carry the whole time.
 
+The same harness selects the int8 WMMA expert route with `--route mmq
+--tile-j 16|32|64|128`, which adds the Q8_1 activation pass and runs the expert
+projections through `moe_gate_up_mmq` and `moe_down_mmq`. Measured 2026-11-22 on
+the same shape and protocol as the table above, three runs per cell and the
+median reported (the stage columns are one profiled submission after three
+warmups; the total column is the mean of twenty timed submissions):
+
+| Rows | Route | Gate/up ms | Down ms | Total ms | Tokens/s |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 16 | FP32 grouped | 5.356 | 2.141 | 7.449 | 2148 |
+| 16 | MMQ, tile 16 | 1.787 | 0.912 | 2.832 | 5649 |
+| 16 | MMQ, tile 32 | 1.562 | 0.885 | 2.542 | 6291 |
+| 32 | FP32 grouped | 7.399 | 2.903 | 10.326 | 3097 |
+| 32 | MMQ, tile 16 | 2.360 | 1.194 | 3.652 | 8763 |
+| 32 | MMQ, tile 32 | 2.021 | 1.135 | 3.229 | 9910 |
+| 64 | FP32 grouped | 12.296 | 4.890 | 17.218 | 3715 |
+| 64 | MMQ, tile 16 | 2.941 | 1.457 | 4.481 | 14284 |
+| 64 | MMQ, tile 32 | 2.515 | 1.428 | 3.993 | 16027 |
+| 128 | FP32 grouped | 19.711 | 8.203 | 28.035 | 4557 |
+| 128 | MMQ, tile 16 | 3.008 | 1.511 | 4.681 | 27343 |
+| 128 | MMQ, tile 32 | 2.539 | 1.440 | 4.170 | 30699 |
+
+The WMMA route is 2.6-6.9x faster on the two expert stages at this shape, and it
+stops growing with the assignment count the way the FP32 route does: gate/up
+goes from 1.56 to 2.54 ms while the FP32 route goes from 5.36 to 19.71 ms. The
+widest tiles lose on this shape because a bucket averages `128*8/128 = 8`
+assignments, so a tile of 64 or 128 leaves most columns padded (tile 128:
+4.816 / 6.131 / 7.588 / 7.944 ms total). The assignment tile is therefore a
+dispatch decision, not a constant; the table above is synthetic, and the tile
+table for the target model belongs with its own record in
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md).
+
 These are kernel-pipeline numbers for a synthetic shape. End-to-end
 `qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 128, 512, and 2048
 prefill tokens and 128 decode tokens, next to llama.cpp on the same protocol,

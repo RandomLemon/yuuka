@@ -134,6 +134,7 @@ hard-coded from another GPU.
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
 | `moe_route` / `moe_gate_up_grouped` / `moe_down_grouped` | Sparse MoE prefill | Top-k routing, per-expert assignment bins, packed expert reads |
 | `moe_gate_up_q8` / `moe_down_q8` | Sparse MoE prefill, IQ experts | Q8_1 activation tile, int8 `dp4a`, sixteen-assignment tile |
+| `moe_gate_up_mmq` / `moe_down_mmq` | Sparse MoE prefill, K-quant experts | Q8_1 activation tile, int8 WMMA, 16-128 assignment tile, gather/scatter through the routed bucket |
 | `moe_gate_up_selected` / `moe_down_selected` / `moe_shared_add` | Sparse MoE decode | One grid per routing slot, no binning, sigmoid-gated shared expert |
 | `sampling` | Output | GPU sampling or a low-cost host path |
 
@@ -1099,10 +1100,51 @@ The int8 product is exact, so the only difference from the FP32 route is where
 the scales are applied. `tests/hip/iq_moe_test.cpp` runs the full Q8_1 pipeline
 and requires it to match a host computation over the same decoded weights and the
 dequantized Q8_1 activations to 2e-2; the measured difference is 1.5e-6, and the
-two routes select the same experts. Shorter chunks, other widths, and non-IQ
-experts keep the FP32 grouped kernels, which is also what serves the cropped
-one-row FFN of the last layer. The route is a plan-build-time decision
-(`addMoEPrefillFFN`), not a runtime option.
+two routes select the same experts. Chunks below sixteen rows, widths that do
+not fill the tiles, and non-IQ experts keep the FP32 grouped kernels, which is
+also what serves the cropped one-row FFN of the last layer; K-quant experts can
+take the opt-in int8 WMMA route described next. The route is a plan-build-time
+decision (`addMoEPrefillFFN`), not a runtime option.
+
+**The int8 WMMA expert route.** The Q8_1 route above still dots one assignment
+at a time with `v_dot4`, so its cost grows with the assignment count even when
+the weight bytes do not: the expert set is 9.06 GB at 128 and at 512 rows, and
+the measured stage grows from 99.4 to 363.2 ms (91 to 24.9 GB/s of unique
+weight bytes) while the reference implementation stays at the weight-read
+regime. `moe_gate_up_mmq` and `moe_down_mmq` keep the same Q8_1 activation tile
+and the same routed buckets, and replace the per-assignment dot with the int8
+WMMA of the dense MMQ GEMM, staged through
+`kernels/hip/gemm/mmq_tile.cuh`:
+
+- One block owns one expert and one tile of output channels, and walks that
+  expert's bucket in tiles of `n[5]` assignments (16, 32, 64, or 128), so one
+  decoded weight tile serves the whole assignment tile. The bucket counts stay
+  on the device, so the launch never synchronizes and stays graph capturable.
+- The tile is 128 output channels at `n[5] <= 64` (one warp per 16-row fragment
+  group, all eight warps busy) and 64 channels at `n[5] = 128` (two token halves
+  of 64, four accumulator fragments per warp). The K step is 128 values, or 64
+  at the widest assignment tile, which keeps the staged operands near the 30 KiB
+  budget that holds two blocks per CU.
+- The weight staging, the per-16/per-32 scale slots, and the Q4_K/Q5_K minimum
+  term are the dense GEMM's, so the digits are the same ones the dequantized
+  reference path sees. The activation tile is gathered through the routing
+  arrays: the gate/up projections read the activation row of the assignment, the
+  down projection reads the SwiGLU slot of the assignment, and both scatter the
+  result to that slot row.
+- The assignment tile width is chosen at plan build time from the average bucket
+  of one expert, `ceil(rows*used/experts)`, so one weight pass covers a bucket at
+  every measured chunk size.
+
+`tests/hip/moe_mmq_test.cpp` pins the route for Q4_K and Q6_K experts, whose
+scale layouts differ (per 32 values with a row minimum, and per 16 values
+without), at assignment tiles 16, 32, 64, and 128, and at bucket sizes that do
+not fill the tile. The projections are compared against a host computation over
+the dequantized weights and the same Q8_1 values (measured 1e-6 relative), and
+the down projection over the device SwiGLU tile. The route is a plan-build-time
+decision (`SelectMoEPrefillPath`), gated by `Options.MoEMMQ`: it serves the
+K-quant expert dtypes, the IQ codebooks keep the dp4a route until they have a
+decoder in this tile layout, and enabling it by default waits for the recorded
+tile sweep (`docs/benchmarks.md`, grouped MoE pipeline).
 
 The grouped grid is the prefill form. At one token it would launch
 `experts * ffn` blocks, of which only `used * ffn` correspond to selected
