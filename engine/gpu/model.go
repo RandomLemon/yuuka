@@ -100,6 +100,8 @@ type prefillActivations struct {
 	moeGate          *hip.Buffer // expert gate projections [rows*used,ffn]
 	moeUp            *hip.Buffer // expert up projections [rows*used,ffn]
 	moeOut           *hip.Buffer // weighted expert output [rows*used,hidden]
+	moeQ8            *hip.Buffer // int8 silu(gate)*up per slot [rows*used,ffn]
+	moeDS            *hip.Buffer // float2 Q8_1 scales for moeQ8
 }
 
 // Options configures a shared GPU model and its KV pool.
@@ -633,6 +635,14 @@ func (m *Model) configurePrefill(rows int) error {
 				dst   **hip.Buffer
 				bytes uint64
 			}{&p.moeOut, rowSlots * hiddenWidth * 4},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeQ8, rowSlots * expertWidth},
+			struct {
+				dst   **hip.Buffer
+				bytes uint64
+			}{&p.moeDS, rowSlots * (expertWidth / 32) * 8},
 		)
 	}
 	p.attentionBlas = nil

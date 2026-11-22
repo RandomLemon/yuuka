@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 10
+#define YUUKA_HIP_ABI_VERSION 11
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -147,7 +147,9 @@ typedef enum yuuka_op_code {
     YUUKA_OP_SILU_MUL_QUANT_Q8_1 = 43,
     YUUKA_OP_MOE_GATE_UP_SELECTED = 44,
     YUUKA_OP_MOE_DOWN_SELECTED = 45,
-    YUUKA_OP_MOE_SHARED_ADD = 46
+    YUUKA_OP_MOE_SHARED_ADD = 46,
+    YUUKA_OP_MOE_GATE_UP_Q8 = 47,
+    YUUKA_OP_MOE_DOWN_Q8 = 48
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -483,6 +485,22 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                   weight [hidden] F32, buf3 norm [rows,hidden];
  *                   n={hidden,rows}. Computes s = sigmoid(dot(gate, norm[row]))
  *                   and x[row,i] += s * src[row,i].
+ *
+ * Q8_1 expert family. These are the grouped kernels over an int8 activation
+ * tile: QUANT_Q8_1 produces norm_qs/norm_ds from the normalized rows, and
+ * SILU_MUL_QUANT_Q8_1 produces act_qs/act_ds from the gate and up outputs. Only
+ * IQ2_XXS, IQ2_S, and IQ3_S weights are accepted, hidden and ffn must be
+ * multiples of 256, and the K width of each op must be a multiple of 256. The
+ * grouped assignment inputs are the MOE_ROUTE outputs.
+ *   MOE_GATE_UP_Q8: buf0 norm_qs int8[rows,hidden], buf1 norm_ds
+ *                   float2[rows,hidden/32], buf2 gate_exps, buf3 up_exps,
+ *                   buf4 counts, buf5 assign_rows, buf6 assign_slots,
+ *                   buf7 gate_out [rows*used,ffn], buf8 up_out [rows*used,ffn];
+ *                   n={hidden,ffn,rows,experts,used}; u[0]=dtype
+ *   MOE_DOWN_Q8: buf0 act_qs int8[rows*used,ffn], buf1 act_ds
+ *                float2[rows*used,ffn/32], buf2 down_exps, buf3 counts,
+ *                buf4 assign_rows, buf5 assign_slots, buf6 out [rows*used,hidden];
+ *                n={ffn,hidden,rows,experts,used}; u[0]=dtype
  *
  * Graph capture executes a plan with device-resident dynamic parameters.
  * Position-dependent ops must have a dynamic-parameter kernel; plans containing

@@ -393,6 +393,255 @@ __global__ void moe_down_grouped_kernel(
     }
 }
 
+// Q8_1 expert route.
+//
+// The FP32 grouped kernels above decode eight weight values into eight FP32
+// values and multiply them against an FP32 activation, once per assignment in
+// the tile. This route instead quantizes the activation tile to Q8_1 and dots
+// the packed int8 digits of eight weights against eight activation digits with
+// two dp4a instructions, so one assignment costs two instructions per eight
+// values instead of eight converts and eight FMAs, and the activation is read
+// from shared memory as one eight-byte word per assignment.
+//
+// The tile, the K step, and the staging were measured on gfx1151 at the MoE
+// prefill shapes (docs/kernels.md): sixteen assignments per tile halve the
+// weight decode against the FP32 tile of eight, and a 256-value K step stages
+// sixteen assignment rows of int8 activations in 4.2 KiB, which keeps the
+// block resident. A row is padded by eight bytes so neighbouring rows do not
+// land on the same LDS banks.
+constexpr int kQ8Tile = 16;
+constexpr int kQ8StepK = 256;
+constexpr int kQ8XStride = kQ8StepK + 8;
+constexpr int kQ8RowsPerBlock = 8;
+constexpr int kQ8Block32 = kQ8StepK / 32;
+
+static_assert(kQ8Tile * 16 == kThreads, "one thread stages one 16-byte row chunk");
+static_assert(kQ8Tile * kQ8Block32 <= kThreads, "the scale tile fits one pass");
+static_assert(kQ8RowsPerBlock == kWarps, "one warp owns one output row");
+
+// dot4_i8 is the signed int8 dot product of the four digits packed in each
+// operand; both digits of an IQ row and of a Q8_1 activation are signed, so both
+// negation flags are set (see kernels/hip/gemv/gemv_i8.hip).
+__device__ __forceinline__ int dot4_i8(int32_t a, int32_t b) {
+    return __builtin_amdgcn_sudot4(true, a, true, b, 0, false);
+}
+
+// moe_dot8 decodes the eight values that start at base of one packed IQ expert
+// row into packed int8 digits and returns the scale of the span. It is
+// instantiated only for the IQ codebooks, so it takes no runtime dtype.
+template <MoeCodebook kCodebook>
+__device__ __forceinline__ void moe_dot8(const uint8_t * row, int64_t base,
+                                         int32_t (&w)[2], float & scale) {
+    if constexpr (kCodebook == MoeCodebook::IQ2XXS) {
+        iq2xxs_dot8(row + (base / 256) * 66, static_cast<int>(base % 256), w, scale);
+    } else if constexpr (kCodebook == MoeCodebook::IQ2S) {
+        iq2s_dot8(row + (base / 256) * 82, static_cast<int>(base % 256), w, scale);
+    } else {
+        static_assert(kCodebook == MoeCodebook::IQ3S,
+                      "the Q8_1 expert route serves the IQ codebooks only");
+        iq3s_dot8(row + (base / 256) * 110, static_cast<int>(base % 256), w, scale);
+    }
+}
+
+// moe_gate_up_grouped_q8_kernel computes one expert gate and up output row for
+// every assignment binned to that expert, from Q8_1 activations. One warp owns
+// one output row, decodes its gate and up weight spans once per 256-value K
+// step, and reuses them across a tile of sixteen assignments read from shared
+// memory.
+template <MoeCodebook kCodebook>
+__global__ void moe_gate_up_grouped_q8_kernel(
+    const int8_t * norm_qs, const float2 * norm_ds, const uint8_t * gate_exps,
+    const uint8_t * up_exps, const int32_t * counts, const int32_t * assign_rows,
+    const int32_t * assign_slots, float * gate_out, float * up_out, int rows,
+    int used, int hidden, int ffn, uint64_t hidden_row_bytes) {
+    __shared__ __align__(16) int8_t xs[kQ8Tile][kQ8XStride];
+    __shared__ float2 xds[kQ8Tile][kQ8Block32];
+    const int lane = threadIdx.x & 31;
+    const int expert = blockIdx.x;
+    const int out_row = blockIdx.y * kQ8RowsPerBlock + (threadIdx.x >> 5);
+    // A warp past the output width still stages and synchronizes, so the block
+    // barriers stay uniform; only the decode, the accumulation, and the store
+    // are skipped. The planned shapes make every warp active.
+    const bool active = out_row < ffn;
+    const int weight_row = active ? out_row : 0;
+    const int64_t bucket = static_cast<int64_t>(expert) * rows * used;
+    const int count = counts[expert];
+    const uint8_t * gate_row =
+        gate_exps + static_cast<int64_t>(expert * ffn + weight_row) * hidden_row_bytes;
+    const uint8_t * up_row =
+        up_exps + static_cast<int64_t>(expert * ffn + weight_row) * hidden_row_bytes;
+    for (int a0 = 0; a0 < count; a0 += kQ8Tile) {
+        const int take = count - a0 < kQ8Tile ? count - a0 : kQ8Tile;
+        float gate_acc[kQ8Tile];
+        float up_acc[kQ8Tile];
+        #pragma unroll
+        for (int j = 0; j < kQ8Tile; ++j) {
+            gate_acc[j] = 0.0f;
+            up_acc[j] = 0.0f;
+        }
+        for (int base = 0; base < hidden; base += kQ8StepK) {
+            // Stage the assignment rows' int8 digits and block scales before
+            // any warp decodes, so the K step is one LDS read per assignment.
+            {
+                const int j = threadIdx.x >> 4;
+                const int chunk = threadIdx.x & 15;
+                int4 value = make_int4(0, 0, 0, 0);
+                if (j < take) {
+                    const int64_t src =
+                        static_cast<int64_t>(assign_rows[bucket + a0 + j]) * hidden;
+                    value = *reinterpret_cast<const int4 *>(
+                        norm_qs + src + base + chunk * 16);
+                }
+                // A row is padded by eight bytes, so the staged row base is
+                // eight-byte aligned and the store is two eight-byte writes.
+                int2 * dst = reinterpret_cast<int2 *>(xs[j] + chunk * 16);
+                dst[0] = make_int2(value.x, value.y);
+                dst[1] = make_int2(value.z, value.w);
+            }
+            if (threadIdx.x < kQ8Tile * kQ8Block32) {
+                const int j = threadIdx.x >> 3;
+                const int b = threadIdx.x & 7;
+                float2 value = make_float2(0.0f, 0.0f);
+                if (j < take) {
+                    const int64_t src =
+                        static_cast<int64_t>(assign_rows[bucket + a0 + j]) * (hidden / 32);
+                    value = norm_ds[src + base / 32 + b];
+                }
+                xds[j][b] = value;
+            }
+            __syncthreads();
+            if (active) {
+                const int idx = base + lane * 8;
+                int32_t gate_w[2];
+                int32_t up_w[2];
+                float gate_scale = 0.0f;
+                float up_scale = 0.0f;
+                moe_dot8<kCodebook>(gate_row, idx, gate_w, gate_scale);
+                moe_dot8<kCodebook>(up_row, idx, up_w, up_scale);
+                #pragma unroll
+                for (int j = 0; j < kQ8Tile; ++j) {
+                    if (j >= take) {
+                        continue;
+                    }
+                    const int2 xw = *reinterpret_cast<const int2 *>(xs[j] + lane * 8);
+                    const float x_scale = xds[j][lane / 4].x;
+                    const int gate_sum =
+                        dot4_i8(gate_w[0], xw.x) + dot4_i8(gate_w[1], xw.y);
+                    const int up_sum =
+                        dot4_i8(up_w[0], xw.x) + dot4_i8(up_w[1], xw.y);
+                    gate_acc[j] += static_cast<float>(gate_sum) * (gate_scale * x_scale);
+                    up_acc[j] += static_cast<float>(up_sum) * (up_scale * x_scale);
+                }
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int j = 0; j < kQ8Tile; ++j) {
+            if (j >= take) {
+                continue;
+            }
+            const float g = warp_reduce_sum(gate_acc[j]);
+            const float u = warp_reduce_sum(up_acc[j]);
+            if (active && lane == 0) {
+                const int slot = assign_rows[bucket + a0 + j] * used +
+                                 assign_slots[bucket + a0 + j];
+                const int64_t dst = static_cast<int64_t>(slot) * ffn + out_row;
+                gate_out[dst] = g;
+                up_out[dst] = u;
+            }
+        }
+    }
+}
+
+// moe_down_grouped_q8_kernel computes one expert down-projection row for every
+// assignment binned to that expert, from the Q8_1 SwiGLU activations, with the
+// same output-row and assignment tile as the gate/up form.
+template <MoeCodebook kCodebook>
+__global__ void moe_down_grouped_q8_kernel(
+    const int8_t * act_qs, const float2 * act_ds, const uint8_t * down_exps,
+    const int32_t * counts, const int32_t * assign_rows,
+    const int32_t * assign_slots, float * out, int rows, int used, int hidden,
+    int ffn, uint64_t ffn_row_bytes) {
+    __shared__ __align__(16) int8_t xs[kQ8Tile][kQ8XStride];
+    __shared__ float2 xds[kQ8Tile][kQ8Block32];
+    const int lane = threadIdx.x & 31;
+    const int expert = blockIdx.x;
+    const int out_row = blockIdx.y * kQ8RowsPerBlock + (threadIdx.x >> 5);
+    const bool active = out_row < hidden;
+    const int weight_row = active ? out_row : 0;
+    const int64_t bucket = static_cast<int64_t>(expert) * rows * used;
+    const int count = counts[expert];
+    const uint8_t * weight = down_exps +
+        static_cast<int64_t>(expert * hidden + weight_row) * ffn_row_bytes;
+    for (int a0 = 0; a0 < count; a0 += kQ8Tile) {
+        const int take = count - a0 < kQ8Tile ? count - a0 : kQ8Tile;
+        float acc[kQ8Tile];
+        #pragma unroll
+        for (int j = 0; j < kQ8Tile; ++j) {
+            acc[j] = 0.0f;
+        }
+        for (int base = 0; base < ffn; base += kQ8StepK) {
+            {
+                const int j = threadIdx.x >> 4;
+                const int chunk = threadIdx.x & 15;
+                int4 value = make_int4(0, 0, 0, 0);
+                if (j < take) {
+                    const int slot = assign_rows[bucket + a0 + j] * used +
+                                     assign_slots[bucket + a0 + j];
+                    value = *reinterpret_cast<const int4 *>(
+                        act_qs + static_cast<int64_t>(slot) * ffn + base + chunk * 16);
+                }
+                // A row is padded by eight bytes, so the staged row base is
+                // eight-byte aligned and the store is two eight-byte writes.
+                int2 * dst = reinterpret_cast<int2 *>(xs[j] + chunk * 16);
+                dst[0] = make_int2(value.x, value.y);
+                dst[1] = make_int2(value.z, value.w);
+            }
+            if (threadIdx.x < kQ8Tile * kQ8Block32) {
+                const int j = threadIdx.x >> 3;
+                const int b = threadIdx.x & 7;
+                float2 value = make_float2(0.0f, 0.0f);
+                if (j < take) {
+                    const int slot = assign_rows[bucket + a0 + j] * used +
+                                     assign_slots[bucket + a0 + j];
+                    value = act_ds[static_cast<int64_t>(slot) * (ffn / 32) + base / 32 + b];
+                }
+                xds[j][b] = value;
+            }
+            __syncthreads();
+            if (active) {
+                const int idx = base + lane * 8;
+                int32_t w[2];
+                float scale = 0.0f;
+                moe_dot8<kCodebook>(weight, idx, w, scale);
+                #pragma unroll
+                for (int j = 0; j < kQ8Tile; ++j) {
+                    if (j >= take) {
+                        continue;
+                    }
+                    const int2 xw = *reinterpret_cast<const int2 *>(xs[j] + lane * 8);
+                    const float x_scale = xds[j][lane / 4].x;
+                    const int sum = dot4_i8(w[0], xw.x) + dot4_i8(w[1], xw.y);
+                    acc[j] += static_cast<float>(sum) * (scale * x_scale);
+                }
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int j = 0; j < kQ8Tile; ++j) {
+            if (j >= take) {
+                continue;
+            }
+            const float sum = warp_reduce_sum(acc[j]);
+            if (active && lane == 0) {
+                const int slot = assign_rows[bucket + a0 + j] * used +
+                                 assign_slots[bucket + a0 + j];
+                out[static_cast<int64_t>(slot) * hidden + out_row] = sum;
+            }
+        }
+    }
+}
+
 // moe_reduce_add_kernel combines per-slot expert outputs with their routing
 // weights and accumulates into the residual stream.
 __global__ void moe_reduce_add_kernel(float * x, const float * expert_out,
@@ -684,6 +933,76 @@ void launch_moe_down_grouped(const float * act, const void * down_exps,
         break;
     }
     #undef YUUKA_LAUNCH_MOE_DOWN_GROUPED
+}
+
+void launch_moe_gate_up_grouped_q8(const int8_t * norm_qs,
+                                   const float2 * norm_ds, const void * gate_exps,
+                                   const void * up_exps, const int32_t * counts,
+                                   const int32_t * assign_rows,
+                                   const int32_t * assign_slots, float * gate_out,
+                                   float * up_out, int rows, int experts, int used,
+                                   int hidden, int ffn, uint64_t hidden_row_bytes,
+                                   uint32_t dtype, hipStream_t stream) {
+    if (rows <= 0 || experts <= 0 || used <= 0 || hidden <= 0 || ffn <= 0 ||
+        hidden % kQ8StepK != 0 || ffn % kQ8StepK != 0) {
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(experts),
+                    static_cast<unsigned>((ffn + kQ8RowsPerBlock - 1) / kQ8RowsPerBlock));
+    const auto * gate = static_cast<const uint8_t *>(gate_exps);
+    const auto * up = static_cast<const uint8_t *>(up_exps);
+    #define YUUKA_LAUNCH_MOE_GATE_UP_GROUPED_Q8(CODEBOOK)                              \
+        moe_gate_up_grouped_q8_kernel<CODEBOOK><<<grid, kThreads, 0, stream>>>(        \
+            norm_qs, norm_ds, gate, up, counts, assign_rows, assign_slots, gate_out,   \
+            up_out, rows, used, hidden, ffn, hidden_row_bytes)
+    switch (moe_codebook(dtype)) {
+    case MoeCodebook::IQ2XXS:
+        YUUKA_LAUNCH_MOE_GATE_UP_GROUPED_Q8(MoeCodebook::IQ2XXS);
+        break;
+    case MoeCodebook::IQ2S:
+        YUUKA_LAUNCH_MOE_GATE_UP_GROUPED_Q8(MoeCodebook::IQ2S);
+        break;
+    case MoeCodebook::IQ3S:
+        YUUKA_LAUNCH_MOE_GATE_UP_GROUPED_Q8(MoeCodebook::IQ3S);
+        break;
+    default:
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_GATE_UP_GROUPED_Q8
+}
+
+void launch_moe_down_grouped_q8(const int8_t * act_qs, const float2 * act_ds,
+                                const void * down_exps, const int32_t * counts,
+                                const int32_t * assign_rows,
+                                const int32_t * assign_slots, float * out, int rows,
+                                int experts, int used, int hidden, int ffn,
+                                uint64_t ffn_row_bytes, uint32_t dtype,
+                                hipStream_t stream) {
+    if (rows <= 0 || experts <= 0 || used <= 0 || hidden <= 0 || ffn <= 0 ||
+        hidden % kQ8StepK != 0 || ffn % kQ8StepK != 0) {
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>(experts),
+                    static_cast<unsigned>((hidden + kQ8RowsPerBlock - 1) / kQ8RowsPerBlock));
+    const auto * down = static_cast<const uint8_t *>(down_exps);
+    #define YUUKA_LAUNCH_MOE_DOWN_GROUPED_Q8(CODEBOOK)                                 \
+        moe_down_grouped_q8_kernel<CODEBOOK><<<grid, kThreads, 0, stream>>>(           \
+            act_qs, act_ds, down, counts, assign_rows, assign_slots, out, rows,        \
+            used, hidden, ffn, ffn_row_bytes)
+    switch (moe_codebook(dtype)) {
+    case MoeCodebook::IQ2XXS:
+        YUUKA_LAUNCH_MOE_DOWN_GROUPED_Q8(MoeCodebook::IQ2XXS);
+        break;
+    case MoeCodebook::IQ2S:
+        YUUKA_LAUNCH_MOE_DOWN_GROUPED_Q8(MoeCodebook::IQ2S);
+        break;
+    case MoeCodebook::IQ3S:
+        YUUKA_LAUNCH_MOE_DOWN_GROUPED_Q8(MoeCodebook::IQ3S);
+        break;
+    default:
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_DOWN_GROUPED_Q8
 }
 
 void launch_moe_reduce_add(float * x, const float * expert_out,

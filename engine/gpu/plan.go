@@ -1077,6 +1077,17 @@ func (m *Model) addPrefillSwiGLU(plan *hip.Plan, gate, up, down weight, norm *hi
 	return m.prefillMatmulPath(plan, down, p.ffnGate, 0, p.tmp, 0, ffn, hidden, rows, downPath)
 }
 
+// isIQExpertDType reports whether an expert matrix uses one of the IQ codebooks
+// whose 256-value blocks the int8 expert route decodes to int8 digits.
+func isIQExpertDType(dtype tensor.DType) bool {
+	switch dtype {
+	case tensor.IQ2XXS, tensor.IQ2S, tensor.IQ3S:
+		return true
+	default:
+		return false
+	}
+}
+
 // addMoEPrefillFFN builds one MoE sub-layer for a prompt chunk. The routed
 // experts use the grouped kernels, which schedule one grid over all experts and
 // let each expert read its binned assignment range; the shared expert reuses the
@@ -1150,18 +1161,45 @@ func (m *Model) addMoEPrefillFFN(plan *hip.Plan, prefix string, postNorm weight,
 		p.moeAssignRows, p.moeAssignSlots, p.moeAssignWeights, rows, experts, used); err != nil {
 		return err
 	}
-	if err := plan.AddMoEGateUpGrouped(p.norm, gate.buf, up.buf, p.moeCounts,
-		p.moeAssignRows, p.moeAssignSlots, p.moeGate, p.moeUp, hidden, ffn, rows,
-		experts, used, gate.dtype); err != nil {
-		return err
-	}
-	if err := plan.AddSiluMul(p.moeGate, p.moeUp, p.moeGate, rows*used*ffn); err != nil {
-		return err
-	}
-	if err := plan.AddMoEDownGrouped(p.moeGate, down.buf, p.moeCounts,
-		p.moeAssignRows, p.moeAssignSlots, p.moeOut, ffn, hidden, rows, experts,
-		used, down.dtype); err != nil {
-		return err
+	// The int8 route needs a whole 256-value K step and a whole sixteen-
+	// assignment tile. It also needs both expert matrices in an IQ codebook,
+	// which is what the dp4a decoders serve; every other shape or dtype keeps
+	// the FP32 grouped path.
+	q8 := rows >= 16 && hidden%256 == 0 && ffn%256 == 0 &&
+		gate.dtype == up.dtype && isIQExpertDType(gate.dtype) &&
+		isIQExpertDType(down.dtype)
+	if q8 {
+		if err := plan.AddQuantizeQ8_1At(p.norm, 0, p.xQ8, p.xDS, hidden, rows); err != nil {
+			return err
+		}
+		if err := plan.AddMoEGateUpQ8(p.xQ8, p.xDS, gate.buf, up.buf, p.moeCounts,
+			p.moeAssignRows, p.moeAssignSlots, p.moeGate, p.moeUp, hidden, ffn,
+			rows, experts, used, gate.dtype); err != nil {
+			return err
+		}
+		if err := plan.AddSiluMulQuantQ8_1At(p.moeGate, 0, p.moeUp, 0, p.moeQ8, 0,
+			p.moeDS, 0, ffn, rows*used); err != nil {
+			return err
+		}
+		if err := plan.AddMoEDownQ8(p.moeQ8, p.moeDS, down.buf, p.moeCounts,
+			p.moeAssignRows, p.moeAssignSlots, p.moeOut, ffn, hidden, rows,
+			experts, used, down.dtype); err != nil {
+			return err
+		}
+	} else {
+		if err := plan.AddMoEGateUpGrouped(p.norm, gate.buf, up.buf, p.moeCounts,
+			p.moeAssignRows, p.moeAssignSlots, p.moeGate, p.moeUp, hidden, ffn, rows,
+			experts, used, gate.dtype); err != nil {
+			return err
+		}
+		if err := plan.AddSiluMul(p.moeGate, p.moeUp, p.moeGate, rows*used*ffn); err != nil {
+			return err
+		}
+		if err := plan.AddMoEDownGrouped(p.moeGate, down.buf, p.moeCounts,
+			p.moeAssignRows, p.moeAssignSlots, p.moeOut, ffn, hidden, rows, experts,
+			used, down.dtype); err != nil {
+			return err
+		}
 	}
 	if err := plan.AddMoEReduceAdd(p.x, p.moeOut, p.moeWeights, hidden, rows, used); err != nil {
 		return err

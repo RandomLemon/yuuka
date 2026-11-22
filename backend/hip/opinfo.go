@@ -56,6 +56,8 @@ const (
 	OpMoEGateUpSelected     uint32 = uint32(C.YUUKA_OP_MOE_GATE_UP_SELECTED)
 	OpMoEDownSelected       uint32 = uint32(C.YUUKA_OP_MOE_DOWN_SELECTED)
 	OpMoESharedAdd          uint32 = uint32(C.YUUKA_OP_MOE_SHARED_ADD)
+	OpMoEGateUpQ8           uint32 = uint32(C.YUUKA_OP_MOE_GATE_UP_Q8)
+	OpMoEDownQ8             uint32 = uint32(C.YUUKA_OP_MOE_DOWN_Q8)
 )
 
 // opFlagTail mirrors YUUKA_OP_FLAG_TAIL.
@@ -64,7 +66,7 @@ const opFlagTail = 0x1
 // MaxOpCode is the highest op code the bound ABI declares. The shadow covers
 // every code in 1..MaxOpCode, and opinfo_test.go fails when one of them has no
 // name or role.
-const MaxOpCode = OpMoESharedAdd
+const MaxOpCode = OpMoEDownQ8
 
 // OpRole names what a plan operation holds in one of its buffer slots. The role
 // is a property of the ABI opcode, so it is recorded once per code in opRoles
@@ -222,6 +224,10 @@ func OpName(code uint32) string {
 		return "moe_down_selected"
 	case OpMoESharedAdd:
 		return "moe_shared_add"
+	case OpMoEGateUpQ8:
+		return "moe_gate_up_q8"
+	case OpMoEDownQ8:
+		return "moe_down_q8"
 	default:
 		return "unknown"
 	}
@@ -310,6 +316,12 @@ func opRoles(code uint32) [3]OpRole {
 	case OpMoESharedAdd:
 		// x, shared-expert output, gate vector.
 		return [3]OpRole{RoleAccumulator, RoleActivation, RoleWeight}
+	case OpMoEGateUpQ8:
+		// int8 norm tile, its block scales, gate weights; up weights follow.
+		return [3]OpRole{RoleActivation, RoleScratch, RoleWeight}
+	case OpMoEDownQ8:
+		// int8 SwiGLU tile, its block scales, down weights.
+		return [3]OpRole{RoleActivation, RoleScratch, RoleWeight}
 	case OpGemmSwiglu:
 		// gate weights, up weights, x, out.
 		return [3]OpRole{RoleWeight, RoleWeight, RoleActivation}

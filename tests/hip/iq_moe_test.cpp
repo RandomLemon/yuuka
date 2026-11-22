@@ -156,6 +156,29 @@ float dot(const float * a, const float * b, int n) {
     return sum;
 }
 
+// quantize_q8_1_host reproduces the device Q8_1 quantizer: for each 32-value
+// block the scale is amax/127 and each digit is the clamped, rounded quotient,
+// so the value the expert dots see is digit * scale. The block sum the kernel
+// also stores is only read by the K-quant minimum term, which the IQ codebooks
+// do not use.
+std::vector<float> quantize_q8_1_host(const std::vector<float> & x) {
+    std::vector<float> out(x.size());
+    for (size_t base = 0; base + 32 <= x.size(); base += 32) {
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            amax = std::fmax(amax, std::fabs(x[base + i]));
+        }
+        const float scale = amax / 127.0f;
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const float digit =
+                std::fmax(-127.0f, std::fmin(127.0f, std::rint(x[base + i] * inv)));
+            out[base + i] = digit * scale;
+        }
+    }
+    return out;
+}
+
 struct moe_buffers {
     yuuka_buffer * norm = nullptr;
     yuuka_buffer * ids = nullptr;
@@ -173,6 +196,12 @@ struct moe_buffers {
     yuuka_buffer * expert_out = nullptr;
     yuuka_buffer * x = nullptr;
     yuuka_buffer * logits = nullptr;
+    // Q8_1 route: the normalized tile, and the SwiGLU tile the down projection
+    // reads.
+    yuuka_buffer * norm_q8 = nullptr;
+    yuuka_buffer * norm_ds = nullptr;
+    yuuka_buffer * act_q8 = nullptr;
+    yuuka_buffer * act_ds = nullptr;
 };
 
 bool alloc_buffers(context & ctx, moe_buffers & b, int rows, int experts, int used,
@@ -197,19 +226,24 @@ bool alloc_buffers(context & ctx, moe_buffers & b, int rows, int experts, int us
     b.slot_act = upload(ctx, nullptr, slots * ffn * 4);
     b.expert_out = upload(ctx, nullptr, slots * hidden * 4);
     b.x = upload(ctx, nullptr, rows * hidden * 4);
+    b.norm_q8 = upload(ctx, nullptr, uint64_t(rows) * hidden);
+    b.norm_ds = upload(ctx, nullptr, uint64_t(rows) * (hidden / 32) * 8);
+    b.act_q8 = upload(ctx, nullptr, uint64_t(slots) * ffn);
+    b.act_ds = upload(ctx, nullptr, uint64_t(slots) * (ffn / 32) * 8);
     return b.norm != nullptr && b.logits != nullptr && b.ids != nullptr &&
            b.weights != nullptr && b.counts != nullptr && b.assign_rows != nullptr &&
            b.assign_slots != nullptr && b.assign_weights != nullptr &&
            b.gate != nullptr && b.up != nullptr && b.down != nullptr &&
            b.gate_out != nullptr && b.up_out != nullptr && b.slot_act != nullptr &&
-           b.expert_out != nullptr && b.x != nullptr;
+           b.expert_out != nullptr && b.x != nullptr && b.norm_q8 != nullptr &&
+           b.norm_ds != nullptr && b.act_q8 != nullptr && b.act_ds != nullptr;
 }
 
 void free_buffers(moe_buffers & b) {
     yuuka_buffer * all[] = {b.norm, b.ids, b.weights, b.counts, b.assign_rows,
                             b.assign_slots, b.assign_weights, b.gate, b.up, b.down,
                             b.gate_out, b.up_out, b.slot_act, b.expert_out, b.x,
-                            b.logits};
+                            b.logits, b.norm_q8, b.norm_ds, b.act_q8, b.act_ds};
     for (yuuka_buffer * buffer : all) {
         if (buffer != nullptr) yuuka_buffer_free(buffer);
     }
@@ -294,6 +328,71 @@ yuuka_status add_grouped(yuuka_plan * plan, moe_buffers & b, int hidden, int ffn
     return yuuka_plan_add(plan, &op);
 }
 
+// add_grouped_q8 is the Q8_1 form of add_grouped: the normalized tile is
+// quantized once, both expert projections run over the int8 digits, and the
+// SwiGLU product is quantized for the down projection.
+yuuka_status add_grouped_q8(yuuka_plan * plan, moe_buffers & b, int hidden, int ffn,
+                            int rows, int experts, int used, uint32_t gate_dtype,
+                            uint32_t down_dtype) {
+    yuuka_op op{};
+    op.code = YUUKA_OP_QUANT_Q8_1;
+    op.buf[0] = b.norm;
+    op.buf[1] = b.norm_q8;
+    op.buf[2] = b.norm_ds;
+    op.n[0] = hidden;
+    op.n[1] = rows;
+    yuuka_status status = yuuka_plan_add(plan, &op);
+    if (status != YUUKA_OK) return status;
+
+    op = yuuka_op{};
+    op.code = YUUKA_OP_MOE_GATE_UP_Q8;
+    op.buf[0] = b.norm_q8;
+    op.buf[1] = b.norm_ds;
+    op.buf[2] = b.gate;
+    op.buf[3] = b.up;
+    op.buf[4] = b.counts;
+    op.buf[5] = b.assign_rows;
+    op.buf[6] = b.assign_slots;
+    op.buf[7] = b.gate_out;
+    op.buf[8] = b.up_out;
+    op.n[0] = hidden;
+    op.n[1] = ffn;
+    op.n[2] = rows;
+    op.n[3] = experts;
+    op.n[4] = used;
+    op.u[0] = gate_dtype;
+    status = yuuka_plan_add(plan, &op);
+    if (status != YUUKA_OK) return status;
+
+    op = yuuka_op{};
+    op.code = YUUKA_OP_SILU_MUL_QUANT_Q8_1;
+    op.buf[0] = b.gate_out;
+    op.buf[1] = b.up_out;
+    op.buf[2] = b.act_q8;
+    op.buf[3] = b.act_ds;
+    op.n[0] = ffn;
+    op.n[1] = rows * used;
+    status = yuuka_plan_add(plan, &op);
+    if (status != YUUKA_OK) return status;
+
+    op = yuuka_op{};
+    op.code = YUUKA_OP_MOE_DOWN_Q8;
+    op.buf[0] = b.act_q8;
+    op.buf[1] = b.act_ds;
+    op.buf[2] = b.down;
+    op.buf[3] = b.counts;
+    op.buf[4] = b.assign_rows;
+    op.buf[5] = b.assign_slots;
+    op.buf[6] = b.expert_out;
+    op.n[0] = ffn;
+    op.n[1] = hidden;
+    op.n[2] = rows;
+    op.n[3] = experts;
+    op.n[4] = used;
+    op.u[0] = down_dtype;
+    return yuuka_plan_add(plan, &op);
+}
+
 yuuka_status add_selected(yuuka_plan * plan, moe_buffers & b, int hidden, int ffn,
                           int rows, int experts, int used, uint32_t gate_dtype,
                           uint32_t down_dtype) {
@@ -329,8 +428,9 @@ yuuka_status add_selected(yuuka_plan * plan, moe_buffers & b, int hidden, int ff
 }
 
 // run_pipeline executes one MoE plan over a zero residual row and returns the
-// result plus the routing the device selected.
-int run_pipeline(context & ctx, moe_buffers & b, bool selected, int hidden, int ffn,
+// result plus the routing the device selected. mode selects the grouped FP32
+// path (0), the selected FP32 path (1), or the grouped Q8_1 path (2).
+int run_pipeline(context & ctx, moe_buffers & b, int mode, int hidden, int ffn,
                  int rows, int experts, int used, uint32_t gate_dtype,
                  uint32_t down_dtype, std::vector<float> & out,
                  std::vector<int32_t> & ids, std::vector<float> & weights) {
@@ -338,10 +438,13 @@ int run_pipeline(context & ctx, moe_buffers & b, bool selected, int hidden, int 
     CHECK_STATUS(yuuka_plan_create(ctx.device, &plan));
     yuuka_status status = add_route(plan, b, rows, experts, used);
     if (status == YUUKA_OK) {
-        status = selected ? add_selected(plan, b, hidden, ffn, rows, experts, used,
-                                         gate_dtype, down_dtype)
-                          : add_grouped(plan, b, hidden, ffn, rows, experts, used,
-                                        gate_dtype, down_dtype);
+        status = mode == 2 ? add_grouped_q8(plan, b, hidden, ffn, rows, experts, used,
+                                            gate_dtype, down_dtype)
+                           : mode == 1
+                                 ? add_selected(plan, b, hidden, ffn, rows, experts,
+                                                used, gate_dtype, down_dtype)
+                                 : add_grouped(plan, b, hidden, ffn, rows, experts,
+                                               used, gate_dtype, down_dtype);
     }
     if (status == YUUKA_OK) {
         status = add_reduce(plan, b, hidden, rows, used);
@@ -477,7 +580,7 @@ int main() {
                                 up_packed, down_packed, norm, logits));
             std::vector<float> got, weights;
             std::vector<int32_t> ids;
-            if (run_pipeline(ctx, b, selected != 0, hidden, ffn, rows, experts, used,
+            if (run_pipeline(ctx, b, selected, hidden, ffn, rows, experts, used,
                              YUUKA_DTYPE_IQ2_XXS, down_dtype, got, ids, weights) != 0) {
                 free_buffers(b);
                 teardown(ctx);
@@ -519,6 +622,91 @@ int main() {
                         selected != 0 ? "selected" : "grouped", down_dtype, worst);
             CHECK(worst <= 1e-2f);
         }
+    }
+
+    // Q8_1 expert route. The assignment tile is sixteen, so a 32-row chunk with
+    // one slot per row and logits that alternate the winner fills the tile for
+    // both experts. The reference reprocesses the same device routing over the
+    // decoded weights and the dequantized Q8_1 activations, which is the numeric
+    // contract of the int8 route.
+    {
+        const int q_rows = 32;
+        const int q_hidden = hidden, q_ffn = ffn;
+        const int q_experts = experts, q_used = used;
+        std::vector<float> q_norm(uint64_t(q_rows) * q_hidden);
+        for (float & value : q_norm) value = dist(rng);
+        std::vector<float> q_logits(uint64_t(q_rows) * q_experts);
+        for (int row = 0; row < q_rows; ++row) {
+            q_logits[row * q_experts + 0] = (row % 2 == 0) ? 0.6f : 0.2f;
+            q_logits[row * q_experts + 1] = (row % 2 == 0) ? 0.2f : 0.6f;
+        }
+        std::vector<uint8_t> q_down_packed;
+        for (int row = 0; row < q_experts * q_hidden; ++row) {
+            append_block(q_down_packed, ref_blocks[2], row);
+        }
+        const std::vector<float> q_down_host = dequant(
+            ctx, q_down_packed, q_ffn, uint64_t(q_experts) * q_hidden,
+            YUUKA_DTYPE_IQ2_S);
+        CHECK(!q_down_host.empty());
+
+        moe_buffers b;
+        CHECK(alloc_buffers(ctx, b, q_rows, q_experts, q_used, q_hidden, q_ffn,
+                            gate_packed, up_packed, q_down_packed, q_norm, q_logits));
+        std::vector<float> fp32_out, fp32_weights, q8_out, q8_weights;
+        std::vector<int32_t> fp32_ids, q8_ids;
+        if (run_pipeline(ctx, b, 0, q_hidden, q_ffn, q_rows, q_experts, q_used,
+                         YUUKA_DTYPE_IQ2_XXS, YUUKA_DTYPE_IQ2_S, fp32_out, fp32_ids,
+                         fp32_weights) != 0) {
+            free_buffers(b);
+            teardown(ctx);
+            return 1;
+        }
+        if (run_pipeline(ctx, b, 2, q_hidden, q_ffn, q_rows, q_experts, q_used,
+                         YUUKA_DTYPE_IQ2_XXS, YUUKA_DTYPE_IQ2_S, q8_out, q8_ids,
+                         q8_weights) != 0) {
+            free_buffers(b);
+            teardown(ctx);
+            return 1;
+        }
+        free_buffers(b);
+        CHECK(q8_ids == fp32_ids);
+        int per_expert[4] = {0, 0, 0, 0};
+        for (int32_t expert : q8_ids) {
+            CHECK(expert >= 0 && expert < q_experts);
+            per_expert[expert]++;
+        }
+        CHECK(per_expert[0] == q_rows / 2 && per_expert[1] == q_rows / 2);
+
+        std::vector<float> want(uint64_t(q_rows) * q_hidden, 0.0f);
+        for (int row = 0; row < q_rows; ++row) {
+            const auto begin = q_norm.begin() + uint64_t(row) * q_hidden;
+            const std::vector<float> x =
+                quantize_q8_1_host(std::vector<float>(begin, begin + q_hidden));
+            const int expert = q8_ids[row * q_used];
+            std::vector<float> act(q_ffn);
+            for (int j = 0; j < q_ffn; ++j) {
+                const float * gate_row =
+                    &gate_host[(uint64_t(expert) * q_ffn + j) * q_hidden];
+                const float * up_row =
+                    &up_host[(uint64_t(expert) * q_ffn + j) * q_hidden];
+                act[j] = silu(dot(gate_row, x.data(), q_hidden)) *
+                         dot(up_row, x.data(), q_hidden);
+            }
+            const std::vector<float> q_act = quantize_q8_1_host(act);
+            for (int i = 0; i < q_hidden; ++i) {
+                const float * down_row =
+                    &q_down_host[(uint64_t(expert) * q_hidden + i) * q_ffn];
+                want[uint64_t(row) * q_hidden + i] =
+                    q8_weights[row * q_used] * dot(down_row, q_act.data(), q_ffn);
+            }
+        }
+        float worst = 0.0f;
+        for (size_t i = 0; i < q8_out.size(); ++i) {
+            worst = std::fmax(worst, std::fabs(q8_out[i] - want[i]));
+        }
+        std::printf("moe q8 grouped path, down dtype %u: max abs diff %.3g\n",
+                    uint32_t(YUUKA_DTYPE_IQ2_S), worst);
+        CHECK(worst <= 2e-2f);
     }
 
     // Shared expert: x += sigmoid(dot(gate, norm[row])) * src[row].

@@ -354,6 +354,27 @@ void launch_moe_reduce_add(float * x, const float * expert_out,
                            const float * weights, int rows, int used, int hidden,
                            hipStream_t stream);
 
+/* Q8_1 expert kernels. The activation tile is quantized to int8 with one FP32
+ * scale per 32 values in norm_qs/norm_ds (gate and up) and act_qs/act_ds (down);
+ * the packed IQ weight digits are decoded to int8 and dotted with dp4a. Both
+ * require the K width and the output width to be multiples of 256 and serve only
+ * IQ2_XXS, IQ2_S, and IQ3_S. */
+void launch_moe_gate_up_grouped_q8(const int8_t * norm_qs,
+                                   const float2 * norm_ds, const void * gate_exps,
+                                   const void * up_exps, const int32_t * counts,
+                                   const int32_t * assign_rows,
+                                   const int32_t * assign_slots, float * gate_out,
+                                   float * up_out, int rows, int experts, int used,
+                                   int hidden, int ffn, uint64_t hidden_row_bytes,
+                                   uint32_t dtype, hipStream_t stream);
+void launch_moe_down_grouped_q8(const int8_t * act_qs, const float2 * act_ds,
+                                const void * down_exps, const int32_t * counts,
+                                const int32_t * assign_rows,
+                                const int32_t * assign_slots, float * out, int rows,
+                                int experts, int used, int hidden, int ffn,
+                                uint64_t ffn_row_bytes, uint32_t dtype,
+                                hipStream_t stream);
+
 /* Selected-expert MoE kernels. The decode path reads the routing ids and
  * launches one grid over the rows*used selected slots, so an expert row is only
  * scheduled for a token that selected it. */

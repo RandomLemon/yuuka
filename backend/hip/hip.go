@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 10
+const RequiredABI = 11
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -450,6 +450,22 @@ func checkMoEDType(dtype tensor.DType, nIn int64) error {
 	}
 	if _, err := dtype.RowBytes(nIn); err != nil {
 		return fmt.Errorf("hip: MoE shape: %w", err)
+	}
+	return nil
+}
+
+// checkMoEQ8DType is the narrower rule of the Q8_1 expert route. The int8 dots
+// decode only the IQ codebooks, and the kernels require both the K width and the
+// output width of the op to be multiples of 256 so a 256-value K step and a
+// whole int8 tile always fit.
+func checkMoEQ8DType(dtype tensor.DType, width int64) error {
+	switch dtype {
+	case tensor.IQ2XXS, tensor.IQ2S, tensor.IQ3S:
+	default:
+		return fmt.Errorf("hip: Q8_1 expert route serves IQ codebooks only, got %s", dtype)
+	}
+	if width%256 != 0 {
+		return fmt.Errorf("hip: Q8_1 expert width %d is not a multiple of 256", width)
 	}
 	return nil
 }
@@ -1074,6 +1090,9 @@ func (p *Plan) AddSiluMulQuantQ8_1At(gate *Buffer, gateOff uint64, up *Buffer, u
 	if width <= 0 || rows <= 0 {
 		return errors.New("hip: SwiGLU Q8_1 dimensions must be positive")
 	}
+	if width%128 != 0 {
+		return fmt.Errorf("hip: SwiGLU Q8_1 width %d is not a multiple of 128", width)
+	}
 	if err := p.check(gate, up, qs, ds); err != nil {
 		return err
 	}
@@ -1653,6 +1672,90 @@ func (p *Plan) AddMoEDownGrouped(act, downExps, counts, assignRows, assignSlots,
 	op.buf[3] = assignRows.ptr
 	op.buf[4] = assignSlots.ptr
 	op.buf[5] = out.ptr
+	op.n[0] = C.uint64_t(ffn)
+	op.n[1] = C.uint64_t(hidden)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(experts)
+	op.n[4] = C.uint64_t(used)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddMoEGateUpQ8 appends the grouped gate/up expert projections over a Q8_1
+// activation tile. normQ8 holds the int8 digits of [rows, hidden] and normDS
+// their float2 block scales; counts and assignments come from AddMoERoute, and
+// gateOut and upOut are [rows*used, ffn]. Both expert matrices must share dtype,
+// which the kernel decodes with one instantiation. Only IQ2_XXS, IQ2_S, and
+// IQ3_S are accepted, and hidden and ffn must be multiples of 256.
+func (p *Plan) AddMoEGateUpQ8(normQ8, normDS, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut *Buffer, hidden, ffn, rows, experts, used int64, dtype tensor.DType) error {
+	if hidden <= 0 || ffn <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid Q8 MoE gate/up dimensions")
+	}
+	if err := checkMoEQ8DType(dtype, hidden); err != nil {
+		return err
+	}
+	if err := checkMoEQ8DType(dtype, ffn); err != nil {
+		return err
+	}
+	if err := p.check(normQ8, normDS, gateExps, upExps, counts, assignRows, assignSlots, gateOut, upOut); err != nil {
+		return err
+	}
+	if want := rows * hidden; int64(normQ8.bytes) < want {
+		return fmt.Errorf("hip: Q8 norm tile holds %d bytes, want %d", normQ8.bytes, want)
+	}
+	if want := rows * (hidden / 32) * 8; int64(normDS.bytes) < want {
+		return fmt.Errorf("hip: Q8 norm scales hold %d bytes, want %d", normDS.bytes, want)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_GATE_UP_Q8}
+	op.buf[0] = normQ8.ptr
+	op.buf[1] = normDS.ptr
+	op.buf[2] = gateExps.ptr
+	op.buf[3] = upExps.ptr
+	op.buf[4] = counts.ptr
+	op.buf[5] = assignRows.ptr
+	op.buf[6] = assignSlots.ptr
+	op.buf[7] = gateOut.ptr
+	op.buf[8] = upOut.ptr
+	op.n[0] = C.uint64_t(hidden)
+	op.n[1] = C.uint64_t(ffn)
+	op.n[2] = C.uint64_t(rows)
+	op.n[3] = C.uint64_t(experts)
+	op.n[4] = C.uint64_t(used)
+	op.u[0] = C.uint32_t(dtype)
+	return p.add(op)
+}
+
+// AddMoEDownQ8 appends the grouped expert down projections over the Q8_1
+// SwiGLU tile. actQ8 holds the int8 digits of [rows*used, ffn] and actDS their
+// float2 block scales; out is [rows*used, hidden].
+func (p *Plan) AddMoEDownQ8(actQ8, actDS, downExps, counts, assignRows, assignSlots, out *Buffer, ffn, hidden, rows, experts, used int64, dtype tensor.DType) error {
+	if ffn <= 0 || hidden <= 0 || rows <= 0 || experts <= 0 || used <= 0 || used > experts {
+		return errors.New("hip: invalid Q8 MoE down dimensions")
+	}
+	if err := checkMoEQ8DType(dtype, ffn); err != nil {
+		return err
+	}
+	if err := checkMoEQ8DType(dtype, hidden); err != nil {
+		return err
+	}
+	if err := p.check(actQ8, actDS, downExps, counts, assignRows, assignSlots, out); err != nil {
+		return err
+	}
+	slots := rows * used
+	if want := slots * ffn; int64(actQ8.bytes) < want {
+		return fmt.Errorf("hip: Q8 down activation tile holds %d bytes, want %d", actQ8.bytes, want)
+	}
+	if want := slots * (ffn / 32) * 8; int64(actDS.bytes) < want {
+		return fmt.Errorf("hip: Q8 down activation scales hold %d bytes, want %d", actDS.bytes, want)
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_DOWN_Q8}
+	op.buf[0] = actQ8.ptr
+	op.buf[1] = actDS.ptr
+	op.buf[2] = downExps.ptr
+	op.buf[3] = counts.ptr
+	op.buf[4] = assignRows.ptr
+	op.buf[5] = assignSlots.ptr
+	op.buf[6] = out.ptr
 	op.n[0] = C.uint64_t(ffn)
 	op.n[1] = C.uint64_t(hidden)
 	op.n[2] = C.uint64_t(rows)
