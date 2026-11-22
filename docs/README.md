@@ -96,7 +96,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 ### Module indexes
 
 - [Qwen prefill optimization](prefill-optimization/README.md) — Implementation stages and verification for single-request prefill against upstream llama.cpp v1.0.0.
-- [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — Measured `qwen35moe` HIP prefill and decode throughput next to llama.cpp, the per-operation attribution of the gap, the assignment-tile table, and the correctness gates.
+- [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — The matched 512/2048/8192-token `qwen35moe` HIP prefill comparison next to llama.cpp, the per-operation attribution of what changed, the assignment-tile table, and the correctness gates.
 
 ## Implementation status
 
@@ -195,10 +195,15 @@ Implemented and tested:
   int8 WMMA grouped route, which replaces the per-assignment `dp4a` with the
   dense MMQ GEMM's int8 tiles at a measured assignment-tile table (see
   [kernels.md](kernels.md#81-moe-expert-pipeline)); `Options.ForceMoEQ8` keeps
-  the `dp4a` route for A/B measurement. On Qwen3.6-35B-A3B it moves the expert
-  stage from 99.4 to 58.4 ms at a 128-row chunk and from 363.2 to 142.1 ms at
-  512 rows, and prefill from 733-751 to 949-1227 tokens/s at 128-512 tokens
-  ([benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#results)).
+  the `dp4a` route for A/B measurement. On Qwen3.6-35B-A3B the int8 WMMA route
+  moved the expert stage from 99.4 to 58.4 ms at a 128-row chunk and from 363.2
+  to 142.1 ms at 512 rows. The 2026-11-22 prefill pass then reached 1718.6,
+  1682.4, and 1493.4 tokens/s at 512, 2048, and 8192 tokens against llama.cpp's
+  1613.8, 1564.0, and 1477.1: 1.065x, 1.076x, and 1.011x. It adds the 8:1 F16
+  grouped-head WMMA attention route, the F32 router tile, the measured Q5_K
+  direct cells, the direct IQ2_XXS gate/up layout, and the shared-expert
+  quantizer reuse
+  ([benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#matched-release-comparison)).
 - Exact greedy prompt-lookup speculative decoding, verified against the plain
   greedy path and enabled with `--speculative`.
 - A diagnostic NPU capability probe (`yuuka npu-probe`, `--npu`) that reports

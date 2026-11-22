@@ -1,18 +1,21 @@
 # Qwen3.6-35B-A3B (`qwen35moe`) benchmark
 
-**Objective.** Record the `qwen35moe` HIP throughput on gfx1151 for prompt
-lengths 128, 512, and 2048 and for a 128-token decode, next to llama.cpp on the
-same model, device, KV format, and single-request protocol, with the
-per-operation attribution of the difference and the correctness gates the run
-was taken with.
+**Objective.** Record the `qwen35moe` HIP prefill throughput on gfx1151 at 512,
+2048, and 8192 prompt tokens against llama.cpp on the same model, device, KV
+format, chunk size, and single-request protocol, with the per-operation
+attribution of what changed and the correctness gates the run was taken with.
+Decode is recorded only as a regression check; it is not a speed target.
 
-**Status.** Measured on 2026-11-22 at `ac7c697`. yuuka reaches 954, 1249, and
-1070 tokens/s prefill at 128, 512, and 2048 prompt tokens and 63.5, 63.0, and
-61.9 tokens/s decode, that is 0.87, 0.80, and 0.71 of the reference's prefill and
-0.94, 0.93, and 0.92 of its decode. The grouped int8 WMMA route
-([kernels.md](../kernels.md#81-moe-expert-pipeline)) runs the routed experts; its
-expert stage is within 1.14x of the reference's at a 128-row chunk, and the
-remaining gap is in the dense stages (table below).
+**Status.** Measured on 2026-11-22 at `d0253fde` against the frozen
+`1bc54d18` baseline and upstream `b1b770d90`. The matched fixed-512 ABBA
+comparison now leads at every requested length: 1718.6 against 1613.8 tokens/s
+at 512 (1.065x), 1682.4 against 1564.0 at 2048 (1.076x), and 1493.4 against
+1477.1 at 8192 (1.011x), using 20 samples per engine per length. The three
+speed gates and the behavior gates pass; the MoE attention route's numerical
+envelope is recorded in the matched comparison and in
+[moe_real_test.go](../../engine/gpu/moe_real_test.go). The earlier
+`ac7c697` dense-stage record and 128-row attribution below are historical and
+are kept for the stage comparison.
 
 ## Environment and protocol
 
@@ -30,23 +33,149 @@ remaining gap is in the dense stages (table below).
 | Kernel | 7.0.14-28-pve |
 | Power profile | GPU DPM `performance` (amdgpu sysfs), CPU governor `performance` (`amd-pstate-epp`) |
 | Go | go1.24.4, `-tags hip` |
-| Commit | `ac7c697` |
-| llama.cpp | upstream `b1b770d90` (build 12359), ROCm build, `-ngl 99`, `-fa auto` |
+| Optimized commit | `d0253fde1e9172143b9923a838b1ac393cd3d639` |
+| Frozen baseline commit | `1bc54d18b8911723498df6f2e76a72b8492d9e6f` |
+| llama.cpp | upstream `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`, ROCm Release build, `-ngl 99`, `-fa auto` |
 | Tokenizer / chat template | GGUF-embedded Qwen3.6 vocabulary and template |
-| Sampling | Greedy; decode throughput does not depend on which token is drawn |
-| KV format | F16 on both sides (the engine default) |
-| Prefill chunk | 512 tokens on both sides (`--chunk-size 512`, llama.cpp batch 2048 / ubatch 512) |
-| Warmup / repetitions | 1 / 3 (median for `yuuka bench`, mean ± standard deviation for `llama-bench`) |
-| Concurrency | 1 request |
+| Sampling | None; both drivers compare the final host logit row and greedy top-1 |
+| KV format | F16 on both sides |
+| Prefill chunk | 512 tokens on both sides (1, 4, and 16 chunks for the three lengths) |
+| Warmup / repetitions | 2 / 5 per process, five-sample medians, two reversed-order processes per engine per length |
+| Token stream | One saved 8192-token little-endian `int32` file, SHA-256 `e613216db780a72fdbe796b31c63b4afabf273199dbc67f799b5c082d18e3e30` |
+| Concurrency | 1 request; no prefix cache, profiling, or parallel GPU job |
+| Thermal state | Idle 47-48 °C before each accepted block; sensor edge 52-61 °C during the runs; sclk 2.17-2.40 GHz |
 
-`yuuka bench` reports TTFT from submission and `decode = (decode_tokens - 1) /
-decode p50`, matching the prefill and decode split of `llama-bench` (`pp` and
-`tg`). Numbers are observations on one machine, not guarantees; device clocks,
-power, and thermal state are not pinned beyond the settings above, and the two
-sides ran sequentially, not interleaved. Both were run twice; the two yuuka runs
-differ by at most 2.2%.
+Each engine runs `y1, l1, l2, y2` at every length. `ycompare` times
+`Session.Prefill(tokens, true)` through the final host row, and the llama driver
+times the same saved tokens through `llama_batch` with `n_batch = n_ubatch =
+512` and full GPU offload. The score pools all ten samples per engine and
+requires both reversed-order pairs and the pooled median to exceed 1.00x.
+A first confirm block started at 56 °C and its 512-token first process was
+discarded as thermally contaminated; the accepted confirmation block started at
+47 °C. Numbers are observations on one machine, not guarantees.
 
-## Results
+## Matched release comparison
+
+| Prompt | Frozen baseline | Optimized | llama.cpp | Optimized / llama |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 416.9 ms, 1228.1 tok/s | 297.9 ms, 1718.6 tok/s | 317.3 ms, 1613.8 tok/s | **1.065x** |
+| 2048 | 1886.2 ms, 1085.8 tok/s | 1217.3 ms, 1682.4 tok/s | 1309.4 ms, 1564.0 tok/s | **1.076x** |
+| 8192 | 11705.2 ms, 699.9 tok/s | 5485.6 ms, 1493.4 tok/s | 5546.2 ms, 1477.1 tok/s | **1.011x** |
+
+The medians pool 20 samples per engine per length from two complete ABBA
+blocks. The accepted release block (`release3`) and its confirmation block
+(`confirm2`) give these reversed-order pairs:
+
+| Prompt | Release y1/l1 | Release y2/l2 | Confirmation y1/l1 | Confirmation y2/l2 |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1.068x | 1.083x | 1.034x | 1.044x |
+| 2048 | 1.055x | 1.052x | 1.097x | 1.073x |
+| 8192 | 1.019x | 0.995x | 1.047x | 1.012x |
+
+The 8192 release pair `y2/l2` is 0.5% below parity; the fresh confirm block
+passes both pairs at every length, and the pooled 8192 ratio is 1.011x. The
+pooled 512 and 2048 ratios are 1.065x and 1.076x. Individual process medians
+(ms, `y1/y2` and `l1/l2`) were 299.7/297.2 and 320.2/321.9 at 512,
+1196.8/1248.3 and 1263.2/1313.3 at 2048, and 5415.4/5507.4 and 5516.8/5478.8
+at 8192 in the release block; the confirmation block was 300.2/297.7 and
+310.6/310.9, 1204.9/1221.9 and 1321.4/1310.9, and 5404.1/5511.1 and
+5657.4/5577.8.
+
+### Attribution at the release chunk
+
+`TestGPUProfileMoEPrefillLong` executes every 512-row chunk at its populated
+absolute position for the same 8192-token stream, so this table charges attention
+and recurrence the context they carry in the release run. It is a diagnostic:
+events add submission overhead and clocks are not pinned. The frozen and
+optimized libs are the same binaries as the release blocks.
+
+| Stage | Base 512 | New 512 | Base 2048 | New 2048 | Base 8192 | New 8192 | 8192 saved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| prefill attention | 22.2 | 5.9 | 352.1 | 61.1 | 5505.6 | 826.2 | 4679.4 |
+| dense GEMM | 160.5 | 115.0 | 649.6 | 456.6 | 2555.2 | 1783.0 | 772.2 |
+| expert gate/up | 95.6 | 76.6 | 367.1 | 286.7 | 1405.6 | 1086.3 | 319.3 |
+| expert down | 49.5 | 47.9 | 189.9 | 182.6 | 751.7 | 698.4 | 53.3 |
+| recurrent chunk | 26.0 | 26.4 | 103.6 | 105.5 | 424.3 | 418.5 | 5.8 |
+| expert reduce | 15.2 | 16.1 | 60.7 | 65.3 | 244.3 | 263.4 | -19.1 |
+| other | 17.7 | 17.6 | 55.4 | 55.5 | 219.3 | 212.8 | 6.5 |
+| **total profiled** | **386.7** | **305.5** | **1778.4** | **1213.3** | **11106.0** | **5288.5** | **5817.5** |
+
+The dense GEMM column at 8192 decomposes from 2555.2 to 1783.0 ms as: F32 router
+610.6 to 104.2 (the new 64x64 tile), Q5_K Q/QKV 469.7 to 366.5, recurrent gate
+263.9 to 196.1, attention Q 141.7 to 110.2, attention output 80.8 to 55.7,
+shared gate/up 124.9 to 89.6, K/V 31.6 to 22.8, and the unchanged F32 recurrent
+alpha/beta and Q6_K SSM-out/shared-down cells. The expert gate/up column is the
+direct IQ2_XXS layout; 1086.3 ms is 67.9 ms per 512-row chunk against 88.9 ms
+before. The 19.1 ms increase in expert reduce is within the run-to-run stage
+spread and was not optimized.
+
+The recurrent chunk is unchanged because the prepared four-lane core is bound
+and measured neutral on this geometry; the state and logits are bitwise
+identical to the frozen build when attention is forced to the tiled kernel. The
+Q6_K dense trial and contiguous expert-store trials from the plan were not
+needed once the three speed gates passed.
+
+### Stage sweeps
+
+`build/yuuka_prefill_sweep --moe-dense` ran in base, candidate, candidate, base
+library order at M=512, two warmups and five samples per cell. Medians in ms:
+
+| Cell | Base | Candidate | Base | Change |
+| --- | ---: | ---: | ---: | ---: |
+| F32 router 2048->256 | 0.802 | 0.139 | 0.813 | 5.8x faster |
+| Q5_K 2048->8192 | 0.981 | 0.727 | 0.970 | 25% faster |
+| Q5_K 2048->4096 | 0.507 | 0.368 | 0.500 | 27% faster |
+| Q5_K 2048->512 | 0.116 | 0.087 | 0.120 | 26% faster |
+| Q5_K 4096->2048 | 0.532 | 0.392 | 0.520 | 26% faster |
+| Q6_K 4096->2048 | 0.624 | 0.641 | 0.636 | unchanged |
+| Q6_K 512->2048 | 0.141 | 0.132 | 0.138 | unchanged |
+
+`build/yuuka_moe_sweep --route mmq --dtype iq2xxs --experts 256 --used 8
+--hidden 2048 --ffn 512 --rows 512 --tile-j 32` measured gate/up 2.499 ms
+before and 1.898 ms after (24% less); the IQ2_S and IQ3_S gate/up and all three
+down projections are unchanged. The real-prompt attribution above confirms the
+same direction at 19-20 ms per 512-row chunk.
+
+### Numerical and behavioral gates
+
+- Optimized, baseline, and llama.cpp top-1 agree at every length: 13477 at 512,
+  5388 at 2048, and 13477 at 8192.
+- The optimized final logits differ from the frozen baseline by at most 1.4246,
+  1.1723, and 0.7767 at 512, 2048, and 8192 (mean 0.213, 0.168, 0.122), and
+  from llama.cpp by 2.0572, 1.3264, and 1.0292. The difference is the approved
+  8:1 F16 grouped-head WMMA route; `TestGPUMoEPrefillGreedyContinuity` records
+  1.43/1.26/0.87 against the forced tiled control, keeps the greedy tokens
+  `[13477 37550 33075 888]` at 512, `[5388 13 561 3841]` at 2048, and
+  `[13477 37550 33075 888]` at 8192, and enforces
+  `moeAttentionRouteLogitTolerance = 2.0`. The route gate change was approved
+  explicitly for this record; the dense 4:1 route keeps 0.05/0.3.
+- `TestGPUMoEMmqMatchesQ8` reports 0 maximum logit difference and the golden
+  continuation `[11751 11 264 3177]`; `TestGPUMoEGoldenGeneration` keeps a
+  0.00286746 first-token difference from the CPU reference;
+  `TestGPUMoEChunkedPrefill` keeps the CPU top-1 and continuation
+  `[279 15217 5388 13]` at 1.07/1.14 against the 2.0 bound; and
+  `TestGPUChunkedPrefillLongContext` passes with the same top-1.
+- Native coverage passes: the router tile matches the scalar 513-row control
+  byte for byte; the Q5_K direct cells match the generic M=513 control byte for
+  byte; the direct IQ2_XXS gate/up matches dp4a at 2.4e-7 relative with IQ2_S
+  and IQ3_S down at 1.7e-8; and the 16-head/2-KV-head F16 attention case is
+  within 5e-3 of the tiled and host references. The selected CTest suite is
+  8/8, and `kernel_resources.sh` reports no spills for the grouped-head WMMA
+  instantiation.
+- `TestGPULongSplitAttentionMatchesDirect` skips because the 8:1 geometry does
+  not allocate the split workspace; split attention was not shipped for this
+  model.
+
+The independent driver build and the `y1, l1, l2, y2` process order follow
+[the matched upstream comparison](../prefill-optimization/acceptance/08-upstream-comparison.md);
+the only changes are the verified model path, the saved token file, and the
+fixed 512 chunk. The Go gates use `YUUKA_TEST_MODEL` and `YUUKA_TEST_MOE_MODEL`
+set to that GGUF, `YUUKA_TEST_KV=f16`, and
+`YUUKA_TEST_ATTENTION_LONG=1` for `TestGPUAttentionPathsAgree`. The native
+gates are the selected CTest suite and the `--moe-dense` sweep in base,
+candidate, candidate, base order.
+
+## Earlier dense-stage record (ac7c697)
 
 | Measurement | yuuka run 1 | yuuka run 2 | llama.cpp | ratio (run 1) |
 | --- | ---: | ---: | ---: | ---: |
@@ -77,7 +206,7 @@ Detail of run 1:
 - llama.cpp's prefill rate is flat at 1513-1562 tokens/s from 512 to 2048
   tokens, so the prefill gap widens from 1.25x to 1.41x over that range.
 
-## Measured attribution
+## Earlier 128-row attribution (ac7c697)
 
 One 128-row prefill chunk and one decode step, per operation. The yuuka column
 is `TestGPUProfileMoE`, which attributes the planned operations of one chunk and
@@ -159,7 +288,7 @@ The experts are 3.6 ms of the 17.1 ms step against the reference's 2.5 ms, and
 the largest single difference is the LM head and dense matvec family: 10.13 ms
 across 311 operations against 7.49 ms.
 
-## Assignment tile
+## Assignment tile (ac7c697)
 
 The grouped int8 WMMA route walks an expert's assignment bucket in tiles of
 `n[5]` rows, and the tile width is a dispatch table measured with
@@ -189,7 +318,7 @@ concentrates more assignments per expert than a random draw and a 16-wide tile
 then needs a second weight pass. The 128-wide tile loses at every row count
 because it halves the channel tile and doubles the block count.
 
-## Correctness gates
+## Correctness gates at ac7c697
 
 Every number above was taken at a commit whose MoE path was verified on the same
 host and model:

@@ -669,13 +669,13 @@ assignments, so a tile of 64 or 128 leaves most columns padded (tile 128:
 4.816 / 6.131 / 7.588 / 7.944 ms total). The assignment tile is therefore a
 dispatch decision, not a constant; the tile table the dispatch uses was measured
 per row class afterwards and is recorded with the target model in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile).
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile-ac7c697).
 
 `--route q8` runs the same shape through the Q8_1 `dp4a` pipeline, and
 `--dtype q4_k|q5_k|q6_k|iq2xxs|iq2s|iq3s` selects the synthetic expert codebook
 for either quantized route, so one binary covers the two quantized forms per
 codebook. Measured 2026-11-22 with the IQ staging of
-[qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution),
+[qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#earlier-128-row-attribution-ac7c697),
 `--dtype iq2xxs --experts 256 --used 8 --hidden 2048 --ffn 512`, three runs per
 cell with the median reported:
 
@@ -693,14 +693,17 @@ assignment tile in the last column is the table `SelectMoEPrefillPath` uses for
 that row class.
 
 These are kernel-pipeline numbers for a synthetic shape. End-to-end
-`qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 128, 512, and 2048
-prefill tokens and 128 decode tokens, next to llama.cpp on the same protocol,
-is recorded in [benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md),
-together with the per-operation attribution of that gap: the two expert kernels
-hold 42% of a 128-row prefill chunk and are within 1.14x of llama.cpp's int8 MMQ
-kernels, while the dense GEMM (1.33x) and the gated delta-net chunk (3.4x) carry
-the remaining chunk gap, and the decode step's largest single difference is the
-LM head and dense matvec family (1.35x).
+`qwen35moe` throughput on Qwen3.6-35B-A3B-UD-IQ2_XXS at 512, 2048, and 8192
+prefill tokens, next to llama.cpp on the same protocol and fixed 512 chunk, is
+recorded in
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#matched-release-comparison).
+The matched run leads by 1.065x, 1.076x, and 1.011x at those lengths. Its
+per-operation attribution shows the 8:1 F16 grouped-head WMMA attention saving
+4679 ms of the 8192-token run, the F32 router tile and Q5_K direct cells saving
+772 ms of dense GEMM, and the direct IQ2_XXS gate/up layout saving 319 ms of the
+expert stage. The earlier 128-row record, where the expert kernels held 42% of
+a chunk and the dense GEMM and gated delta-net carried most of the gap, remains
+in the same document for the stage history.
 
 ## Kernel resource usage
 

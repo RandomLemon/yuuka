@@ -613,6 +613,14 @@ compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
 | Q4_K | 4096, 9216 | 2560 |
 | Q5_K | 2560 | 8192 |
 | Q5_K | 4096 | 2560 |
+| Q5_K | 2048 | 8192, 4096, 512 (M=512 only) |
+| Q5_K | 4096 | 2048 (M=512 only) |
+
+The last two rows are the qwen35moe prompt cells: Q/QKV and the recurrent gate,
+K/V plus the shared-expert gate/up, and the attention output. They are selected
+only at the release chunk size, M=512; measured medians at that size are 0.727,
+0.368, 0.087, and 0.392 ms against 0.981, 0.507, 0.116, and 0.532 ms for the
+generic tile. The direct matrix matches the generic M=513 control byte for byte.
 
 The original Q4_K FFN cell `M=512, K=2560, N=9216` uses its compile-time
 dimensions. The other cells pass dimensions into the same tile algorithm.
@@ -1229,7 +1237,7 @@ row is a whole number of 256-value blocks and the output width fills the
 128-channel tile. The assignment tile width comes from the measured table in
 `moeAssignmentTile`: 16 up to 384 rows, 32 from 512 to 2048, and 64 from 4096.
 The table is the measured winner of each row class in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile),
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile-ac7c697),
 where the tile sweep and the end-to-end numbers are recorded; at 512 rows the two
 widths tie in the sweep and the real model prefers 32 because its routing
 concentrates more assignments per expert than a random draw.
@@ -1263,7 +1271,7 @@ computation over the same decoded expert matrices.
 
 Measured cost (2026-11-22, gfx1151, Qwen3.6-35B-A3B-UD-IQ2_XXS, tables and
 reference comparison in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#measured-attribution)):
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#earlier-128-row-attribution-ac7c697)):
 
 | Stage | Stage time | Share of its phase |
 | --- | ---: | ---: |
