@@ -145,7 +145,7 @@ Implemented and tested:
   `128–8192` tokens; `yuuka run` and `yuuka bench` default to 1024-token chunks
   for `1024–8192` tokens on the verified `gfx1151` F16 KV configuration when
   `--chunk-size` is omitted. See
-  [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#current-prefill-status-commit-9aaf432).
+  [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#prefill-prompt-length).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   Decode runs the delta-net layer as a fused pair (one convolution plus L2 norm

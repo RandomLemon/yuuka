@@ -1062,8 +1062,9 @@ the accumulator block: at 192 registers it spilled 21 slots into the key loop,
 and removing that spill was most of the 1.5x the stage measured.
 
 Crossover and measurements. Isolated prefill attention, one layer, FP32 pool,
-median of 20 launches after a warmup (full table in
-[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#prefill-attention)):
+median of 20 launches after a warmup. The crossover below is the design record;
+the current [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#prefill-attention)
+records the selected route in step:
 
 | Shape | Tiled | MMA |
 | --- | ---: | ---: |
@@ -1352,7 +1353,7 @@ row is a whole number of 256-value blocks and the output width fills the
 128-channel tile. The assignment tile width comes from the measured table in
 `moeAssignmentTile`: 16 up to 384 rows, 32 from 512 to 2048, and 64 from 4096.
 The table is the measured winner of each row class in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile-ac7c697),
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#assignment-tile),
 where the tile sweep and the end-to-end numbers are recorded; at 512 rows the two
 widths tie in the sweep and the real model prefers 32 because its routing
 concentrates more assignments per expert than a random draw.
@@ -1386,7 +1387,7 @@ computation over the same decoded expert matrices.
 
 Measured cost (2026-11-22, gfx1151, Qwen3.6-35B-A3B-UD-IQ2_XXS, tables and
 reference comparison in
-[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#earlier-128-row-attribution-ac7c697)):
+[benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#decode-attribution)):
 
 | Stage | Stage time | Share of its phase |
 | --- | ---: | ---: |

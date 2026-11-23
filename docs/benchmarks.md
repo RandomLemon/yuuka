@@ -25,7 +25,7 @@ target model in the section.
 
 | Report | Model file | Architecture | Quantization | Device | Contents |
 | --- | --- | --- | --- | --- | --- |
-| [Qwen3.5-4B](benchmarks/qwen3.5_4b.md) | `Qwen3.5-4B-Q4_K_M.gguf` | `qwen35` | Q4_K_M | `gfx1151` | Single-request prefill, decode, KV formats, isolated kernels, the synthetic grouped-MoE pipeline sweep, serving, llama.cpp comparison, and measured dispatch decisions |
+| [Qwen3.5-4B](benchmarks/qwen3.5_4b.md) | `Qwen3.5-4B-Q4_K_M.gguf` | `qwen35` | Q4_K_M | `gfx1151` | Single-request prefill, decode, KV formats, isolated kernels, serving, llama.cpp comparison, and measured dispatch decisions |
 | [Qwen3.6-35B-A3B](benchmarks/qwen3.6_35b_a3b.md) | `Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` | `qwen35moe` | UD-IQ2_XXS | `gfx1151` | Matched prefill and decode comparisons against llama.cpp, per-operation attribution, assignment-tile table, and gates |
 
 ## Adding a model report
