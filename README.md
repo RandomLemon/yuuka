@@ -153,7 +153,7 @@ Start at [`docs/README.md`](docs/README.md). The design contracts are:
 | [`docs/kernels.md`](docs/kernels.md) | Prefill/decode kernels, quantization, attention, dispatch |
 | [`docs/serving.md`](docs/serving.md) | Scheduler, paged KV, HIP Graph, API, observability |
 | [`docs/testing.md`](docs/testing.md) | Correctness strategy, test matrix, benchmark protocol, regression gates |
-| [`docs/benchmarks.md`](docs/benchmarks.md) | Measured prefill, decode, and serving results with reproduction steps |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark report conventions, required metadata and coverage, and the per-model report index |
 | [`docs/hardware.md`](docs/hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, rocWMMA facts |
 | [`docs/npu.md`](docs/npu.md) | Deferred NPU strategy and interface reservations |
 

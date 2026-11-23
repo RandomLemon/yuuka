@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Reduce a rocprofv3 kernel trace of ``yuuka_gemv_decode_sweep`` to the decode
-matvec table of docs/benchmarks.md.
+matvec table of docs/benchmarks/qwen3.5_4b.md.
 
 The sweep runs every shape in three forms (per-row GEMV, batched GEMV, streaming
 LM head), and every cell submits one plan operation ``kSubmissionsPerCell``
@@ -11,7 +11,7 @@ cells instead would mix fourteen shapes and three forms.
 
 Two columns disagree on purpose. ``host_ms`` is the sweep's own median over the
 ten timed submissions and includes the submission and the wait; it is the
-number docs/benchmarks.md records. ``device_us`` is the mean kernel
+number docs/benchmarks/qwen3.5_4b.md records. ``device_us`` is the mean kernel
 duration from the trace and excludes everything around the launch, so the
 difference between them is the per-operation launch cost the decode step pays
 579 times. GB/s is reported for both.
@@ -22,7 +22,7 @@ that: it equals ``grid_size_x * grid_size_y / 32`` on this device, and the
 reduction fails when it does not. Instruction counts are normalized per weight
 element as ``count * 32 / (n_in * n_out)``, that is wave-level instructions
 times the lanes they cover, which is the "instructions per weight" figure of
-docs/benchmarks.md.
+docs/benchmarks/qwen3.5_4b.md.
 
 Only the Python standard library is used; the rocpd database is plain SQLite.
 """
@@ -271,7 +271,7 @@ def print_table(label, columns, rows):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Reduce a rocprofv3 trace of yuuka_gemv_decode_sweep to the decode"
-                    " matvec table of docs/benchmarks.md.")
+                    " matvec table of docs/benchmarks/qwen3.5_4b.md.")
     parser.add_argument("--cells", required=True,
                         help="sweep output CSV (build/yuuka_gemv_decode_sweep)")
     parser.add_argument("--db", required=True,
@@ -353,7 +353,7 @@ def main(argv=None):
         print("Interpretation: host_ms - device_ms is the per-submission launch cost"
               " the decode step pays once per operation. valu/w and lds/w are the"
               " wave-level instructions times 32 lanes per packed weight, the figure"
-              " docs/benchmarks.md uses; a gemv_batch4 cell covers four rows,"
+              " docs/benchmarks/qwen3.5_4b.md uses; a gemv_batch4 cell covers four rows,"
               " so its instruction figures are the cost of producing four rows at"
               " once, not four times the per-row cost.")
     except Fail as error:

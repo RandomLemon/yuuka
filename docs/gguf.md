@@ -264,7 +264,7 @@ and the HIP MoE expert kernels plus `yuuka_dequant_f16` decode the same three
 codebooks on the device. No HIP GEMV, GEMM, or LM-head kernel accepts them, so
 using an IQ tensor outside those two paths is a planning error. The prefill dispatch table and
 benchmark evidence are in [kernels.md](kernels.md) and
-[benchmarks.md](benchmarks.md). Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, IQ1, IQ2_XS,
+[the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md). Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, IQ1, IQ2_XS,
 IQ3_XXS, IQ4_NL, and IQ4_XS remain capability failures.
 
 ## 10. Validation checklist

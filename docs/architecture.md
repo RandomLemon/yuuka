@@ -468,7 +468,7 @@ decision and the phase that may reopen it are recorded below.
 4. **Dispatch decisions.** Measured thresholds are encoded in the explicit Go
    selector `SelectPrefillPath`, keyed by dtype, shape class, and row class. They
    are derived from the checked-in sweep harness and recorded in
-   [benchmarks.md](benchmarks.md), and they are gated by dispatch tests. There is
+   [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md), and they are gated by dispatch tests. There is
    no runtime autotuner or device table registry; adding a device requires
    re-running the sweeps and updating the selectors and tests. Values from other
    RDNA parts are not accepted.

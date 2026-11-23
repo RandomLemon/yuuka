@@ -22,7 +22,8 @@ treated as format and correctness references only.
 > future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
 > and does not execute model operations. All first-release success criteria are
 > met, including the 128/256-token decode matrix in
-> [benchmarks.md](benchmarks.md). See the implementation status below,
+> [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decode-output-length). See
+> the implementation status below,
 > [npu.md](npu.md), [hardware.md](hardware.md), and
 > [benchmarks.md](benchmarks.md).
 
@@ -88,13 +89,14 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | [gguf.md](gguf.md) | GGUF reader, metadata mapping, tokenizer, quantization handling, model support matrix | Runtime and model contributors |
 | [kernels.md](kernels.md) | Prefill/decode kernel design, quantized GEMV/GEMM, attention, fusion, dispatch and tuning | Kernel contributors |
 | [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |
-| [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, reporting, regression gates | All contributors |
+| [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, regression gates | All contributors |
 | [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
-| [benchmarks.md](benchmarks.md) | Single-request, prefill, and concurrent-serving measurements with reproduction steps | All contributors |
+| [benchmarks.md](benchmarks.md) | Benchmark report conventions, required metadata and coverage, and the per-model report index | All contributors |
 
 ### Module indexes
 
+- [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md) — The single-request `qwen35` HIP record: prefill and decode curves, KV formats, isolated kernel sweeps, serving, the llama.cpp comparison, and the measured dispatch decisions.
 - [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — The matched 512/2048/8192-token `qwen35moe` HIP prefill comparison next to llama.cpp, the per-operation attribution of what changed, the assignment-tile table, and the correctness gates.
 
 ## Implementation status
@@ -142,7 +144,8 @@ Implemented and tested:
   and leads official `llama.cpp v1.0.0` by `+12.4%` to `+17.6%` across
   `128–8192` tokens; `yuuka run` and `yuuka bench` default to 1024-token chunks
   for `1024–8192` tokens on the verified `gfx1151` F16 KV configuration when
-  `--chunk-size` is omitted. See [benchmarks.md](benchmarks.md).
+  `--chunk-size` is omitted. See
+  [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#current-prefill-status-commit-9aaf432).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   Decode runs the delta-net layer as a fused pair (one convolution plus L2 norm
@@ -268,8 +271,9 @@ rejected at load time.
 - `MUST`, `SHOULD`, and `MAY` describe design requirements, not current
   implementation behavior.
 - Performance numbers in these documents are design estimates or measurement
-  targets. Only results recorded under the protocol in
-  [testing.md](testing.md) count as benchmarks.
+  targets. Only results recorded under the protocol in [testing.md](testing.md)
+  and published in a model report listed in [benchmarks.md](benchmarks.md) count
+  as benchmarks.
 - Diagrams are intentionally textual so they remain readable in terminals,
   code review, and generated documentation.
 - All measurements must record the model file, quantization, ROCm/driver

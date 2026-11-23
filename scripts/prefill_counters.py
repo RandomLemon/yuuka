@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reduce rocprofv3 databases to the per-MMA prefill table of docs/benchmarks.md.
+"""Reduce rocprofv3 databases to the per-MMA prefill table of docs/benchmarks/qwen3.5_4b.md.
 
 The reduction pairs ``gemm_mmq`` dispatches with ``yuuka_prefill_sweep`` cells in
 submission order. The sweep submits every cell seven times (two warmups plus
@@ -63,7 +63,7 @@ STALL_COUNTERS = (
 
 FOCUS = {"dtype": "Q4_K", "rows": 512, "n_out": 9216, "n_in": 2560}
 
-# Recorded 2026-11-18 attribution from docs/benchmarks.md. These are
+# Recorded 2026-11-18 attribution from docs/benchmarks/qwen3.5_4b.md. These are
 # printed as a comparison column only; they are not gates.
 RECORDED_YUUKA = {
     "valu_per_mma": 24.8,
@@ -654,7 +654,7 @@ def main(argv=None):
                     f"LDS/wave {format_value(reference_metrics.get('lds_per_wave'))})"
                 )
         print(
-            "\ndelta is against the 2026-11-18 attribution in docs/benchmarks.md; "
+            "\ndelta is against the 2026-11-18 attribution in docs/benchmarks/qwen3.5_4b.md; "
             "achieved TF/s also moves with clock state and code "
             "revision, so only the counters are expected to match."
         )

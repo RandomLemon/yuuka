@@ -149,7 +149,7 @@ type Options struct {
 	// PrequantizedInt8 submits one Q8_1 quantization operation per activation
 	// group instead of letting each int8 matvec block quantize the row itself.
 	// It exists so the two activation sources can be measured against each other;
-	// the fused form is the selected one (docs/benchmarks.md).
+	// the fused form is the selected one (docs/benchmarks/qwen3.5_4b.md).
 	PrequantizedInt8 bool
 	// NoResidualFusion keeps the decode matvec that ends a sub-layer and the
 	// separate residual ADD as two operations instead of letting the matvec add

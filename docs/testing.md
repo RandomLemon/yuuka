@@ -189,7 +189,7 @@ comparison between two non-identical routes therefore sits on that noise floor:
 between its arms, measures 0.18-0.25 at 2048 tokens instead of 0.0132 and is
 gated at 0.3 with the top-1 token still required to match. This is the accuracy regime that
 llama.cpp's default K-quant prefill path runs in. See
-[benchmarks.md](benchmarks.md#isolated-kernels).
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#isolated-kernels).
 
 The qwen35moe 8:1 F16 grouped-head route is a stronger case of the same effect.
 Its attention output stays within the native 5e-3 bound, but an FP16-staged
@@ -361,7 +361,8 @@ NPU support is a future task and is not part of Phase 5 acceptance. The
 | Comparison | llama.cpp HIP, llama.cpp Vulkan (same GGUF) |
 
 Not every combination needs to run on every commit. For the first release, the
-release gate is the recorded subset in [benchmarks.md](benchmarks.md):
+release gate is the recorded subset in the
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md):
 prompt-length prefill curves at 128-32768 tokens and the 128/256-token decode
 matrix at a 128-token prompt. The remaining concurrency and quantization rows
 are tracked performance work for the features they cover; they do not block the
@@ -371,19 +372,10 @@ single-request GPU-only release. A smaller tracked subset runs regularly.
 
 ### 6.1 Required metadata
 
-Record at minimum:
-
-- model name, file hash, and quantization preset;
-- per-tensor dtype summary, if the preset is mixed;
-- tokenizer and chat-template version;
-- prompt set and token lengths;
-- ROCm version, HIP runtime, kernel/driver version, and firmware;
-- gfx target and device name;
-- host CPU, memory configuration, and power/thermal profile;
-- code commit, kernel version, and dispatch-table version;
-- sampling parameters and seed;
-- warmup iterations and measurement repetitions;
-- concurrent request schedule and arrival pattern.
+The required report metadata, including the model file name and hash,
+environment, versions, build, and protocol fields, is defined in
+[benchmarks.md](benchmarks.md#model-identity-and-environment). Every benchmark
+run records those fields; a result without them is an anecdote, not a result.
 
 ### 6.2 Procedure
 
@@ -407,7 +399,7 @@ test. A kernel that is wrong by a factor of `decay` agrees with a correct kernel
 to 1.6e-5 when `decay` is 0.997 and differs by 2.6e-4 when it is 0.75, so a test
 written against the first input would have accepted a wrong gated delta-net
 kernel; the case is recorded in
-[benchmarks.md](benchmarks.md#gated-delta-net). The rules:
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#gated-delta-net). The rules:
 
 - For every decay, gate, scale, or mask the kernel applies, pick at least one
   test value where applying it and not applying it differ by far more than the
@@ -438,7 +430,8 @@ Per-operation attribution is a diagnostic step, not a benchmark result.
 with HIP events around every plan operation. It is opt-in through
 `YUUKA_TEST_MODEL`, and `YUUKA_TEST_KV=f16` selects the F16 KV pool. Use it to
 rank work; confirm any accepted change with the protocol above and report it in
-[benchmarks.md](benchmarks.md). The current attribution is the prefill
+the model's benchmark report listed in [benchmarks.md](benchmarks.md). The
+current attribution is the prefill
 diagnostic described below.
 
 `rocprofv3` cannot profile a Go process. It writes its result database from a
@@ -471,7 +464,7 @@ operation, resolves each operation to the model buffer it reads, and prints the
 per-operation, per-tensor, and per-dtype tables plus one line per plan index
 sorted by time. It is opt-in through `YUUKA_TEST_MODEL`, and it gates the result
 against the recorded attribution of
-[benchmarks.md](benchmarks.md#decode-gap-attribution): the plan must hold
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decode-gap-attribution): the plan must hold
 the recorded 355 operations, the profiled total must stay inside a wide band
 around the recorded 17.100 ms, and the matvec share must stay within five points
 of the recorded share. The bands are wide because device clocks are not pinned,
@@ -489,7 +482,7 @@ because they add quantization operations and drop fusions by design.
 The operation count is exact because it is structural, so a plan change is
 always visible, and a change that moves the attribution outside the bands has
 to re-record the constants and the document rather than pass silently. The
-per-fusion history is in [benchmarks.md](benchmarks.md#decode-fusion). Event
+per-fusion history is in [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decode-fusion). Event
 instrumentation adds a submission gap per operation, so the totals exceed a
 release run and are a diagnosis, not a benchmark result.
 
@@ -582,25 +575,10 @@ launch cost, which is the quantity the matvec fusions target.
 
 ## 8. Reporting template
 
-| Field | Value |
-| --- | --- |
-| Date / commit | |
-| Model / hash | |
-| Quantization | |
-| Backend / ROCm / driver | |
-| Device / power profile | |
-| Prompt tokens / output tokens | |
-| Concurrency | |
-| TTFT P50 / P95 / P99 | |
-| TPOT P50 / P95 / P99 | |
-| Prefill tok/s | |
-| Decode tok/s (per request / aggregate) | |
-| Effective weight GB/s | |
-| Peak memory | |
-| Correctness status | |
-| Notes / throttling | |
-
-A benchmark result without this metadata is an anecdote, not a result.
+The report layout, section order, and per-table fields are defined in
+[benchmarks.md](benchmarks.md#report-structure). Every model report records the
+model identity block and the protocol row for each table. A benchmark result
+without that metadata is an anecdote, not a result.
 
 ## 9. Regression gates
 

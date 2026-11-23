@@ -13,7 +13,7 @@ decode attention, convolution state, gated delta-net recurrence, embedding,
 SwiGLU, residual add, and copy are implemented and validated against CPU
 references. Batched GEMV
 reuses each packed weight element across up to 16 rows; its measured thresholds
-are recorded in [benchmarks.md](benchmarks.md), and
+are recorded in [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md), and
 `backend/hip.SelectPrefillPath` chooses the batched path for the small row
 classes it covers.
 
@@ -224,7 +224,7 @@ row, either writing both rows or forming `silu(A x) * (B x)`, which replaces
 choices; the plain form stays for the int8 and per-row routes.
 
 Three shapes of this idea were measured and rejected
-([benchmarks.md](benchmarks.md#decode-fusion)): eight output
+([Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decode-fusion)): eight output
 channels per wave (28% slower, the wider wave spills), a 512-value K step (7%
 slower, the staging tile costs more than the barriers it removes), and a pair that
 dispatches the decoder at run time so the two matrices could mix dtypes (40%
@@ -243,7 +243,7 @@ activation group, which takes the remapped one-row kernel). On the remapped
 mapping it measures 175.3 GB/s in step against 176.6 for the FP32 route and is
 0.67 ms slower per decode step, because it loses the gate/up pair fusion and
 pays for the activation quantizations. The FP32 route stays selected; the
-numbers are in [benchmarks.md](benchmarks.md#int8-decode-matvec).
+numbers are in [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#int8-decode-matvec).
 
 Numerics. The per-row kernel sums a strided set of K values per thread and
 reduces over the block; the streaming kernel sums four neighbours per lane and
@@ -333,7 +333,7 @@ taken yet.
 
 Inside the decode step the same kernels run at 94-187 GB/s rather than the
 isolated figures, because a token rotates through 2.7 GB of weights and every
-matrix is cold in the 32 MB MALL ([benchmarks.md](benchmarks.md#decode-matvec)).
+matrix is cold in the 32 MB MALL ([Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decode-matvec)).
 
 ### 5.4 Q4_0 and Q5_0
 
@@ -456,7 +456,7 @@ destination forces that reduction through FP16 (1.1-1.5e-3 measured against
 was also measured: it halves the weight-tile reloads but needs a two-half
 epilogue for the 24 KiB staging alias, and it loses on tall-`K` shapes where the
 extra CTA count matters more. All of these are recorded in
-[benchmarks.md](benchmarks.md#decisions-and-rejected-routes).
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decisions-and-rejected-routes).
 
 The 64x64/K32 variant is selected for `rows >= 64` when `K <= N`; the 32x64
 variant remains selected for tall-K projections and smaller batches. Tall-K was
@@ -476,14 +476,14 @@ reports 42-43 VGPRs, 25-46 SGPRs, 14 KiB static LDS, no spills, and 16
 waves/SIMD. Measured on 2026-11-16 with the same binary pair, `M = 512` shapes
 improve 48-50% for Q4_K, 49-54% for Q5_K, 32-49% for Q8_0, 3-23% for Q6_K, and
 14-27% for F16, and the 512-token prefill moved from 544 to 881 tok/s at the
-time of that change. See [benchmarks.md](benchmarks.md#isolated-kernels).
+time of that change. See [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#isolated-kernels).
 
 The int8 MMQ route (6.3) now carries K-quants from 128 rows up, so the current
 numbers for the wide shapes come from it: 17.3-18.3 TFLOP/s on Q4_K
 `2560 -> 9216` at `M = 512` against 8.4 for this WMMA tile, and a 512-token
 prefill of 1612 tok/s end to end against llama.cpp's 2346 tok/s on the same
 device. The gap record is in
-[benchmarks.md](benchmarks.md#llamacpp-comparison).
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#llamacpp-comparison).
 
 A CTA-order experiment that mapped consecutive blocks to M tiles was measured
 and rejected: it reduced the tall-K time but raised the wide-projection time,
@@ -574,7 +574,7 @@ which keeps two blocks resident per CU (measured `OccupancyPercent` 45.6%
 against 23.9%), and the staging stalls of one block are covered by the other
 block's MMAs. A 256-value step needs 60 KiB and one block, and a 64-value step
 adds enough barriers to lose the tall-K shapes; both were measured and rejected
-(see [benchmarks.md](benchmarks.md#decisions-and-rejected-routes)).
+(see [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decisions-and-rejected-routes)).
 
 The Q4_K/Q5_K scale (one per 32 values) is applied after each pair of 16-wide
 slices, which is exact because the int32 partial sum is exact and the scale is
@@ -614,7 +614,7 @@ warmups, including the Q8_1 pass): Q4_K 17.3-18.3, Q5_K 17.5-18.1, and Q6_K
 12.4-14.4 TFLOP/s across the three shapes, against 13.5-14.1, 12.6-13.4, and
 11.0-11.6 TFLOP/s before the layout and occupancy change. At this baseline,
 the generic route ran 1.2–1.3× below llama.cpp's MMQ kernel on the same
-device. [Measured attribution](benchmarks.md#prefill-gemm)
+device. [Measured attribution](benchmarks/qwen3.5_4b.md#prefill-gemm)
 
 The q/k/v and qkv/gate groups read the same normalized tile, so the plan
 quantizes it once per group instead of once per projection
@@ -705,7 +705,7 @@ with the shared Q8_1 activation scale.
 
 Dispatch is based on `M`, `N`, `K`, quantization type, and the measured row
 class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
-[benchmarks.md](benchmarks.md).
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md).
 
 | Condition | Selected path |
 | --- | --- |
@@ -757,7 +757,7 @@ GDN, paired `Q8_0` WMMA, `Q6_K` Direct MMQ, and 8-tile workgroup swizzle
 additions (`9aaf432`), F16 KV prefill reaches `~2610–2624 tok/s` at 512 tokens
 and leads official `llama.cpp v1.0.0` by `+12.4%` to `+17.6%` across `128–8192`
 tokens. The recorded benchmark status is in
-[benchmarks.md](benchmarks.md#prefill-prompt-length).
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#prefill-prompt-length).
 
 ### 6.5 Streaming LM head
 
@@ -860,7 +860,7 @@ GEMV's vectorized path is still ahead at 1024 (0.022 ms against 0.035 ms). The
 threshold stays at 1024 because one number covers every dtype without
 regressing Q8_0, which is level there, and because no model shape sits in the
 512-1536 range: an output projection is vocabulary sized. The table is in
-[benchmarks.md](benchmarks.md#decode-matvec).
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decode-matvec).
 
 Numerics of the decode route. The per-row GEMV sums a strided set of K values
 per thread and reduces over the block; the streaming kernel sums four
@@ -1063,7 +1063,7 @@ and removing that spill was most of the 1.5x the stage measured.
 
 Crossover and measurements. Isolated prefill attention, one layer, FP32 pool,
 median of 20 launches after a warmup (full table in
-[benchmarks.md](benchmarks.md#prefill-attention)):
+[Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#prefill-attention)):
 
 | Shape | Tiled | MMA |
 | --- | ---: | ---: |
@@ -1580,7 +1580,7 @@ far from one on purpose: with a decay of 0.997 a missing factor on `S^T k`
 produces a 1.6e-5 difference, and with 0.75 it produces 2.6e-4, which the 1e-5
 bound rejects.
 
-Measured design choice ([benchmarks.md](benchmarks.md#gated-delta-net)): the
+Measured design choice ([Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#gated-delta-net)): the
 register-resident form
 reaches 375 GB/s of state traffic against 125 GB/s for a shared-memory-resident
 form of the same recurrence, because a 64 KB state fills the workgroup shared
@@ -1655,7 +1655,7 @@ registry to consult at runtime.
 
 Dispatch decisions are offline. Thresholds measured on gfx1151 are encoded in
 `backend/hip.SelectPrefillPath`, keyed by dtype, shape class, and row class, and
-recorded with the measurement environment in [benchmarks.md](benchmarks.md).
+recorded with the measurement environment in [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md).
 There is no runtime autotuner. Adding a device requires re-running the sweeps
 and updating the selector and tests.
 
@@ -1702,10 +1702,10 @@ A kernel is not complete until:
 - [x] Its relevant shape classes are covered by a benchmark or profile.
 - [x] Its VGPR, LDS, scratch, and occupancy figures are recorded for the Phase
       0-3 kernel families (`scripts/kernel_resources.sh`, results in
-      [benchmarks.md](benchmarks.md)).
+      [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md)).
 - [x] New Phase 5 kernels have recorded VGPR, LDS, and occupancy figures for the
       GEMV, WMMA, and MoE variants (`scripts/kernel_resources.sh`, results in
-      [benchmarks.md](benchmarks.md)).
+      [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md)).
 - [x] The planner selects it; quantized GEMV and GEMM have measured fallbacks.
 - [x] It is integrated into an end-to-end model run.
 - [x] It does not regress a previously accepted shape class.

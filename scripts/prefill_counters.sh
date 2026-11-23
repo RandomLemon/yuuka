@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the prefill counter attribution of docs/benchmarks.md.
+# Reproduce the prefill counter attribution of docs/benchmarks/qwen3.5_4b.md.
 #
 # Run build/yuuka_prefill_sweep under rocprofv3 with the
 # instruction counters and again with the stall/occupancy counters, optionally

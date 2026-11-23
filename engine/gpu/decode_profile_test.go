@@ -23,7 +23,7 @@ import (
 // decode attention was split over the key range and the matvec was remapped to
 // one wave per row, and 17.1 ms after the norms were rewritten around a wave
 // reduction and the beta/alpha projections were merged. The measured history
-// stays in docs/benchmarks.md.
+// stays in docs/benchmarks/qwen3.5_4b.md.
 const (
 	decodeBaselineOps     = 355
 	decodeBaselineTotalMS = 17.070
@@ -40,7 +40,7 @@ const (
 )
 
 // TestGPUProfileDecode attributes one decode step per planned operation and per
-// tensor. It reproduces the attribution tables of docs/benchmarks.md and gates
+// tensor. It reproduces the attribution tables of docs/benchmarks/qwen3.5_4b.md and gates
 // the result against the recorded attribution. Event instrumentation adds
 // a submission gap per operation, so the absolute numbers are a diagnosis, not
 // a release measurement; see docs/testing.md section 6.3.
@@ -406,7 +406,7 @@ type decodeDTypeRow struct {
 }
 
 // decodeCodeRow aggregates by operation code, which is the per-operation table
-// of docs/benchmarks.md.
+// of docs/benchmarks/qwen3.5_4b.md.
 type decodeCodeRow struct {
 	code uint32
 	ops  int
@@ -570,21 +570,21 @@ func checkDecodeGates(t *testing.T, r *decodeReport) {
 	t.Helper()
 	if got := len(r.samples); got != decodeBaselineOps {
 		t.Fatalf("the decode step runs %d operations, the recorded attribution is %d;"+
-			" update the attribution in docs/benchmarks.md before changing the plan shape", got,
+			" update the attribution in docs/benchmarks/qwen3.5_4b.md before changing the plan shape", got,
 			decodeBaselineOps)
 	}
 	if r.total < decodeTotalLowRatio*decodeBaselineTotalMS ||
 		r.total > decodeTotalHighRatio*decodeBaselineTotalMS {
 		t.Fatalf("profiled decode step is %.3f ms, which is outside the recorded"+
 			" %.1fx..%.1fx band of %.3f ms; re-record the attribution in"+
-			" docs/benchmarks.md for this device", r.total,
+			" docs/benchmarks/qwen3.5_4b.md for this device", r.total,
 			decodeTotalLowRatio, decodeTotalHighRatio, decodeBaselineTotalMS)
 	}
 	share := r.matmul / r.total
 	baselineShare := decodeBaselineGemvMS / decodeBaselineTotalMS
 	if share < baselineShare-decodeShareTolerance || share > baselineShare+decodeShareTolerance {
 		t.Fatalf("the GEMV family is %.1f%% of the decode step, the recorded attribution"+
-			" is %.1f%%; a change moved the bottleneck, so update docs/benchmarks.md"+
+			" is %.1f%%; a change moved the bottleneck, so update docs/benchmarks/qwen3.5_4b.md"+
 			" and the gate bands", 100*share, 100*baselineShare)
 	}
 	t.Logf("gate: %d operations (recorded %d), total %.3f ms (recorded %.3f ms),"+

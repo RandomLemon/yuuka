@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Reproduce the decode matvec attribution of docs/benchmarks.md.
+# Reproduce the decode matvec attribution of docs/benchmarks/qwen3.5_4b.md.
 #
 # One command for both halves of the attribution:
 #
 # 1. run build/yuuka_gemv_decode_sweep once unprofiled, then trace it with
 #    rocprofv3 kernel tracing and the instruction counters, and reduce both to
-#    the per-shape GB/s table of docs/benchmarks.md with the per-weight
+#    the per-shape GB/s table of docs/benchmarks/qwen3.5_4b.md with the per-weight
 #    instruction counts. The sweep keeps every matrix resident, so its numbers
 #    are the hot-matrix upper bound.
 # 2. run the rows = 1 output-projection crossover sweep, the measurement behind

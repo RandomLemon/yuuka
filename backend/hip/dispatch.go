@@ -45,7 +45,7 @@ func (p PrefillPath) String() string {
 // shape. Small K-quant row blocks can use FP32 streaming. Wider blocks
 // retain FP16-operand WMMA until the Q8_1 MMQ threshold at 128 rows.
 // F16 weights also use rocBLAS for the shape classes measured in
-// docs/benchmarks.md.
+// docs/benchmarks/qwen3.5_4b.md.
 func SelectPrefillPath(dtype tensor.DType, rows, nIn, nOut int64) PrefillPath {
 	if rows <= 0 {
 		return PrefillBatchedGemv
@@ -134,7 +134,7 @@ const MoEMMQMaxTileJ = 128
 // prefill chunk stays on the FP32 grouped route. Everything else falls back to
 // the Q8_1 dp4a route for the IQ codebooks and to the FP32 grouped route
 // otherwise. These are plan-build-time decisions; the measured stage times that
-// motivate them are in docs/benchmarks.md and
+// motivate them are in docs/benchmarks/qwen3.5_4b.md and
 // docs/benchmarks/qwen3.6_35b_a3b.md.
 //
 // forceQ8 keeps the Q8_1 dp4a route for the routed experts (Options.ForceMoEQ8).
@@ -214,7 +214,7 @@ func moeAssignmentTile(rows int64) int64 {
 // an output projection. The kernel serves 1..16 rows and streams every packed
 // weight row once, which is what makes both output tails bandwidth bound
 // instead of latency bound; it is measured against the per-row GEMV in
-// docs/benchmarks.md. The prefill tail and the decode tail use it directly, and
+// docs/benchmarks/qwen3.5_4b.md. The prefill tail and the decode tail use it directly, and
 // SelectDecodeGemvPath uses it for the whole decode matvec family; any shape it
 // does not cover keeps the per-row GEMV, which stays the documented fallback
 // rather than a silent substitution.
@@ -315,13 +315,13 @@ func (p DecodeGemvPath) String() string {
 // cannot serve (a K step that is not 512 values, an unsupported dtype, or more
 // than one row). Sharing one predicate keeps the two tails and the layer
 // matvecs from drifting apart; the crossover measurement is in
-// docs/benchmarks.md.
+// docs/benchmarks/qwen3.5_4b.md.
 //
 // The FP32 streaming kernel is the selected route for every dtype. The int8
 // route is implemented and reachable through int8Matvec, and it is measured
 // slower end to end on gfx1151: the decode step reads one row of weights per
 // matvec and is not instruction bound, so the ALU saving does not pay for the
-// activation quantization the route needs (docs/benchmarks.md).
+// activation quantization the route needs (docs/benchmarks/qwen3.5_4b.md).
 // It stays available so that measurement is reproducible and so a device or a
 // later fusion can be re-evaluated against it.
 //

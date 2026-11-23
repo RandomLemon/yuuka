@@ -515,11 +515,12 @@ per layer per step, which gives the step count.
   GGUFs are not measured for this model.
 - The routed expert stage streams 9.06 GB of unique weight bytes at 155 GB/s for
   a 128-row chunk and 64 GB/s for a 512-row chunk, against the 244 GB/s read
-  ceiling of [benchmarks.md](../benchmarks.md). The 512-row loss is the work
+  ceiling of [the Qwen3.5-4B report](qwen3.5_4b.md#decode-matvec). The 512-row loss is the work
   around the weight pass (two token tiles of MMA, four times the gathered
   activation bytes, and four times the expert-output writes), not the read
   itself; the fused gate/up/SwiGLU/quantize epilogue that would remove the
   intermediate gate/up tiles is not implemented.
-- The prefill protocol of the repository is owned by
-  [benchmarks.md](../benchmarks.md); this file adds one model to it and does not
-  redefine it.
+- The benchmark protocol is owned by
+  [testing.md](../testing.md#6-benchmark-protocol) and the report layout by
+  [benchmarks.md](../benchmarks.md); this file adds one model to them and does
+  not redefine them.

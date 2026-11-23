@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the decode comparison against llama.cpp recorded in docs/benchmarks.md.
+# Reproduce the decode comparison against llama.cpp recorded in docs/benchmarks/qwen3.5_4b.md.
 #
 # One command for the two halves of the comparison:
 #
@@ -47,7 +47,7 @@ usage() {
     cat <<'EOF'
 usage: decode_compare.sh --model PATH [options]
 
-Print the decode comparison tables recorded in docs/benchmarks.md.
+Print the decode comparison tables recorded in docs/benchmarks/qwen3.5_4b.md.
 
   --model PATH        GGUF both engines read. Its SHA-256 must match the recorded
                       comparison hash. Defaults to $YUUKA_TEST_MODEL.

@@ -114,7 +114,7 @@ func TestGPUAttentionPathsAgree(t *testing.T) {
 		// gate matches the tolerance the KV-format test uses; the long-prompt
 		// gate matches the Q8_1 route's measured sensitivity, which moves logits
 		// by the same amount as changing the KV storage format on one kernel.
-		// The measurements are recorded in docs/benchmarks.md.
+		// The measurements are recorded in docs/benchmarks/qwen3.5_4b.md.
 		if top1(got) != top1(baseline) || maxDiff > gate {
 			t.Fatalf("%s attention exceeds the %g model-level logit gate (%.6g)",
 				a.name, gate, maxDiff)
