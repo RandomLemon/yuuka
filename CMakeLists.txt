@@ -27,6 +27,10 @@ if(YUUKA_ENABLE_HIP)
     endif()
     enable_language(HIP)
     set_source_files_properties(backend/hip/bridge/bridge.cpp PROPERTIES LANGUAGE HIP)
+    if(CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
+        set_source_files_properties(kernels/hip/gemm/wmma_gemm.hip PROPERTIES
+                                    COMPILE_DEFINITIONS YUUKA_DIRECT_FP16_WMMA)
+    endif()
     add_library(yuuka_hip SHARED
         backend/hip/bridge/bridge.cpp
         kernels/hip/attention/attention.hip

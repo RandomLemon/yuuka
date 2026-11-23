@@ -220,10 +220,11 @@ Requirements and current behavior:
   opt-in F32 and Q8_0 pools for the `qwen35` and `qwen35moe` CPU and HIP
   backends. The prefix-cache model key includes the format, and the F32 path
   remains the numerical baseline.
-- HIP paged prefill attention runs the FP16 MMA kernel for F32 and F16 pools
-  once the chunk has 64 rows or the context reaches 256 tokens; Q8_0 pools,
-  other head widths, and shorter chunks use the tiled kernel. Both read the
-  same paged KV layout, and decode attention is unchanged. The retired rocBLAS
+- HIP paged prefill attention runs the FP16 MMA kernel (and measured split-key
+  attention for long prefixes) across `F32`, `F16`, and packed `Q8_0` pools on
+  covered shapes and position cutoffs; unsupported head widths, `Q8_0` early
+  prefixes, and short chunks fall back to the tiled kernel. Both read the same
+  paged KV layout, and decode attention is unchanged. The retired rocBLAS
   path stays behind `LegacyBlasAttention` for A/B measurement only.
 - Configurable block size; the server and benchmark default to 16 tokens.
 - One allocator per model with a fixed block count derived from context and
@@ -270,6 +271,10 @@ request.
 - **Payload:** block references covering the prompt, the recurrent
   convolution/matrix state snapshot at the prompt boundary, and the logits for
   the last prompt token. The logits let a full-prompt hit sample immediately.
+  Requests with prefix caching enabled capture both after attempting to emit
+  the first sampled token and before the first decode step. A stop token, a
+  one-token limit or a sink error still captures the prompt boundary.
+  Requests with caching disabled skip the snapshot and serialization.
 - **Partial final block:** when the prompt is not block-aligned, the cache owns
   the original partial block and the request receives a private copy, so later
   decode writes cannot corrupt the cached KV.
@@ -320,8 +325,10 @@ shapes where host launch overhead is measured to matter.
 The CLI supports loading a GGUF model, single-prompt generation (including
 stdin input), inspection, benchmark, and a diagnostic NPU-probe mode.
 `yuuka run` and `yuuka bench` accept
-`--kv-type f32|f16|q8_0` for `qwen35` and `qwen35moe` on both backends. They also
-accept `--speculative`,
+`--kv-type f32|f16|q8_0` for `qwen35` and `qwen35moe` on both backends, and
+automatically select 1024-token chunks for `1024–8192` input tokens on the
+verified `gfx1151` `Qwen3.5-4B Q4_K_M` F16 KV configuration unless
+`--chunk-size` is specified explicitly. They also accept `--speculative`,
 `--spec-max-draft`, and `--spec-min-match`. `--npu` records the NPU capability
 result and falls back to the selected backend; it is diagnostic only, and NPU
 support is a future task.

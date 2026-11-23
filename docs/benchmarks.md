@@ -86,9 +86,9 @@ Current tree, same commit:
 
 | Check | Result |
 | --- | --- |
-| `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE) | 9 / 9 pass |
+| `ctest --test-dir build` (native ABI, quantized GEMV, operators, GEMM, prefill, paged KV/graph, embedding, MoE, deltanet, plan validation; 10 / 10 at `9aaf432`, 9 / 9 at `d56ad88`) | 10 / 10 pass |
 | `TestGPUChunkedPrefillLongContext`, 1024 real-model tokens, chunks 128/512/1024 | top-1 `33075` in all three; maximum logit difference 0 against the chunk-128 reference |
-| `TestGPUMatchesCPU` | first-step maximum logit difference `0.00309944`, greedy tokens match |
+| `TestGPUMatchesCPU` | first-step maximum logit difference `0.00004673` with short-chunk FP32 streaming, greedy tokens match |
 | `tests/hip/prefill_test.cpp` MMQ checks | Q8_1 digits identical to the host quantizer; GEMM maximum absolute difference `6.9e-5` (Q4_K) and `1.5e-4` (Q5_K) against the CPU product |
 | `tests/hip/prefill_test.cpp` LM head checks | every dtype within `1.3e-4` of the host dot products for 1/3/16 rows, bitwise reproducible |
 | `TestPlanLMHeadMatchesDequant` | Q8_0 bitwise equal to the dequantized CPU dot; Q6_K within `2e-6` |
@@ -103,8 +103,32 @@ regime llama.cpp's K-quant prefill also runs in.
 
 ## Prefill: prompt length
 
-`yuuka bench --backend hip --decode-tokens 1 --chunk-size 512 --kv-type f32`,
-F32 KV unless stated, median of five repetitions:
+### Current prefill status (commit `9aaf432`)
+
+After Phase 1 and Phase 2 prefill work (`9aaf432`, F16 KV, greedy, `power=auto`,
+`concurrency=1`, matched integer prompt tokens vs official `llama.cpp v1.0.0`
+`b1b770d90`, two interleaved reversed-order rounds, `2` warmups and `5` timed
+prefills per process, `3` at `8192`):
+
+| Prompt | Chunk (`yuuka` / `llama.cpp`) | Round 1 / 2 `yuuka` p50 (ms) | Round 1 / 2 `llama.cpp` p50 (ms) | Throughput gain | Top-1 |
+| ---: | :---: | ---: | ---: | ---: | :---: |
+| 128 | 128 / 128 | 59.081 / 59.499 | 68.533 / 67.957 | **+16.00% / +14.21%** | Match |
+| 512 | 512 / 512 | 195.141 / 196.271 | 228.578 / 230.809 | **+17.13% / +17.60%** | Match |
+| 2048 | 1024 / 512 | 808.156 / 811.868 | 937.983 / 939.982 | **+16.06% / +15.78%** | Match |
+| 8192 | 1024 / 256 | 3685.340 / 3703.992 | 4163.147 / 4163.955 | **+12.97% / +12.42%** | Match |
+
+Phase 2 also eliminated the non-power-of-two and short-chunk cliffs (`1..16` FP32
+streaming, `17..127` Direct FP16 WMMA, `>= 128` arbitrary-row Direct MMQ, `>= 2`
+prepared GDN), sped up `8192`-token `Q8_0` KV prefill from `1105 tok/s` to
+`2114–2122 tok/s` (unsplit WMMA + split-key), reduced `16384`-token `F32` KV
+prefill by `~6.3%` via split-key attention, and moved prefix-cache snapshots off
+the critical path of the first SSE token (`yuuka-server`).
+
+### Baseline prompt-length sweep (commit `d56ad88`)
+
+The historical pre-Phase-1/Phase-2 baseline uses five repetitions and reports
+their median. Select F32 explicitly with
+`yuuka bench --backend hip --decode-tokens 1 --chunk-size 512 --kv-type f32`.
 
 | Prompt tokens | F32 KV p50 | F32 tok/s | F16 KV p50 | F16 tok/s | Q8_0 KV p50 | Q8_0 tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -120,9 +144,10 @@ gave 1345.1 / 1626.2 / 1673.9 / 1409.2 tok/s at the four lengths, so the stage i
 +12.4% / +8.0% / +1.9% / +2.0%. The gain follows the 8.4 ms the tail saves per
 chunk, which is a larger share of the shorter prompts. F32 and F16 KV are within
 4% of each other at every length, because both run the same attention kernel;
-Q8_0 keeps the tiled kernel and diverges from 2048 tokens, where attention
-starts to dominate. The F16 and Q8_0 rows are the pre-LM-head measurements and
-were not repeated.
+Q8_0 used tiled attention in these samples and diverged from 2048 tokens.
+The F16 and Q8_0 columns are the pre-LM-head measurements. In later paired
+`Q8_0` WMMA runs at `8192` tokens (`chunk=512`), unsplit `Q8_0` WMMA reached
+`2114–2122 tok/s` against `1105 tok/s` on the tiled kernel.
 
 Before this stage the same table read 1380.1 / 1704.8 / 1715.2 / 1441.7 tok/s for
 F32 KV at `161fbba`. That earlier row was measured after the FP16 MMA prefill
@@ -133,26 +158,13 @@ current ones by 0.5-1.6% at the longer prompts, which is the run-to-run noise of
 an unpinned clock on this device, so the same-session A/B above is the number to
 compare the LM head stage against.
 
-The [Q4_K FFN specialization acceptance](prefill-optimization/acceptance/02-q4-ffn.md)
-records the 2026-11-19 gfx1151 prefill comparison using F16 KV,
-including isolated MMQ, complete FFN and prompt-length medians.
-The [final FFN acceptance](prefill-optimization/acceptance/03-final-ffn.md)
-records the next F16 KV comparison, with one FFN row in the ordinary
-prefill output tail.
-The [MMQ shape expansion](prefill-optimization/acceptance/04a-mmq-shapes.md)
-records projection shape medians and the short- and long-prompt A/B.
-The [prepared GDN comparison](prefill-optimization/acceptance/04b-gdn.md)
-records the recurrence timings and the model-state comparison by lane mapping.
-The [FFN fusion comparison](prefill-optimization/acceptance/05-ffn-fusion.md)
-records the isolated quantizer check, complete FFN time and prompt rates.
-The [final query crop comparison](prefill-optimization/acceptance/06-final-query.md)
-records K/V equivalence, output work per chunk and the resulting prompt rates.
-The [long attention comparison](prefill-optimization/acceptance/07-long-attention.md)
-records split-key numerics, merge costs, scratch and the 8K chunk sweep.
-The [official v1.0.0 matched-input comparison](prefill-optimization/acceptance/08-upstream-comparison.md)
-records host logit latency and the per-length gate. At measured chunk settings
-the prefill leads were +0.61%, +6.61%, +9.04% and +6.69% for 128, 512,
-2048 and 8192 tokens respectively.
+Successive Phase 1 stages on `gfx1151` with F16 KV added `Q4_K` FFN MMQ
+specialization, final-layer FFN cropping, expanded Direct MMQ projection shapes,
+prepared GDN recurrence, fused `SwiGLU + Q8_1` activation quantization, final
+query cropping after KV write, and split-key long attention. At measured chunk
+settings, the Phase 1 matched-input comparison against official `llama.cpp v1.0.0`
+reached prefill leads of +0.61%, +6.61%, +9.04%, and +6.69% at 128, 512, 2048,
+and 8192 tokens respectively before the Phase 2 improvements above.
 
 ## Decode: output length
 
@@ -833,9 +845,14 @@ extra work; see [kernels.md](kernels.md#91-chunkwise-form).
 
 ## llama.cpp comparison
 
+The table below records the **historical `d56ad88` / `161fbba` baseline** against
+`strix-llama.cpp` (`c8912d7f5`) prior to the Phase 1/2 prefill optimizations; see
+[Current prefill status (`9aaf432`)](#current-prefill-status-commit-9aaf432)
+above for the current prefill comparison against official `llama.cpp v1.0.0`.
+
 `llama-bench -ngl 99 -b 512 -ub 512 -r 3`, F16 KV (llama.cpp's default; its
-`llama-bench` rejects an `f32` KV type), against the yuuka rows from
-[prefill](#prefill-prompt-length) and [decode](#decode-output-length):
+`llama-bench` rejects an `f32` KV type), against the historical `d56ad88` yuuka
+rows from [prefill](#prefill-prompt-length) and [decode](#decode-output-length):
 
 | Test | llama.cpp t/s | yuuka t/s | yuuka/llama |
 | --- | ---: | ---: | ---: |
@@ -861,7 +878,8 @@ The remaining gaps, in order of size:
    further time yuuka does not measure separately here.
 3. Long-context prefill, 1.5x at 8192: the FP16 MMA attention kernel closed
    most of this gap, so what remains is the quantized GEMM plus the delta-net
-   chunk, not attention. Q8_0 KV keeps the tiled kernel and stays at 0.40.
+   chunk in this comparison. Q8_0 KV used tiled attention and measured a
+   0.40 ratio in that historical comparison.
 4. Multi-request decode, 16x aggregate: llama.cpp batches the resident requests
    into one weight pass; yuuka re-reads the weights per request because fused
    mixed-shape decode batching is not implemented.
@@ -1017,10 +1035,11 @@ Each of these is a measured decision that still holds in the current code:
   The 64x64/K32 and 32x64 variants remain the dispatch choice for the paths they
   serve, and the wide K-quant shapes in this report come from the int8 MMQ route
   instead.
-- **Prefill attention is settled on the FP16 MMA kernel** for F32 and F16 pools
-  from 64 rows or a 256-token prefix; the tiled kernel stays for Q8_0, for
-  shapes the MMA kernel does not cover, and below that crossover (measured
-  1.2-2.4x faster there). Staging K transposed per key tile instead of Q once
+- **Prefill attention uses FP16 MMA** for supported F32, F16 and Q8_0 shapes
+  from 64 rows or a 256-token prefix. Q8_0 additionally requires a chunk start
+  at position 512 or later, or 2048 or later for 1024-row parents. Tiled
+  attention covers other shapes and the short prefix (measured 1.2-2.4x
+  faster there for F32). Staging K transposed per key tile instead of Q once
   per workgroup, and keeping the accumulator at 192 registers instead of
   `__launch_bounds__(128, 2)`, were measured and rejected: the first costs 128
   scalar shared-memory loads per key tile, the second spilled 21 slots into the

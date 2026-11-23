@@ -73,6 +73,12 @@ __global__ void lm_head_kernel(float * out, const float * x, const uint8_t * w,
     const bool active = ch0 < n_out;
     const int j0 = 4 * lane;
     const int64_t steps = n_in / kStepK;
+    // The complete 16-row tile can stage four contiguous activations per
+    // lane instead of issuing one scalar load per lane for each row.
+    constexpr bool kKQuant = DType == YUUKA_DTYPE_Q4_K || DType == YUUKA_DTYPE_Q5_K ||
+                             DType == YUUKA_DTYPE_Q6_K;
+    const bool vector_stage = kKQuant && MaxRows == kMaxRows && rows == kMaxRows &&
+                              reinterpret_cast<uintptr_t>(x) % alignof(float4) == 0;
     // An inactive wave keeps a valid pointer so the guarded decode below never
     // forms one past the weight buffer.
     const uint8_t * base = active ? w + ch0 * row_bytes : w;
@@ -87,11 +93,22 @@ __global__ void lm_head_kernel(float * out, const float * x, const uint8_t * w,
     }
 
     for (int64_t step = 0; step < steps; ++step) {
-        for (int64_t m = 0; m < rows; ++m) {
-            const float * src = x + m * n_in + step * kStepK;
-            for (int idx = static_cast<int>(threadIdx.x); idx < kStepK;
-                 idx += kThreads) {
-                xs[m * kStepK + idx] = src[idx];
+        if (vector_stage) {
+            constexpr int kVectorsPerRow = kStepK / 4;
+            auto * tile = reinterpret_cast<float4 *>(xs);
+            for (int idx = threadIdx.x; idx < kMaxRows * kVectorsPerRow; idx += kThreads) {
+                const int m = idx / kVectorsPerRow;
+                const int k = (idx % kVectorsPerRow) * 4;
+                const float * src = x + m * n_in + step * kStepK + k;
+                tile[idx] = *reinterpret_cast<const float4 *>(src);
+            }
+        } else {
+            for (int64_t m = 0; m < rows; ++m) {
+                const float * src = x + m * n_in + step * kStepK;
+                for (int idx = static_cast<int>(threadIdx.x); idx < kStepK;
+                     idx += kThreads) {
+                    xs[m * kStepK + idx] = src[idx];
+                }
             }
         }
         __syncthreads();

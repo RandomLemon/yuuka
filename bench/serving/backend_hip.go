@@ -9,6 +9,6 @@ import (
 )
 
 func newBenchHIPBackend(reader *gguf.Reader, model *qwen35.Model, cfg benchBackendConfig) (serving.Backend, error) {
-	return serving.NewQwen35GPUBackend(reader, model, cfg.ModelKey, cfg.Blocks,
-		cfg.BlockSize, cfg.PrefillChunk, cfg.Graph)
+	return serving.NewQwen35GPUBackendWithKV(reader, model, cfg.ModelKey, cfg.Blocks,
+		cfg.BlockSize, cfg.PrefillChunk, cfg.Graph, cfg.KVFormat.DType())
 }

@@ -195,8 +195,10 @@ Stream tokens / finish / release request resources
 ```
 
 Current status: the HIP `qwen35` path processes prompts through cached chunked
-prefill plans (batched WMMA or rocBLAS GEMM, paged Flash Attention, and paged KV
-writes) and then decodes through the single-token paged plan. The CPU reference
+prefill plans (int8 MMQ with `gfx1151` Direct specialization, Direct/rocWMMA
+FP16 GEMM, FP32 streaming for `1–16` K-quant rows, rocBLAS F16 baseline, paged
+MMA/split-key and tiled attention, prepared/split-register gated delta-net, and
+paged KV writes) and then decodes through the single-token paged plan. The CPU reference
 path processes the prompt one token at a time through the reference operators
 and uses the same paged KV and recurrent-state interfaces, but it does not build
 WMMA, rocBLAS, or Flash Attention plans. The serving scheduler interleaves
@@ -404,6 +406,7 @@ yuuka/
 │   └── hip/                   # C ABI, GEMV, GEMM, operators, paged KV, graph
 ├── bench/
 │   ├── hip/                   # Hardware probe and kernel sweeps
+│   ├── prefill-compare/       # Matched-input prefill driver and llama.cpp runner
 │   └── serving/               # Latency and throughput harness
 ├── scripts/
 ├── docs/

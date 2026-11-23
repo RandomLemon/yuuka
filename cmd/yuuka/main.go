@@ -241,7 +241,7 @@ func runGenerate(args []string) error {
 	thinking := fs.Bool("thinking", false, "enable an open reasoning block in chat mode")
 	contextSize := fs.Int("ctx", 4096, "context capacity")
 	backend := fs.String("backend", "cpu", "execution backend: cpu or hip")
-	chunkSize := fs.Int("chunk-size", 512, "HIP prompt chunk size")
+	chunkSize := fs.Int("chunk-size", defaultChunkSize, "HIP prompt chunk size override (automatic for eligible F16 KV prompts)")
 	maxTokens := fs.Int("max-tokens", 128, "maximum generated tokens")
 	temperature := fs.Float64("temperature", 0, "sampling temperature (0 = greedy)")
 	topK := fs.Int("top-k", 40, "top-k sampling cutoff")
@@ -301,7 +301,8 @@ func runGenerate(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := buildEngine(l, *contextSize, sampler, *backend, *chunkSize, kvFormat)
+	chunk := prefillChunkOption(fs, *chunkSize, len(ids))
+	runner, err := buildEngine(l, *contextSize, sampler, *backend, chunk, kvFormat)
 	if err != nil {
 		return err
 	}
@@ -347,7 +348,7 @@ func runBench(args []string) error {
 	decodeTokens := fs.Int("decode-tokens", 32, "generated tokens per repetition")
 	contextSize := fs.Int("ctx", 0, "context capacity (default: prompt + decode + 64)")
 	backend := fs.String("backend", "cpu", "execution backend: cpu or hip")
-	chunkSize := fs.Int("chunk-size", 512, "HIP prompt chunk size")
+	chunkSize := fs.Int("chunk-size", defaultChunkSize, "HIP prompt chunk size override (automatic for eligible F16 KV prompts)")
 	warmup := fs.Int("warmup", 1, "warmup repetitions")
 	reps := fs.Int("reps", 3, "measured repetitions")
 	hash := fs.Bool("hash", false, "print the model SHA-256")
@@ -392,7 +393,8 @@ func runBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	runner, err := buildEngine(l, capacity, sampler, *backend, *chunkSize, kvFormat)
+	chunk := prefillChunkOption(fs, *chunkSize, len(ids))
+	runner, err := buildEngine(l, capacity, sampler, *backend, chunk, kvFormat)
 	if err != nil {
 		return err
 	}
@@ -475,24 +477,44 @@ func percentile(values []float64, p float64) float64 {
 	return sorted[index]
 }
 
-func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string, chunkSize int, format qwen35.KVFormat) (*engine.Engine, error) {
+const defaultChunkSize = 512
+
+type chunkSizeOption struct {
+	rows         int
+	promptTokens int
+	explicit     bool
+}
+
+func prefillChunkOption(fs *flag.FlagSet, rows, promptTokens int) chunkSizeOption {
+	chunk := chunkSizeOption{rows: rows, promptTokens: promptTokens}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "chunk-size" {
+			chunk.explicit = true
+		}
+	})
+	return chunk
+}
+
+func (c chunkSizeOption) resolve(arch string, cfg *qwen35.Config, quantization string, format qwen35.KVFormat) int {
+	arch, _, _ = strings.Cut(arch, ":")
+	if !c.explicit && arch == "gfx1151" && format == qwen35.KVF16 &&
+		cfg.Architecture == qwen35.Architecture && cfg.BlockCount == 32 &&
+		cfg.HiddenSize == 2560 && cfg.FFNSize == 9216 && quantization == "Q4_K_M" &&
+		cfg.HeadCount == 16 && cfg.KVHeadCount == 4 && cfg.HeadDim == 256 &&
+		c.promptTokens >= 1024 && c.promptTokens <= 8192 {
+		return 1024
+	}
+	return c.rows
+}
+
+func buildEngine(l *loadedModel, capacity int, sampler *engine.Sampler, backend string, chunk chunkSizeOption, format qwen35.KVFormat) (*engine.Engine, error) {
 	switch backend {
 	case "cpu":
 		return l.cpuEngine(capacity, sampler, format)
 	case "hip":
-		runtime, err := newHIPRuntime(l, capacity, format)
+		runtime, err := newHIPRuntime(l, capacity, format, chunk)
 		if err != nil {
 			return nil, err
-		}
-		if chunkSize <= 0 {
-			_ = runtime.Close()
-			return nil, fmt.Errorf("chunk size must be positive")
-		}
-		if configurer, ok := runtime.(interface{ SetPrefillChunk(int) error }); ok {
-			if err := configurer.SetPrefillChunk(chunkSize); err != nil {
-				_ = runtime.Close()
-				return nil, err
-			}
 		}
 		runner, err := engine.NewWithRuntime(runtime, l.tokenizer, sampler)
 		if err != nil {

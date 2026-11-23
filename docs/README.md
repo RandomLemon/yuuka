@@ -95,7 +95,6 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 
 ### Module indexes
 
-- [Qwen prefill optimization](prefill-optimization/README.md) — Implementation stages and verification for single-request prefill against upstream llama.cpp v1.0.0.
 - [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — The matched 512/2048/8192-token `qwen35moe` HIP prefill comparison next to llama.cpp, the per-operation attribution of what changed, the assignment-tile table, and the correctness gates.
 
 ## Implementation status
@@ -124,23 +123,26 @@ Implemented and tested:
   prefill operator family. GEMV and WMMA GEMM are validated for `F32`, `F16`,
   `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, and `Q6_K`; direct embedding tests
   cover `F32`, `Q4_0`, `Q5_0`, and `Q6_K`.
-- rocWMMA FP16 and quantized prefill GEMM with measured 64x64 and 32x64 tile
-  selection, an int8 MMQ route for K-quant weights (Q8_1 activations, exact
-  int32 WMMA accumulation, FP32 scales), a fused gate/up SwiGLU kernel, a
-  streaming channel-parallel matvec that reads each packed weight row once, serves
-  the decode matvec family and both output projections (one wave per four output
-  channels, LDS-staged activation, wave reduction) with an opt-in int8 variant
-  over Q8_1 activations that is measured slower and stays off, a
-  rocBLAS FP16 baseline, causal paged
-  prefill attention with an FP16 MMA kernel for F32 and F16 pools (four query
-  heads per workgroup, 16-key tiles, FP32 online softmax) and a tiled fallback
-  for Q8_0 and short chunks, chunked prefill with per-chunk KV writes, and the
-  measured `SelectPrefillPath` dispatch table.
+- rocWMMA and `gfx1151` quantized prefill GEMM: `int8` MMQ for K-quants from 128
+  rows (`Q4_K`/`Q5_K`/`Q6_K` Direct specialization with masked partial tiles and
+  8-tile workgroup swizzle on wide `Q4_K`/`Q5_K` shapes), fused gate/up SwiGLU
+  with `Q8_1` activation quantization, `gfx1151` Direct FP16 WMMA (and fused
+  SwiGLU) for `17–127` K-quant rows, FP32 `lm_head_stream` for `1–16` K-quant
+  rows, paired `Q8_0` WMMA for `ssm_beta`/`ssm_alpha`, a streaming
+  channel-parallel matvec for decode and tails (with an opt-in int8 variant that
+  stays off), a rocBLAS FP16 baseline, causal paged prefill attention using
+  FP16 MMA (and measured split-key attention for long prefixes) across `F32`,
+  `F16`, and packed `Q8_0` pools with tiled fallback for unsupported shapes,
+  and the measured `SelectPrefillPath` dispatch table.
 - A split-register gated delta-net chunk kernel that keeps the recurrent state
-  resident for the whole chunk. With the int8 MMQ prefill GEMM the 512-token
-  prefill rate is 1324 tok/s, up from 313 tok/s before the delta-net and GEMM
-  work, and position-7680 attention dropped from 2030 ms to 643 ms; the
-  measured status is in [benchmarks.md](benchmarks.md).
+  resident for the whole chunk, paired with a separate pre-normalization/decay
+  pass from 2 rows upward on `gfx1151` (`gdn_prepare_splitreg`). With the
+  Phase 1 and Phase 2 prefill optimizations (`9aaf432`), F16 KV prefill on
+  `Qwen3.5-4B-Q4_K_M` reaches `195.1–196.3 ms` at 512 tokens (`~2610–2624 tok/s`)
+  and leads official `llama.cpp v1.0.0` by `+12.4%` to `+17.6%` across
+  `128–8192` tokens; `yuuka run` and `yuuka bench` default to 1024-token chunks
+  for `1024–8192` tokens on the verified `gfx1151` F16 KV configuration when
+  `--chunk-size` is omitted. See [benchmarks.md](benchmarks.md).
 - HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
   full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
   Decode runs the delta-net layer as a fused pair (one convolution plus L2 norm
@@ -169,7 +171,7 @@ Implemented and tested:
 - End-to-end GPU/CPU comparison on the validated model: greedy token sequences
   match. The decode path's recorded first-step maximum absolute logit
   difference is `4.58e-5` (`TestGPUDecodePathMatchesCPU`); the chunked prefill
-  path reports `3.65e-3` on the same prompt with the same top-1 token. The
+  path reports `4.67e-5` (`TestGPUMatchesCPU`) with the same top-1 token. The
   checked-in tests enforce the token sequence, a loose logit bound, and a
   layer-by-layer hidden-state comparison;
   the worst recorded first-prompt layer difference is `5.53e-5`. Chunked
@@ -239,8 +241,7 @@ rejected at load time.
 - **Hardware bring-up:** [hardware](hardware.md) → [benchmarks](benchmarks.md) →
   [testing](testing.md).
 - **Kernel work:** [kernels](kernels.md) → [testing](testing.md) →
-  [benchmarks](benchmarks.md) →
-  [Qwen prefill implementation plan](prefill-optimization/README.md).
+  [benchmarks](benchmarks.md).
 - **Runtime/service work:** [architecture](architecture.md) →
   [serving](serving.md) → [benchmarks](benchmarks.md).
 - **Model/format work:** [gguf](gguf.md) → [testing](testing.md) →

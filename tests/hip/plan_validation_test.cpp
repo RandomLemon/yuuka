@@ -4,6 +4,7 @@
 #include "yuuka_hip.h"
 
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 
 namespace {
@@ -23,6 +24,91 @@ yuuka_op make_op(uint32_t code, yuuka_buffer * buf) {
     op.code = code;
     for (int i = 0; i < 12; ++i) op.buf[i] = buf;
     return op;
+}
+
+bool test_split_attention_validation(yuuka_device * device, yuuka_buffer * table,
+                                     yuuka_dtype dtype) {
+    constexpr uint64_t heads = 4, head_dim = 256, capacity = 16;
+    constexpr uint64_t scratch_bytes = heads * (4 * (head_dim + 2) + 1) * sizeof(float);
+    const uint64_t pool_bytes = capacity *
+        (dtype == YUUKA_DTYPE_Q8_0 ? head_dim / 32 * 34 : head_dim * sizeof(float));
+    const uint64_t pool_offset = dtype == YUUKA_DTYPE_Q8_0 ? 2 : 16;
+    yuuka_buffer * io = nullptr;
+    yuuka_buffer * pool = nullptr;
+    yuuka_buffer * short_pool = nullptr;
+    yuuka_buffer * scratch = nullptr;
+    yuuka_buffer * short_scratch = nullptr;
+    yuuka_plan * plan = nullptr;
+    bool ok = yuuka_buffer_alloc(device, scratch_bytes, &io) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, pool_offset + pool_bytes, &pool) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, pool_offset + pool_bytes - 1, &short_pool) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, scratch_bytes, &scratch) == YUUKA_OK &&
+              yuuka_buffer_alloc(device, scratch_bytes - 1, &short_scratch) == YUUKA_OK &&
+              yuuka_plan_create(device, &plan) == YUUKA_OK;
+    if (ok) {
+        yuuka_op op{};
+        op.code = YUUKA_OP_ATTENTION_PREFILL_PAGED;
+        op.flags = YUUKA_OP_FLAG_PREFILL_SPLIT_4;
+        op.buf[0] = io;
+        op.buf[1] = op.buf[2] = pool;
+        op.buf[3] = io;
+        op.buf[4] = table;
+        op.buf[6] = scratch;
+        op.off[1] = op.off[2] = pool_offset;
+        op.off[3] = 2 * heads * head_dim * sizeof(float);
+        op.n[0] = 1;
+        op.n[1] = heads;
+        op.n[2] = op.n[3] = head_dim;
+        op.n[4] = 1;
+        op.u[0] = op.u[1] = capacity;
+        op.u[2] = dtype;
+        const auto add = [&](const yuuka_op & desc, yuuka_status status, const char * name) {
+            ok = expect(yuuka_plan_add(plan, &desc), status, name) && ok;
+        };
+        std::printf("Split attention validation dtype=%u\n", dtype);
+        add(op, YUUKA_OK, "split exact-fit pool and scratch");
+        yuuka_op bad = op;
+        bad.buf[1] = short_pool;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split key pool one byte short");
+        bad = op;
+        bad.buf[2] = short_pool;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split value pool one byte short");
+        bad = op;
+        bad.off[1] = 1;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split key pool unaligned");
+        bad = op;
+        bad.buf[6] = short_scratch;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split scratch one byte short");
+        bad.buf[6] = io;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split scratch aliases query");
+        bad.buf[6] = nullptr;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "forced split without scratch");
+        bad = op;
+        bad.off[6] = 1;
+        add(bad, YUUKA_ERR_INVALID_ARGUMENT, "split scratch unaligned");
+        bad = op;
+        bad.n[2] = bad.n[3] = 128;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split unsupported head width");
+        bad = op;
+        bad.u[3] = 1;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split dense query");
+        bad = op;
+        bad.u[2] = YUUKA_DTYPE_Q4_K;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split unsupported KV dtype");
+        bad = op;
+        bad.flags |= YUUKA_OP_FLAG_PREFILL_ATTENTION_TILED;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split with forced tiled flag");
+        bad = op;
+        bad.flags |= 1u << 31;
+        add(bad, YUUKA_ERR_UNSUPPORTED, "split with unknown flag");
+    } else {
+        std::fprintf(stderr, "split validation setup: %s\n", yuuka_last_error());
+    }
+    if (plan != nullptr) yuuka_plan_destroy(plan);
+    for (auto * buf : {io, pool, short_pool, scratch, short_scratch}) {
+        if (buf != nullptr) yuuka_buffer_free(buf);
+    }
+    return ok;
 }
 
 } // namespace
@@ -435,12 +521,51 @@ int main() {
             narrow_in.n[0] = 192;
             ok = expect(yuuka_plan_add(plan, &narrow_in), YUUKA_ERR_UNSUPPORTED,
                         "GEMV_RESIDUAL unaligned input") && ok;
+
+            yuuka_op narrow_pair{};
+            narrow_pair.code = YUUKA_OP_PREFILL_Q8_0_PAIR;
+            narrow_pair.buf[0] = narrow_pair.buf[1] = packed;
+            narrow_pair.buf[2] = narrow_pair.buf[3] = narrow_pair.buf[4] = rows;
+            narrow_pair.off[1] = 2176;
+            narrow_pair.off[3] = 2048;
+            narrow_pair.off[4] = 2240;
+            narrow_pair.n[0] = 128;
+            narrow_pair.n[1] = 16;
+            narrow_pair.n[2] = 3;
+            narrow_pair.u[0] = narrow_pair.u[1] = YUUKA_DTYPE_Q8_0;
+            yuuka_device_info info{};
+            ok = expect(yuuka_device_info_get(device, &info), YUUKA_OK, "device info") && ok;
+            const bool gfx1151 = std::strncmp(info.gcn_arch, "gfx1151", 7) == 0;
+            ok = expect(yuuka_plan_add(plan, &narrow_pair),
+                        gfx1151 ? YUUKA_OK : YUUKA_ERR_UNSUPPORTED,
+                        "PREFILL_Q8_0_PAIR valid disjoint ranges") && ok;
+            if (gfx1151) {
+                yuuka_op invalid = narrow_pair;
+                invalid.off[4] -= 4;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_INVALID_ARGUMENT,
+                            "PREFILL_Q8_0_PAIR overlapping outputs") && ok;
+                invalid = narrow_pair;
+                invalid.off[2] = 4;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_INVALID_ARGUMENT,
+                            "PREFILL_Q8_0_PAIR invalid input alignment") && ok;
+                invalid = narrow_pair;
+                invalid.buf[1] = tiny;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_INVALID_ARGUMENT,
+                            "PREFILL_Q8_0_PAIR truncated weights") && ok;
+                invalid = narrow_pair;
+                invalid.u[1] = YUUKA_DTYPE_F16;
+                ok = expect(yuuka_plan_add(plan, &invalid), YUUKA_ERR_UNSUPPORTED,
+                            "PREFILL_Q8_0_PAIR incompatible dtype") && ok;
+            }
             yuuka_buffer_free(rows);
             yuuka_buffer_free(packed);
         }
         yuuka_buffer_free(wide);
     }
 
+    for (yuuka_dtype dtype : {YUUKA_DTYPE_F32, YUUKA_DTYPE_Q8_0}) {
+        ok = test_split_attention_validation(device, roomy, dtype) && ok;
+    }
     yuuka_plan_destroy(plan);
     yuuka_buffer_free(roomy);
     yuuka_buffer_free(tiny);

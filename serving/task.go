@@ -49,6 +49,7 @@ type generationTask struct {
 
 	promptState    []byte
 	promptLogits   []byte
+	capturePrefix  bool
 	snapshotOK     bool
 	initialHit     bool
 	initialPending bool
@@ -65,6 +66,7 @@ func newGenerationTask(
 	stops []int32,
 	stopStrings []string,
 	ignoreEOS bool,
+	capturePrefix bool,
 	initialLogits []float32,
 	initialState []byte,
 	initialPosition int,
@@ -82,21 +84,22 @@ func newGenerationTask(
 		stopSet[eos] = struct{}{}
 	}
 	task := &generationTask{
-		id:           id,
-		prompt:       prompt,
-		maxToken:     maxTokens,
-		seq:          seq,
-		sampler:      sampler,
-		tok:          tok,
-		stops:        stopSet,
-		sink:         sink,
-		filter:       newStopFilter(stopStrings),
-		started:      started,
-		promptOffset: initialPosition,
-		initial:      initialLogits,
-		promptState:  initialState,
-		initialHit:   initialPosition > 0,
-		prefixTokens: initialPosition,
+		id:            id,
+		prompt:        prompt,
+		maxToken:      maxTokens,
+		seq:           seq,
+		sampler:       sampler,
+		tok:           tok,
+		stops:         stopSet,
+		sink:          sink,
+		filter:        newStopFilter(stopStrings),
+		started:       started,
+		promptOffset:  initialPosition,
+		initial:       initialLogits,
+		promptState:   initialState,
+		capturePrefix: capturePrefix,
+		initialHit:    initialPosition > 0,
+		prefixTokens:  initialPosition,
 	}
 	if initialPosition == len(prompt) {
 		task.promptDone = true
@@ -161,19 +164,26 @@ func (t *generationTask) PrefillOnce(ctx context.Context, budget int) (scheduler
 		return stats, false, nil
 	}
 	t.promptDone = true
-	if snapshot, snapshotErr := t.seq.Snapshot(); snapshotErr == nil {
-		t.promptState = snapshot
-		t.snapshotOK = true
-	}
-	t.promptLogits = serializeLogits(logits)
 	sampleElapsed, err := t.sampleAndEmit(logits)
 	t.sampling += sampleElapsed
 	stats.SamplingTime = sampleElapsed
+	if t.capturePrefix {
+		// Preserve the prompt boundary before the next decode changes the state.
+		t.capturePromptPrefix(logits)
+	}
 	if err != nil {
 		t.failure = err
 		return stats, true, err
 	}
 	return stats, true, t.failure
+}
+
+func (t *generationTask) capturePromptPrefix(logits []float32) {
+	if snapshot, err := t.seq.Snapshot(); err == nil {
+		t.promptState = snapshot
+		t.snapshotOK = true
+	}
+	t.promptLogits = serializeLogits(logits)
 }
 
 // DecodeOnce feeds the pending token and samples the next one.

@@ -73,14 +73,22 @@ func TestSelectPrefillPath(t *testing.T) {
 		nIn, nOut int64
 		want      PrefillPath
 	}{
-		{"tiny batch", tensor.Q4_K, 1, 2560, 9216, PrefillBatchedGemv},
-		{"q4 wide short", tensor.Q4_K, 4, 2560, 9216, PrefillWMMA},
-		{"q4 tall short", tensor.Q4_K, 4, 9216, 2560, PrefillBatchedGemv},
-		{"q4 tall batch8", tensor.Q4_K, 8, 9216, 2560, PrefillWMMA},
+		{"q4k wide single", tensor.Q4_K, 1, 2560, 9216, PrefillStreaming},
+		{"q4 wide short", tensor.Q4_K, 4, 2560, 9216, PrefillStreaming},
+		{"q4 tall short", tensor.Q4_K, 4, 9216, 2560, PrefillStreaming},
+		{"q4 tall batch8", tensor.Q4_K, 8, 9216, 2560, PrefillStreaming},
+		{"q4 wide cap+1", tensor.Q4_K, 17, 2560, 9216, PrefillWMMA},
+		{"q5 narrow", tensor.Q5_K, 16, 2560, 1024, PrefillStreaming},
+		{"q6 tall cap", tensor.Q6_K, 16, 9216, 2560, PrefillStreaming},
+		{"q6 tall cap+1", tensor.Q6_K, 17, 9216, 2560, PrefillWMMA},
+		{"q4 output too narrow", tensor.Q4_K, 2, 2560, 32, PrefillBatchedGemv},
+		{"q4 input unaligned", tensor.Q4_K, 4, 128, 1024, PrefillWMMA},
+		{"q8 wide", tensor.Q8_0, 4, 2560, 4096, PrefillWMMA},
+		{"q8 narrow", tensor.Q8_0, 2, 2560, 32, PrefillBatchedGemv},
 		{"q6 wide batch32", tensor.Q6_K, 32, 2560, 8192, PrefillWMMA},
 		{"q4k wide 128", tensor.Q4_K, 128, 2560, 9216, PrefillMMQ},
 		{"q4k wide 256", tensor.Q4_K, 256, 2560, 9216, PrefillMMQ},
-		{"q4k wide 8", tensor.Q4_K, 8, 2560, 9216, PrefillWMMA},
+		{"q4k wide cap", tensor.Q4_K, 16, 2560, 9216, PrefillStreaming},
 		{"q6k tall 256", tensor.Q6_K, 256, 9216, 2560, PrefillMMQ},
 		{"q6k tall 512", tensor.Q6_K, 512, 9216, 2560, PrefillMMQ},
 		{"q4k wide 64", tensor.Q4_K, 64, 2560, 9216, PrefillWMMA},
@@ -172,6 +180,24 @@ func TestSelectMoEPrefillPath(t *testing.T) {
 		}
 		if c.want == MoEPrefillMMQ && tile != c.wantTile {
 			t.Errorf("%s: got tile %d, want %d", c.name, tile, c.wantTile)
+		}
+	}
+}
+
+func TestPrefillAttentionMMAQ8Prefix(t *testing.T) {
+	for _, tc := range []struct {
+		rows, position int
+		want           bool
+	}{
+		{512, 511, false},
+		{512, 512, true},
+		{1024, 2047, false},
+		{1024, 2048, true},
+		{2048, 512, true},
+	} {
+		got := PrefillAttentionMMA(16, 4, 256, tc.rows, tc.position, tensor.Q8_0)
+		if got != tc.want {
+			t.Errorf("rows=%d position=%d: chose WMMA=%t, want %t", tc.rows, tc.position, got, tc.want)
 		}
 	}
 }

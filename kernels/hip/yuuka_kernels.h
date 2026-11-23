@@ -128,6 +128,9 @@ void launch_lm_head_pair_f32out(float * out0, float * out1, const float * x,
                                 const void * w0, const void * w1, uint64_t n_in,
                                 uint64_t n_out0, uint64_t n_out1, uint32_t dtype,
                                 int swiglu, hipStream_t stream);
+void launch_prefill_q8_0_pair(float * out0, float * out1, const float * x,
+                              const void * w0, const void * w1, uint64_t n_in,
+                              uint64_t n_out, uint64_t rows, hipStream_t stream);
 void launch_lm_head_f32out(float * out, const float * x, const void * w,
                            uint64_t n_in, uint64_t n_out, uint64_t rows,
                            uint32_t dtype, hipStream_t stream);
@@ -296,7 +299,7 @@ size_t attention_wmma_shared_bytes(int head_dim);
 
 // attention_wmma_preferred reports whether the FP16 MMA prefill attention kernel
 // beats the tiled kernel at a chunk length and context position.
-bool attention_wmma_preferred(int rows, int position);
+bool attention_wmma_preferred(int rows, int position, uint32_t dtype);
 
 // attention_wmma_supported reports whether the FP16 MMA prefill attention kernel
 // covers a shape and KV format.
@@ -318,10 +321,11 @@ hipError_t launch_attention_prefill_paged_f32(float * out, const float * q,
                                         bool prefer_wmma, float * partial, int forced_splits,
                                         hipStream_t stream);
 
-hipError_t launch_attention_prefill_paged_split_f16(float * out, const float * q,
+hipError_t launch_attention_prefill_paged_split(float * out, const float * q,
         const void * k_pool, const void * v_pool, const int32_t * block_table,
         int block_size, int kv_heads, int heads, int kv_dim, int rows,
-        int position, float scale, float * partial, int splits, hipStream_t stream);
+        int position, float scale, float * partial, int splits, uint32_t dtype,
+        hipStream_t stream);
 // Experimental GEMM-based attention with gathered FP16 KV, batched QK/PV
 // matrix multiplication, causal softmax, and gated final FP32 output.
 int launch_attention_prefill_paged_blas_f16(

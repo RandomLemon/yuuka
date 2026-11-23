@@ -274,7 +274,7 @@ func (m *Manager) build(req Request, maxTokens int, started time.Time) (*managed
 		return nil, err
 	}
 	task := newGenerationTask(req.ID, req.Prompt, maxTokens, seq, req.Sampler, m.tok,
-		req.StopTokens, req.StopStrings, req.IgnoreEOS, logits, state, cached, req.Sink, started)
+		req.StopTokens, req.StopStrings, req.IgnoreEOS, m.cache != nil, logits, state, cached, req.Sink, started)
 	return &managedTask{generationTask: task, manager: m, table: table}, nil
 }
 

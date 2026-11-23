@@ -29,14 +29,20 @@ measured dispatch table described in section 9.
 Phase 4 adds the paged KV family: decode and prefill attention kernels that
 resolve every key/value position through an int32 block table, paged KV-write
 kernels for one row and for a chunk, dynamic-parameter variants that read the
-token and position from device memory, and a versioned C ABI for
-device-to-device block copies and HIP Graph capture/replay. KV pools support
-F16 (default), F32, and Q8_0; see section 7.3. Prefill attention runs on the
-FP16 MMA kernel for F32 and F16 pools whose shape it covers, and on the scalar
-per-lane tiled kernel otherwise (section 7.5).
-Continuous batching is scheduler-level interleaving of per-request plans;
-mixed-shape prefill/decode kernel batches and split-KV decode are not
-implemented.
+token and position from device memory, and a versioned C ABI (currently version
+10) for device-to-device block copies and HIP Graph capture/replay. KV pools
+support F16 (default), F32, and Q8_0 (section 7.3). Prefill attention runs on
+the FP16 MMA kernel (with split-key support for measured long-prefix windows)
+for F32, F16, and packed Q8_0 pools on covered shapes and position cutoffs, and
+on the scalar per-lane tiled kernel otherwise (section 7.5). On `gfx1151`,
+prefill projections additionally use arbitrary-row Direct int8 MMQ (`Q4_K`,
+`Q5_K`, `Q6_K`, `M >= 128`, with 8-tile workgroup swizzle on wide `Q4_K`/`Q5_K`
+shapes), fused gate/up `SILU_MUL_QUANT_Q8_1`, paired `Q8_0` WMMA for narrow
+recurrent gates, Direct FP16 WMMA and fused SwiGLU (`17 <= M <= 127`), FP32
+streaming (`1 <= M <= 16`), and prepared gated delta-net recurrence (`M >= 2`).
+Decode attention uses split-key paged attention on covered shapes (section
+7.2). Continuous batching interleaves per-request plans at the scheduler
+level.
 
 The guiding rule is that **prefill and decode are separate operator families**.
 They may share data layouts and helper primitives, but they are not the same
@@ -382,7 +388,7 @@ the measured F16 shape classes, not a fallback for unsupported quantization.
 
 ### 6.2 Custom WMMA GEMM
 
-Two rocWMMA tile variants share the packed-load helpers and are selected inside
+Two legacy rocWMMA tile variants share the packed-load helpers and are selected inside
 `launch_gemm_wmma_f32out` from the measured row and shape class:
 
 - `gemm_wmma_k32_kernel`: 32x64 output tile, eight waves, one 16x16 fragment
@@ -494,9 +500,25 @@ when both projections resolve to `PrefillWMMA`; otherwise the separate gate,
 up, and `SILU_MUL` operations remain. Q/K/V, beta/alpha, and RMSNorm fusions are
 not implemented.
 
-Larger tiles, an int8 tensor-core path, and the remaining projection fusions
-remain candidates; they are not implemented and
-are not claimed in the benchmark results.
+#### Direct short-chunk FP16 WMMA
+
+On single-target gfx1151 builds, eligible K-quant GEMMs with 17–127 rows
+use Direct FP16 WMMA. The single GEMM uses 128 output channels and the
+fused SwiGLU uses 64. Both stage 64 values of K and either 32 or 64 tokens
+per tile. Q4_K and Q5_K unpack one 32-value scale group at a time and
+Q6_K uses 16-value groups with two-byte aligned reads. The input tile
+uses vector loads and masks rows beyond the chunk.
+
+Swizzled LDS holds the FP16 operands in 16-byte spans. The upper half-wave
+consumes the second eight K values first, matching the rocWMMA operand
+order. The FP32 accumulators write the guarded output directly. The
+SwiGLU variant applies the gate and multiplication in the same epilogue.
+Both preserve the batch's activation precision and use at most 24 KiB of
+static LDS, with no FP16 weight scratch. The launch requires a multiple
+of 256 input values, a multiple of 128 output channels, and 16-byte
+aligned activations. Q4_K and Q5_K weights require 16-byte alignment.
+Q6_K weights require two-byte alignment. All other calls use the legacy
+tile selection.
 
 ### 6.3 Int8 MMQ GEMM
 
@@ -603,16 +625,28 @@ When gate, up and down all select MMQ, the FFN uses the same Q8_1 inputs
 for gate and up, then reuses those buffers for down on the same stream.
 The `SILU_MUL_QUANT_Q8_1` operation reads the FP32 gate and up
 projections, applies SwiGLU and writes Q8_1 digits and block scales.
-The combined prefill and decode ABI 9 assigns it opcode 43 and assigns
+The combined prefill and decode ABI 14 assigns it opcode 43 and assigns
 opcodes 38–42 to the fused decode operations. The fused quantizer
 uses the plain quantizer's scale, rounding and sum rules and skips
 materializing the activated FP32 tensor. The compact final FFN uses
-its parent chunk's dispatch. [FFN validation and timing](prefill-optimization/acceptance/05-ffn-fusion.md)
+its parent chunk's dispatch.
+
+#### gfx1151 narrow Q8_0 pair
+
+On gfx1151 the recurrent prefill plan pairs the Q8_0 beta and alpha
+projections at input width 2560, output width 32 and chunk rows
+128–2048. The pair reads one normalized FP32 tile and writes independent
+FP32 outputs. Packed Q8_0 weights and input are rounded to FP16 in
+registers. A wave reuses the activation fragment across both WMMA
+products and preserves the legacy FP32 accumulation order.
+
+`PREFILL_Q8_0_PAIR` is opcode 52 in ABI 14. The old projection
+routes cover other shapes, dtypes and devices.
 
 #### gfx1151 direct MMQ specialization
 
 The native launcher selects direct MMQ for the measured shapes in the
-table, `M` in 128, 512 or 2048, and 16-byte aligned packed weights and
+table, `M >= 128`, and 16-byte aligned packed weights and
 Q8_1 digits. gfx1151 compiles the direct WMMA path. Other device targets
 compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
 
@@ -624,17 +658,30 @@ compile the generic kernel. The direct tile covers 128 channels by 64 tokens.
 | Q5_K | 4096 | 2560 |
 | Q5_K | 2048 | 8192, 4096, 512 (M=512 only) |
 | Q5_K | 4096 | 2048 (M=512 only) |
+| Q6_K | 9216 | 2560 |
+| Q6_K | 2560 | 1024 |
 
-The last two rows are the qwen35moe prompt cells: Q/QKV and the recurrent gate,
-K/V plus the shared-expert gate/up, and the attention output. They are selected
-only at the release chunk size, M=512; measured medians at that size are 0.727,
-0.368, 0.087, and 0.392 ms against 0.981, 0.507, 0.116, and 0.532 ms for the
-generic tile. The direct matrix matches the generic M=513 control byte for byte.
+The last two Q5_K rows are the qwen35moe prompt cells: Q/QKV and the recurrent
+gate, K/V plus the shared-expert gate/up, and the attention output. They are
+selected only at the release chunk size, M=512; measured medians at that size
+are 0.727, 0.368, 0.087, and 0.392 ms against 0.981, 0.507, 0.116, and 0.532 ms
+for the generic tile. The direct matrix matches the generic M=513 control byte
+for byte.
 
 The original Q4_K FFN cell `M=512, K=2560, N=9216` uses its compile-time
 dimensions. The other cells pass dimensions into the same tile algorithm.
-Each half of the generic grid's x range covers the same 128-channel
-tiles for a different 64-token half. The shared-memory allocation is 30 KiB.
+In the linear mapping, each half of the grid's x range covers the same
+128-channel tiles for a different 64-token half. On gfx1151, the measured 8192-
+and 9216-output Direct Q4_K cells and the 8192-output Direct Q5_K cell
+use eight channel tiles per group for 128–4096 rows. Each group
+visits all token tiles before advancing to the next channel group.
+This mapping also covers the fixed FFN. The physical grid, K
+accumulation order and output layout stay the same.
+A workgroup returns before the first barrier if its half has no valid
+tokens. A partial half zeros invalid activation digits and scales and
+suppresses stores for those rows. Batches whose row count is a multiple
+of 128 use variants compiled without mask code. The shared-memory
+allocation is 30 KiB.
 
 Within each 512-byte operand region, the specialized LDS layout stores
 two contiguous 16-value slices per row. Both halves of each wave load the
@@ -646,8 +693,13 @@ plane for each of the same subblocks. Each activation block uses
 staging thread writes the FP32 scale and scaled sum once. The kernel
 completes both integer WMMA instructions and
 FP32 scale/min correction of each fragment before consuming the next
-fragment. [FFN cell](prefill-optimization/acceptance/02-q4-ffn.md) ·
-[Additional projections](prefill-optimization/acceptance/04a-mmq-shapes.md)
+fragment.
+
+For Q6_K, eight packed four-byte operations unpack each 32-value
+region using two-byte-aligned loads. Two independent signed WMMA
+results use the Q6_K scale of their respective 16-value slices.
+The FP32 epilogue applies them in the original low-to-high K order
+with the shared Q8_1 activation scale.
 
 ### 6.4 Dispatch
 
@@ -657,9 +709,11 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 
 | Condition | Selected path |
 | --- | --- |
+| K-quant, `K % 256 == 0`, `N >= 1024`, `1 <= M <= 16` | FP32 streaming matvec |
 | `M < 4` | Batched GEMV |
 | Quantized, `M < 8`, and `K > N` | Batched GEMV |
 | K-quant, `N >= 64`, `M >= 128` | Int8 MMQ (Q8_1 activations, int32 WMMA) |
+| Aligned K-quant, `K % 256 == 0`, `N % 128 == 0`, `17 <= M <= 127`, gfx1151 build | Direct FP16 WMMA, with fused SwiGLU for eligible FFN pairs |
 | Quantized, other `M >= 4` | Custom rocWMMA |
 | F16, `4 <= M <= 64`, `K > N` | rocBLAS + cast |
 | F16, `M < 8`, `K <= N` | Batched GEMV |
@@ -668,9 +722,13 @@ class. The table is in `backend/hip.SelectPrefillPath`; measurements are in
 
 The custom kernel is selected only where the sweep showed it faster than the
 compared baseline, and a library route only where it is both faster and inside
-the numeric gates. The K-quant MMQ row is bounded from below by the Q8_1 pass
-and the 128-token tile (it loses to WMMA below 128 rows) and requires
-`N >= 64` because narrower output tiles waste more than half the tile. It
+the numeric gates. The short K-quant route uses `AddLMHeadAt` and retains
+FP32 activations. For complete 16-row blocks with aligned activations, the
+kernel stages four contiguous floats per load. Its point products and wave
+reduction use the same arithmetic as the scalar staging path.
+The K-quant MMQ route starts at 128 rows to keep the measured sub-128
+numerical contract. It requires `N >= 64` because narrower output tiles
+waste more than half the tile. It
 replaces the dequantize-plus-rocBLAS route for K-quants entirely: that route was
 2-17% faster on wide shapes at 512 rows but is numerically rejected on tall
 shapes (see 6.2), and it needed an FP16 copy of the weight matrix per call. F16
@@ -691,14 +749,15 @@ makes a 512-row chunk read every weight tile 16 times, and the 64-row tile
 halves that, but halving it again with the measured 128-row tile only bought
 6-26% on wide shapes and lost 0.5-15% elsewhere. The kernel is instruction-issue
 bound: 114 instructions per 4096-MAC WMMA, of which 54 are VALU and 10 LDS.
-The 2026-11-15 measurements put a 512-token prompt at 516 tok/s, the
-2026-11-16 span-decoding build at 881 tok/s, and the int8 MMQ route now
-measures 1324 tok/s on the same GGUF and device, against llama.cpp HIP at
-2346 tok/s for the same 512-token prompt in the current reference build. The
-2026-11-16 split was matmul 293 ms, the gated delta-net chunk 50 ms, and
-prefill attention 19 ms at position 0 and 562 ms at position 7680; attention at
-position 7680 dropped from 2030 ms to 643 ms. The per-workstream measured status
-is in [benchmarks.md](benchmarks.md#prefill-prompt-length).
+The earlier 2026-11-16 measurements put a 512-token F32 KV prompt at 516 tok/s,
+the span-decoding build at 881 tok/s, and the initial generic int8 MMQ route at
+1324 tok/s (matmul 293 ms, gated delta-net 50 ms, attention 19 ms at pos 0 /
+643 ms at pos 7680). With the `gfx1151` Direct MMQ, Direct FP16 WMMA, prepared
+GDN, paired `Q8_0` WMMA, `Q6_K` Direct MMQ, and 8-tile workgroup swizzle
+additions (`9aaf432`), F16 KV prefill reaches `~2610–2624 tok/s` at 512 tokens
+and leads official `llama.cpp v1.0.0` by `+12.4%` to `+17.6%` across `128–8192`
+tokens. The recorded benchmark status is in
+[benchmarks.md](benchmarks.md#prefill-prompt-length).
 
 ### 6.5 Streaming LM head
 
@@ -710,7 +769,6 @@ projection and attention routes. RoPE and paged attention use the
 last prompt position via the ABI 7 token displacement. An intermediate
 chunk ends after the final K/V write. Speculative verification computes
 every requested row through attention and FFN.
-[Validation and timings](prefill-optimization/acceptance/06-final-query.md)
 
 `lm_head_kernel` in `kernels/hip/gemm/lm_head.hip` computes the output
 projection in the prefill and decode tails. A decode matvec with one row and a
@@ -786,7 +844,7 @@ uses the same digits to 5.7e-4 relative. `tests/hip/prefill_test.cpp` checks all
 the independent host dot products for one, three, and sixteen rows and requires
 a repeated run to be bitwise identical; `TestPlanLMHeadMatchesDequant` checks
 Q6_K and Q8_0 against dequantized CPU dots (Q8_0 is bitwise equal), and the
-model-level gates are unchanged (`TestGPUMatchesCPU` 0.00309944,
+model-level gates are unchanged (`TestGPUMatchesCPU` 0.00004673,
 `TestGPUChunkedPrefillLongContext` top-1 `33075` with zero difference).
 
 A shape the kernel does not cover keeps the per-row GEMV tail; nothing silently
@@ -852,10 +910,15 @@ Supported prefill head dimensions are 1-256; the plane-stage kernel reports an
 unsupported capability error above 256. Decode attention uses the split-key
 kernel described in section 7.2.
 
-Chunked prefill splits a prompt into at most `chunk-size` rows (default 512,
-maximum 4096). KV writes for a chunk happen before its attention, so later
-chunks see the full causal prefix. The runtime builds and caches one plan per
-chunk length; only the final chunk executes the output tail.
+Chunked prefill splits a prompt into at most `chunk-size` rows (runtime
+default 512, maximum 4096). On gfx1151, `yuuka run` and `yuuka bench`
+use 1024 for 1024–8192 input tokens on the Qwen3.5-4B Q4_K_M
+geometry with F16 KV when `--chunk-size` is omitted. The CLI uses
+the token count after chat rendering or benchmark truncation. An
+explicit value takes precedence.
+KV writes for a chunk happen before its attention, so later chunks
+see the full causal prefix. The runtime builds and caches one plan per
+chunk length. Only the final chunk executes the output tail.
 
 ### 7.2 Decode: Split-Key Paged Attention
 
@@ -950,14 +1013,16 @@ the gated layout exclusively.
 kernel. `launch_attention_prefill_paged_f32` selects it when all of the
 following hold, and falls back to the tiled per-head kernel otherwise:
 
-- the pool is F32 or F16, so an FP16 tile staging is either lossless or a
-  documented rounding step (Q8_0 stays on the tiled kernel);
+- the pool stores F32, F16, or Q8_0 KV rows;
 - `heads == 4 * kv_heads`, so one workgroup can serve the four query heads that
   share a KV head; or the pool is F16 at width 256 and
   `heads == 8 * kv_heads`, where two consecutive workgroups share a KV head;
 - `head_dim` is 64, 128, or 256, the widths the kernel is instantiated for;
 - `rows >= 64` or `position + rows >= 256`: below that the chunk offers too few
-  16-row query tiles to fill 40 CUs, and the tiled kernel measures faster.
+  16-row query tiles to fill 40 CUs, and the tiled kernel measures faster;
+- Q8_0 uses tiled attention for chunks starting before position 512, or before
+  position 2048 for a 1024-row parent. The tiled prefix preserves the measured
+  same-format logit tolerance.
 
 Geometry. A workgroup is four waves, one per logical query head, and owns a
 16-row query tile. Each wave keeps the whole `16 x head_dim` output block in
@@ -967,6 +1032,11 @@ memory once per workgroup and reused by all four heads. At 4:1 the workgroup's
 four heads share one KV head. At 8:1 the grouping template launches two
 workgroups per KV head, indexes the paged K/V by `blockIdx.x / 2`, and keeps
 the logical head for the Q load, output, gate, and partial records.
+
+The Q8_0 reader addresses physical page rows in their packed byte stride. Each
+32-digit block has one FP16 scale. The gather multiplies the signed digits by
+the scale in FP32 and converts to half for the shared tile. Causal padding
+writes zeros without reading any masked key slots.
 
 Score orientation. The score product runs as `S^T = K Q^T` rather than
 `S = Q K^T`, so both operands are row major in shared memory: K keeps the
@@ -1029,20 +1099,31 @@ physical KV head, a reversed block table, a nonzero position, a 37-row query
 tail, and a displaced last-row crop, and compares the grouped-head kernel with
 the tiled and host references.
 
-#### Split-key F16 prefill
+#### Split-key paged prefill
 
-On gfx1151 the gated F16 path with 256-wide heads and four query heads per
-KV head supports a four-way key split for 512, 1024 and 2048 query rows in
-the measured window from position 6144 through token 8191. The executor
-uses the current position with the cached plan. Short prefixes and the
-single-query output tail use direct attention.
+On gfx1151, gated GQA with 256-wide heads and four query heads per KV
+head uses the measured four-range policy below when split scratch is bound.
+Start positions are inclusive.
+
+| KV format | Query rows | Start positions |
+| --- | --- | --- |
+| F16 | 512, 1024, 2048 | 6144–14336 |
+| F16 | 64, 513 | 7680–14336 |
+| F32 | 512 | 6144–14336 |
+| Q8_0 | 512 | 8192–14336 |
+
+The executor uses the effective query start with the cached plan. Other
+row counts, earlier prefixes, missing scratch, and the single-query
+output tail use the unsplit policy. The F32 and Q8_0 paths stage K alone
+during the max scan. Their partials read the same KV storage format as
+unsplit WMMA. The merge applies the output gate once.
 
 A score-only pass over the leading 512 keys supplies a starting maximum
 for the later ranges. Each range keeps its own online FP32 maximum, sum
 and value accumulator. A wave merges the records for each row and head,
 then applies the output gate. ABI 8 binds the optional FP32 records and
 prefix maxima in slot 6. The plan reuses this scratch across layers on
-the same stream. [Split-key acceptance](prefill-optimization/acceptance/07-long-attention.md)
+the same stream.
 
 The earlier group-of-four tiled kernel (`attention_prefill_paged_gqa_f32_kernel`)
 is removed: the MMA kernel serves the same group at every shape the tiled kernel
@@ -1052,9 +1133,8 @@ Current limits:
 
 - Q8_0 KV is supported but not faster than F32 at short context; its benefit is
   cache memory.
-- The tiled fallback runs one workgroup per head and is
-  6.5%-of-peak-issue bound on FP32 scalar per-lane arithmetic, which is why
-  Q8_0 pools and short chunks keep the long-context gap.
+- The tiled fallback runs one workgroup per head and is limited by scalar
+  FP32 arithmetic. It serves the Q8_0 short prefix and unsupported WMMA shapes.
 - Direct MMA uses 16-row query tiles. Split-key MMA adds parallel workgroups
   over key ranges with the same query tile.
 - No mixed prefill/decode batch. Each step belongs to one request plan.
@@ -1373,7 +1453,7 @@ traffic without reducing occupancy:
   state size 128, where four lanes cooperate on one state column and each lane
   holds 32 of the 128 state rows in registers for the whole chunk. A layer
   exposes `heads * (state / 32)` workgroups. On gfx1151, for chunks of at
-  least 128 rows whose FFN gate buffer fits the preparation span, a separate
+  least two rows whose FFN gate buffer fits the preparation span, a separate
   launch writes the normalized Q/K per token and key group, and the decay
   and beta per token and head. When the FFN gate buffer is narrower than the
   span, as on an MoE model with a 512-wide expert FFN, the wider attention Q
@@ -1389,7 +1469,6 @@ traffic without reducing occupancy:
   per-head normalization domain. State sizes other than 128 use the fused
   one-column-per-thread kernel, which reads and writes the state for every row.
   Both paths keep the row-major state layout shared with the decode kernel.
-  [Prepared recurrence measurements](prefill-optimization/acceptance/04b-gdn.md)
 
   The lane split of the prepared core is a compile-time constant
   (`kGdnPreparedLanes`). Sweeping it from four lanes to eight and sixteen lanes
@@ -1509,10 +1588,12 @@ budget and leaves no room for the normalization; 512 threads beat 256 by 6% and
 beat a plain read-and-write copy of the same bytes, which makes memory-level
 parallelism per lane the limiter rather than bandwidth.
 
-SwiGLU remains an elementwise pass over the chunk. Fusing it into the GEMM
-epilogue, together with fusing the gate/up GEMMs themselves, is a candidate;
-no fused implementation is claimed. Every
-fusion must be evaluated on all of:
+Prefill FFN fusion is implemented on both active projection families:
+`gemm_wmma_swiglu_kernel` (and its `gfx1151` Direct FP16 variant at
+`17–127` rows) computes `gate`, `up`, and SwiGLU in one pass, and
+`SILU_MUL_QUANT_Q8_1` fuses SwiGLU with `Q8_1` quantization when gate, up, and
+down all select MMQ (section 6.2–6.3); Q/K/V and RMSNorm fusions remain out of
+the production path. Every fusion must be evaluated on all of:
 
 - kernel launch count;
 - VGPR usage and occupancy;

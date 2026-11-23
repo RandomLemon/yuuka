@@ -203,6 +203,9 @@ func (r *Runtime) ProfileStep(token int32) ([]hip.OpTime, error) {
 // Capacity returns the reserved token positions.
 func (r *Runtime) Capacity() int { return r.capacity }
 
+// DeviceArchitecture returns the cached GCN architecture of the HIP device.
+func (r *Runtime) DeviceArchitecture() string { return r.model.device.Info().GCNArch }
+
 // VocabSize returns the model vocabulary size.
 func (r *Runtime) VocabSize() int { return r.model.config.VocabSize }
 

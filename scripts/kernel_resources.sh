@@ -19,8 +19,13 @@ for source in \
     kernels/hip/prefill/prefill.hip \
     kernels/hip/prefill/attention_wmma.hip; do
     echo "== ${source}"
+    definitions=()
+    if [[ "${arch}" == gfx1151 && "${source}" == kernels/hip/gemm/wmma_gemm.hip ]]; then
+        definitions+=(-DYUUKA_DIRECT_FP16_WMMA)
+    fi
     "${hipcc}" --offload-arch="${arch}" -O3 -std=c++17 \
         -I"${root}/backend/hip/bridge" -I"${root}/kernels/hip" \
+        "${definitions[@]}" \
         -c "${root}/${source}" -o "${out}" \
         -Rpass-analysis=kernel-resource-usage 2>&1 |
         grep -E 'Function Name|TotalSGPRs|VGPRs:|ScratchSize|Occupancy|VGPRs Spill|LDS Size'

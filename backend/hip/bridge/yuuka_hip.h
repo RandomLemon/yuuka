@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 13
+#define YUUKA_HIP_ABI_VERSION 14
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -152,7 +152,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_DOWN_Q8 = 48,
     YUUKA_OP_MOE_GATE_UP_MMQ = 49,
     YUUKA_OP_MOE_DOWN_MMQ = 50,
-    YUUKA_OP_MOE_ROUTE_SELECTED = 51
+    YUUKA_OP_MOE_ROUTE_SELECTED = 51,
+    YUUKA_OP_PREFILL_Q8_0_PAIR = 52
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -383,6 +384,11 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   SILU_MUL_QUANT_Q8_1: buf0 FP32 gate, buf1 FP32 up, buf2 int8 dst,
  *                        buf3 float2 block scales; n={width,rows}; offsets
  *                        must be aligned to 16, 16, 4 and 8 bytes
+ *   PREFILL_Q8_0_PAIR:   buf0/1 Q8_0 weights, buf2 shared FP32 inputs,
+ *                        buf3/4 FP32 outputs; n={n_in,n_out,rows};
+ *                        u[0/1]=Q8_0; gfx1151 only, n_in multiple of 128
+ *                        and n_out multiple of 16. WMMA rounds the
+ *                        inputs and dequantized weights to FP16.
  *   GEMM with path MMQ:  buf0 packed weights, buf1 Q8_1 int8 activations,
  *                        buf2 FP32 out, buf3 float2 block scales;
  *                        n={n_in,n_out,rows}; u[0]=Q4_K/Q5_K/Q6_K;
@@ -450,7 +456,12 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *                           BLAS F16 KV path with buf5 FP16 scratch;
  *                           optional buf6 holds split-key FP32 scratch
  *                           with four [rows,heads,head_dim+2] records and
- *                           one [rows,heads] prefix maximum array;
+ *                           one [rows,heads] prefix maximum array for gated
+ *                           256-wide, four-query-per-KV-head F16/F32/Q8_0;
+ *                           off[1] and off[2] select pool ranges aligned to
+ *                           16 bytes (F32 WMMA), 8 bytes (F16 WMMA), or
+ *                           2 bytes (Q8_0). Forced tiled F32 and F16 use
+ *                           natural FP32 and FP16 alignment;
  *                           n={kv_heads,heads,head_dim,kv_dim,rows,displacement};
  *                           first query position is execute position plus
  *                           displacement tokens;

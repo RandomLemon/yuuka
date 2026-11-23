@@ -190,10 +190,9 @@ same direction at 19-20 ms per 512-row chunk.
   not allocate the split workspace; split attention was not shipped for this
   model.
 
-The independent driver build and the `y1, l1, l2, y2` process order follow
-[the matched upstream comparison](../prefill-optimization/acceptance/08-upstream-comparison.md);
-the only changes are the verified model path, the saved token file, and the
-fixed 512 chunk. The Go gates use `YUUKA_TEST_MODEL` and `YUUKA_TEST_MOE_MODEL`
+The independent driver build uses the `y1, l1, l2, y2` process order; the only
+changes are the verified model path, the saved token file, and the fixed 512
+chunk. The Go gates use `YUUKA_TEST_MODEL` and `YUUKA_TEST_MOE_MODEL`
 set to that GGUF, `YUUKA_TEST_KV=f16`, and
 `YUUKA_TEST_ATTENTION_LONG=1` for `TestGPUAttentionPathsAgree`. The native
 gates are the selected CTest suite and the `--moe-dense` sweep in base,

@@ -680,9 +680,13 @@ func (m *Model) configurePrefill(rows int) error {
 	p.attentionBlas = nil
 	p.attentionSplit = nil
 	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
-	measuredRows := rows == 512 || rows == 1024 || rows == 2048
-	if arch == "gfx1151" && measuredRows && m.capacity >= 6144+512 &&
-		m.kvType == tensor.F16 && cfg.HeadDim == 256 && cfg.HeadCount == 4*cfg.KVHeadCount &&
+	measuredRows := rows == 512 || (m.kvType == tensor.F16 && (rows == 1024 || rows == 2048))
+	splitMinPosition := 6144
+	if m.kvType == tensor.Q8_0 {
+		splitMinPosition = 8192
+	}
+	if arch == "gfx1151" && measuredRows && m.capacity >= splitMinPosition+512 &&
+		cfg.HeadDim == 256 && cfg.HeadCount == 4*cfg.KVHeadCount &&
 		!m.forceTiledAttention {
 		values := 4*(cfg.HeadDim+2) + 1
 		bytes := uint64(rows) * uint64(cfg.HeadCount) * uint64(values) * 4

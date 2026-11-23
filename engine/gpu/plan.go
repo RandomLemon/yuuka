@@ -11,6 +11,9 @@ import (
 	"github.com/yuuka-ai/yuuka/tensor"
 )
 
+// The gfx1151 sweep found prepared recurrence faster from two rows onward.
+const gdnPreparedMinRows = 2
+
 // prefillMatmul appends the measured implementation for one prefill matmul.
 func (m *Model) prefillMatmul(plan *hip.Plan, w weight, x *hip.Buffer, xOff uint64,
 	out *hip.Buffer, outOff uint64, nIn, nOut, rows int64) error {
@@ -23,6 +26,8 @@ func (m *Model) prefillMatmulPath(plan *hip.Plan, w weight, x *hip.Buffer, xOff 
 	switch path {
 	case hip.PrefillBatchedGemv:
 		return plan.AddGemvBatchAt(w.buf, 0, x, xOff, out, outOff, nIn, nOut, rows, w.dtype)
+	case hip.PrefillStreaming:
+		return plan.AddLMHeadAt(w.buf, 0, x, xOff, out, outOff, nIn, nOut, rows, w.dtype)
 	case hip.PrefillBLAS:
 		if err := plan.AddCastF16At(x, xOff, m.prefill.xF16, 0, rows*nIn); err != nil {
 			return err
@@ -894,11 +899,12 @@ func (m *Model) addPrefillFullAttention(plan *hip.Plan, s *Session, layerIndex i
 			s.capacity, m.blockSize, scale, displacement); err != nil {
 			return err
 		}
-	} else if p.attentionSplit != nil && queryRows >= 512 {
-		if err := plan.AddAttentionPrefillPagedSplitFormatAt(p.q, m.poolK[layerIndex],
+	} else if p.attentionSplit != nil && (queryRows == 512 ||
+		(m.kvType == tensor.F16 && (queryRows == 64 || queryRows == 513 || queryRows == 1024 || queryRows == 2048))) {
+		if err := plan.AddAttentionPrefillPagedSplitTypedAt(p.q, m.poolK[layerIndex],
 			m.poolV[layerIndex], p.attn, s.tableBuf, p.attentionSplit,
 			cfg.KVHeadCount, cfg.HeadCount, int(headDim), int(kvDim), int(queryRows),
-			s.capacity, m.blockSize, scale); err != nil {
+			s.capacity, m.blockSize, scale, m.kvType); err != nil {
 			return err
 		}
 	} else if err := plan.AddAttentionPrefillPagedOffsetFormatAt(p.q, 0, m.poolK[layerIndex],
@@ -963,19 +969,30 @@ func (m *Model) addPrefillRecurrent(plan *hip.Plan, s *Session, layerIndex int, 
 		rows, hidden, hidden, hidden, cfg.RMSNormEps); err != nil {
 		return err
 	}
-	if err := m.prefillProjections(plan, p.norm, hidden, rows, []prefillProjection{
+	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
+	pair := arch == "gfx1151" && hidden == 2560 && rank == 32 &&
+		rows >= 128 && rows <= 2048 && beta.dtype == tensor.Q8_0 && alpha.dtype == tensor.Q8_0
+	projections := []prefillProjection{
 		{w: qkv, out: p.qkv, nOut: convDim},
 		{w: gate, out: p.z, nOut: inner},
 		{w: beta, out: p.beta, nOut: rank},
 		{w: alpha, out: p.alpha, nOut: rank},
-	}); err != nil {
+	}
+	if pair {
+		projections = projections[:2]
+	}
+	if err := m.prefillProjections(plan, p.norm, hidden, rows, projections); err != nil {
 		return err
+	}
+	if pair {
+		if err := plan.AddPrefillQ8Pair(beta.buf, alpha.buf, p.norm, p.beta, p.alpha, hidden, rank, rows); err != nil {
+			return err
+		}
 	}
 	qScale := float32(1.0 / math.Sqrt(float64(stateSize)))
 	var prepared *hip.Buffer
-	arch, _, _ := strings.Cut(m.device.Info().GCNArch, ":")
 	preparedWidth := uint64(convDim - inner + 2*rank)
-	if arch == "gfx1151" && stateSize == 128 && rows >= 128 {
+	if arch == "gfx1151" && stateSize == 128 && rows >= gdnPreparedMinRows {
 		// The preparation span fits the FFN gate buffer on the dense model.
 		// The MoE gate buffer is only one expert width, so the recurrent chunk
 		// falls back to the wider attention Q buffer, which the next
