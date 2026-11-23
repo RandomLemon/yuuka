@@ -256,7 +256,9 @@ func decodeSamples(shadow []hip.OpInfo, times []hip.OpTime, names map[uintptr]st
 		}
 		switch info.Code {
 		case hip.OpGemv, hip.OpGemvBatch, hip.OpGemm, hip.OpLMHead, hip.OpGemvQ8_1,
-			hip.OpGemmSwiglu, hip.OpQuantQ8_1, hip.OpGemvResidual, hip.OpGemvPair:
+			hip.OpGemmSwiglu, hip.OpQuantQ8_1, hip.OpGemvResidual, hip.OpGemvPair,
+			hip.OpMoEGateUpSelected, hip.OpMoEDownSelected, hip.OpMoEGateUpQ8,
+			hip.OpMoEDownQ8, hip.OpMoEGateUpMMQ, hip.OpMoEDownMMQ:
 			s.dtype = tensor.DType(info.U[0])
 			s.hasDType = true
 		}

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define YUUKA_HIP_ABI_VERSION 12
+#define YUUKA_HIP_ABI_VERSION 13
 
 #if defined(_WIN32)
 #define YUUKA_API __declspec(dllexport)
@@ -151,7 +151,8 @@ typedef enum yuuka_op_code {
     YUUKA_OP_MOE_GATE_UP_Q8 = 47,
     YUUKA_OP_MOE_DOWN_Q8 = 48,
     YUUKA_OP_MOE_GATE_UP_MMQ = 49,
-    YUUKA_OP_MOE_DOWN_MMQ = 50
+    YUUKA_OP_MOE_DOWN_MMQ = 50,
+    YUUKA_OP_MOE_ROUTE_SELECTED = 51
 } yuuka_op_code;
 
 #define YUUKA_OP_FLAG_TAIL 0x1u
@@ -468,6 +469,12 @@ YUUKA_API yuuka_status yuuka_gemv_batch(yuuka_stream * stream, yuuka_buffer * ou
  *   MOE_ROUTE:      buf0 logits [rows,experts], buf1 ids, buf2 weights,
  *                   buf3 counts, buf4 assign_rows, buf5 assign_slots,
  *                   buf6 assign_weights; n={rows,experts,used}
+ *   MOE_ROUTE_SELECTED: buf0 logits [1,experts], buf1 ids int32[used],
+ *                   buf2 weights F32[used]; n={1,experts,used}; offsets are zero.
+ *                   One wave computes the same top-k ids and normalized weights
+ *                   as MOE_ROUTE without the count memset or assignment bins.
+ *                   It serves one-row decode; a prefill tail that consumes the
+ *                   bins keeps MOE_ROUTE.
  *   MOE_GATE_UP:    buf0 norm, buf1 gate_exps, buf2 up_exps, buf3 counts,
  *                   buf4 assign_rows, buf5 assign_slots, buf6 gate_out,
  *                   buf7 up_out; n={hidden,ffn,rows,experts,used}; u[0]=dtype

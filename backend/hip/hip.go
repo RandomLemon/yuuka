@@ -46,7 +46,7 @@ type Device struct {
 }
 
 // RequiredABI is the shared-library ABI this package was compiled against.
-const RequiredABI = 12
+const RequiredABI = 13
 
 // Open opens a HIP device by index after checking the library ABI version.
 func Open(index int) (*Device, error) {
@@ -1617,6 +1617,28 @@ func (p *Plan) AddMoERoute(logits, ids, weights, counts, assignRows, assignSlots
 	op.buf[5] = assignSlots.ptr
 	op.buf[6] = assignWeights.ptr
 	op.n[0] = C.uint64_t(rows)
+	op.n[1] = C.uint64_t(experts)
+	op.n[2] = C.uint64_t(used)
+	return p.add(op)
+}
+
+// AddMoERouteSelected appends the one-row decode router. It computes the same
+// top-k ids and normalized weights as AddMoERoute, but the selected-expert
+// kernels consume only those two buffers, so this form skips the expert counts
+// and assignment bins. logits is [experts], ids and weights are [used]; the
+// operation serves exactly one row and at most one wave of slots.
+func (p *Plan) AddMoERouteSelected(logits, ids, weights *Buffer, experts, used int64) error {
+	if experts <= 0 || experts > 1024 || used <= 0 || used > experts || used > 32 {
+		return errors.New("hip: invalid selected MoE route dimensions")
+	}
+	if err := p.check(logits, ids, weights); err != nil {
+		return err
+	}
+	op := C.yuuka_op{code: C.YUUKA_OP_MOE_ROUTE_SELECTED}
+	op.buf[0] = logits.ptr
+	op.buf[1] = ids.ptr
+	op.buf[2] = weights.ptr
+	op.n[0] = 1
 	op.n[1] = C.uint64_t(experts)
 	op.n[2] = C.uint64_t(used)
 	return p.add(op)

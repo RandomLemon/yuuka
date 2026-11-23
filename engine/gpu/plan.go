@@ -106,10 +106,13 @@ func (m *Model) decodeMatmulPair(plan *hip.Plan, a, b weight, x, outA, outB *hip
 	// A narrow equal-shape pair (the recurrent beta/alpha rank projection) takes
 	// the same fused launch even though each matrix alone is below the streaming
 	// crossover: one launch over both rows is what pays, and the pair kernel
-	// covers the shape when the K step is a multiple of 512.
-	narrow := epilogue == hip.PairWriteBoth && nOutA == nOutB && nIn%512 == 0 &&
-		a.dtype == b.dtype && (a.dtype == tensor.Q4_K || a.dtype == tensor.Q5_K ||
-		a.dtype == tensor.Q6_K || a.dtype == tensor.Q8_0)
+	// covers the shape when the K step is a multiple of 512 for the packed
+	// dtypes, or 256 for the FP32 rank projection.
+	quantNarrow := nIn%512 == 0 && (a.dtype == tensor.Q4_K ||
+		a.dtype == tensor.Q5_K || a.dtype == tensor.Q6_K || a.dtype == tensor.Q8_0)
+	floatNarrow := a.dtype == tensor.F32 && nOutA == 32 && nIn%256 == 0
+	narrow := epilogue == hip.PairWriteBoth && nOutA == nOutB && a.dtype == b.dtype &&
+		(quantNarrow || floatNarrow)
 	usable := !m.noPairFusion && !m.forceDecodeGemv && !m.int8Matvec &&
 		a.dtype == b.dtype && (streaming || narrow) &&
 		(epilogue != hip.PairSwiglu || nOutA == nOutB)
@@ -349,11 +352,22 @@ func (m *Model) addFullAttention(plan *hip.Plan, s *Session, layerIndex int, att
 	if err := m.decodeMatmul(plan, q, m.act.norm, m.act.q, hidden, qDim); err != nil {
 		return err
 	}
-	if err := m.decodeMatmul(plan, k, m.act.norm, m.act.k, hidden, kvDim); err != nil {
-		return err
-	}
-	if err := m.decodeMatmul(plan, v, m.act.norm, m.act.v, hidden, kvDim); err != nil {
-		return err
+	// K and V are the same Q5_K shape at 2048->512 in the target model, so one
+	// pair launch reads the activation row once for both. Q stays separate: its
+	// 8192-output matrix is four times wider and pairing it with K was measured
+	// slower. Other models keep the two launches.
+	if k.dtype == tensor.Q5_K && v.dtype == tensor.Q5_K && hidden == 2048 && kvDim == 512 {
+		if err := m.decodeMatmulPair(plan, k, v, m.act.norm, m.act.k, m.act.v,
+			hidden, kvDim, kvDim, hip.PairWriteBoth); err != nil {
+			return err
+		}
+	} else {
+		if err := m.decodeMatmul(plan, k, m.act.norm, m.act.k, hidden, kvDim); err != nil {
+			return err
+		}
+		if err := m.decodeMatmul(plan, v, m.act.norm, m.act.v, hidden, kvDim); err != nil {
+			return err
+		}
 	}
 	if err := plan.AddRMSNormHeadsAt(m.act.q, 0, qNorm.buf, m.act.q, 0,
 		cfg.HeadCount, headDim, 2*headDim, cfg.RMSNormEps); err != nil {
@@ -618,9 +632,16 @@ func (m *Model) addMoEDecodeFFN(plan *hip.Plan, prefix string, postNorm weight) 
 	if err := m.decodeMatmul(plan, router, m.act.norm, m.act.moeLogits, hidden, experts); err != nil {
 		return err
 	}
-	if err := plan.AddMoERoute(m.act.moeLogits, m.act.moeIDs, m.act.moeWeights,
-		m.act.moeCounts, m.act.moeAssignRows, m.act.moeAssignSlots,
-		m.act.moeAssignWeights, 1, experts, used); err != nil {
+	if m.moeDecodeUsesSelectedRoute() {
+		// The selected-expert kernels read only the ids and weights, so the
+		// one-row form skips the count memset and assignment atomics.
+		if err := plan.AddMoERouteSelected(m.act.moeLogits, m.act.moeIDs,
+			m.act.moeWeights, experts, used); err != nil {
+			return err
+		}
+	} else if err := plan.AddMoERoute(m.act.moeLogits, m.act.moeIDs,
+		m.act.moeWeights, m.act.moeCounts, m.act.moeAssignRows,
+		m.act.moeAssignSlots, m.act.moeAssignWeights, 1, experts, used); err != nil {
 		return err
 	}
 	if err := plan.AddMoEGateUpSelected(m.act.norm, m.act.moeIDs, gate.buf, up.buf,

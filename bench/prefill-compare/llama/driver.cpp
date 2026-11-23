@@ -26,8 +26,8 @@ int fail(const char * message) {
 }
 
 int run(const char * model_path, const char * token_path, int prompt, int chunk,
-        int warmups, int repetitions, const char * logit_path) {
-    std::vector<llama_token> tokens(prompt);
+        int warmups, int repetitions, const char * logit_path, int decode) {
+    std::vector<llama_token> tokens(static_cast<size_t>(prompt) + static_cast<size_t>(decode));
     std::ifstream input(token_path, std::ios::binary | std::ios::ate);
     const auto file_size = input.tellg();
     const auto bytes = static_cast<std::streamsize>(tokens.size() * sizeof(tokens[0]));
@@ -47,7 +47,7 @@ int run(const char * model_path, const char * token_path, int prompt, int chunk,
     }
 
     llama_context_params params = llama_context_default_params();
-    params.n_ctx = prompt + 64;
+    params.n_ctx = decode > 0 ? prompt + decode : prompt + 64;
     params.n_batch = chunk;
     params.n_ubatch = chunk;
     params.n_seq_max = 1;
@@ -70,6 +70,7 @@ int run(const char * model_path, const char * token_path, int prompt, int chunk,
         start += rows;
     }
     std::vector<long long> samples;
+    std::vector<long long> decode_samples;
     const float * logits = nullptr;
     for (int rep = -warmups; rep < repetitions; ++rep) {
         llama_memory_clear(llama_get_memory(context.get()), false);
@@ -86,7 +87,28 @@ int run(const char * model_path, const char * token_path, int prompt, int chunk,
         if (rep >= 0) {
             samples.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
         }
+        if (decode > 0) {
+            const auto decode_start = std::chrono::steady_clock::now();
+            for (int j = 0; j < decode; ++j) {
+                llama_token token = tokens[static_cast<size_t>(prompt) + static_cast<size_t>(j)];
+                llama_pos position = static_cast<llama_pos>(prompt) + static_cast<llama_pos>(j);
+                int32_t n_seq_id = 1;
+                llama_seq_id seq_id = 0;
+                llama_seq_id * seq_ids[] = {&seq_id};
+                int8_t output = 1;
+                llama_batch batch{1, &token, nullptr, &position, &n_seq_id, seq_ids, &output};
+                if (llama_decode(context.get(), batch) != 0) return fail("llama_decode failed");
+                logits = llama_get_logits_ith(context.get(), -1);
+                if (logits == nullptr) return fail("missing decode logits");
+            }
+            const auto decode_elapsed = std::chrono::steady_clock::now() - decode_start;
+            if (rep >= 0) {
+                decode_samples.push_back(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(decode_elapsed).count());
+            }
+        }
     }
+    if (logits == nullptr) return fail("missing final logits rows");
     int top = 0;
     for (int i = 0; i < vocab_size; ++i) {
         if (!std::isfinite(logits[i])) return fail("nonfinite output logit");
@@ -102,6 +124,12 @@ int run(const char * model_path, const char * token_path, int prompt, int chunk,
     for (size_t i = 0; i < samples.size(); ++i) {
         std::printf("%s%lld", i == 0 ? "" : ",", samples[i]);
     }
+    if (decode > 0) {
+        std::printf("],\"decode\":%d,\"decode_samples_ns\":[", decode);
+        for (size_t i = 0; i < decode_samples.size(); ++i) {
+            std::printf("%s%lld", i == 0 ? "" : ",", decode_samples[i]);
+        }
+    }
     std::puts("]}");
     return 0;
 }
@@ -109,18 +137,22 @@ int run(const char * model_path, const char * token_path, int prompt, int chunk,
 } // namespace
 
 int main(int argc, char ** argv) {
-    int prompt = 0, chunk = 0, warmups = 0, repetitions = 0;
-    if (argc != 8 || !parse_int(argv[3], prompt) || !parse_int(argv[4], chunk) ||
+    int prompt = 0, chunk = 0, warmups = 0, repetitions = 0, decode = 0;
+    if ((argc != 8 && argc != 9) || !parse_int(argv[3], prompt) || !parse_int(argv[4], chunk) ||
         !parse_int(argv[5], warmups) || !parse_int(argv[6], repetitions) ||
         prompt <= 0 || prompt > std::numeric_limits<int>::max() - 64 ||
+        (argc == 9 && (!parse_int(argv[8], decode) || decode < 0 ||
+                       decode > std::numeric_limits<int>::max() - prompt)) ||
         chunk <= 0 || warmups < 0 || repetitions <= 0) {
-        std::fprintf(stderr, "usage: %s MODEL TOKEN_FILE PROMPT CHUNK WARMUP REPS LOGITS\n", argv[0]);
+        std::fprintf(stderr,
+                     "usage: %s MODEL TOKEN_FILE PROMPT CHUNK WARMUP REPS LOGITS [DECODE]\n",
+                     argv[0]);
         return 2;
     }
     ggml_backend_load_all();
     llama_backend_init();
     const int status = run(argv[1], argv[2], prompt, std::min(chunk, prompt),
-                           warmups, repetitions, argv[7]);
+                           warmups, repetitions, argv[7], decode);
     llama_backend_free();
     return status;
 }

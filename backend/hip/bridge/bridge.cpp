@@ -1770,6 +1770,48 @@ yuuka_status validate_moe_route_plan_op(const yuuka_op & op) {
     return YUUKA_OK;
 }
 
+// validate_moe_route_selected_plan_op checks the one-row decode router. The
+// kernel keeps the top-k body of the binned route but has no counts or bucket
+// buffers, so the batch is exactly one row and the selected count is bounded by
+// one wave (32 lanes).
+yuuka_status validate_moe_route_selected_plan_op(const yuuka_op & op) {
+    const uint64_t rows = op.n[0];
+    const uint64_t experts = op.n[1];
+    const uint64_t used = op.n[2];
+    if (rows != 1 || experts == 0 || used == 0 || used > experts) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "invalid selected MoE route dimensions");
+    }
+    if (experts > 32 * 32 || used > 32) {
+        return fail(YUUKA_ERR_UNSUPPORTED,
+                    "selected MoE route supports at most 1024 experts and 32 slots");
+    }
+    if (op.off[0] != 0 || op.off[1] != 0 || op.off[2] != 0) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "selected MoE route requires zero offsets");
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (op.buf[i] == nullptr) {
+            return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                        "selected MoE route buffer %d is null", i);
+        }
+    }
+    uint64_t logits_bytes = 0;
+    uint64_t row_bytes = 0;
+    if (__builtin_mul_overflow(experts, uint64_t(4), &logits_bytes) ||
+        __builtin_mul_overflow(used, uint64_t(4), &row_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "selected MoE route dimensions overflow");
+    }
+    if (!buffer_range_ok(op.buf[0], 0, logits_bytes) ||
+        !buffer_range_ok(op.buf[1], 0, row_bytes) ||
+        !buffer_range_ok(op.buf[2], 0, row_bytes)) {
+        return fail(YUUKA_ERR_INVALID_ARGUMENT,
+                    "selected MoE route buffer is too small");
+    }
+    return YUUKA_OK;
+}
+
 yuuka_status validate_moe_gate_up_plan_op(const yuuka_op & op) {
     const uint64_t hidden = op.n[0];
     const uint64_t ffn = op.n[1];
@@ -2894,6 +2936,18 @@ yuuka_status execute_op(yuuka_op const & op, int32_t token, uint32_t position,
                     op_ptr<int32_t>(op, 5), op_ptr<float>(op, 6), stream));
             if (route_status != YUUKA_OK) {
                 return fail(route_status, "MoE route launch failed");
+            }
+            break;
+        }
+        case YUUKA_OP_MOE_ROUTE_SELECTED: {
+            const int experts = int(op.n[1]);
+            const int used = int(op.n[2]);
+            const yuuka_status route_status = static_cast<yuuka_status>(
+                yuuka::launch_moe_route_selected(
+                    op_ptr<const float>(op, 0), experts, used,
+                    op_ptr<int32_t>(op, 1), op_ptr<float>(op, 2), stream));
+            if (route_status != YUUKA_OK) {
+                return fail(route_status, "selected MoE route launch failed");
             }
             break;
         }
@@ -4119,7 +4173,7 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
         if (plan == nullptr || op == nullptr) {
             return fail(YUUKA_ERR_INVALID_ARGUMENT, "plan or op is null");
         }
-        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MOE_DOWN_MMQ) {
+        if (op->code < YUUKA_OP_GEMV || op->code > YUUKA_OP_MOE_ROUTE_SELECTED) {
             return fail(YUUKA_ERR_UNSUPPORTED, "unknown op code %u", op->code);
         }
         yuuka_status status = YUUKA_OK;
@@ -4204,6 +4258,9 @@ YUUKA_API yuuka_status yuuka_plan_add(yuuka_plan * plan, const yuuka_op * op) {
                 break;
             case YUUKA_OP_MOE_ROUTE:
                 status = validate_moe_route_plan_op(*op);
+                break;
+            case YUUKA_OP_MOE_ROUTE_SELECTED:
+                status = validate_moe_route_selected_plan_op(*op);
                 break;
             case YUUKA_OP_MOE_GATE_UP:
                 status = validate_moe_gate_up_plan_op(*op);

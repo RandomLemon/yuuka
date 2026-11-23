@@ -1,6 +1,7 @@
 //go:build hip && linux
 
-// prefill-compare measures HIP prefill through the final host logit row.
+// prefill-compare measures HIP prefill and an optional sequential one-token
+// decode through the final host logit rows.
 package main
 
 import (
@@ -26,6 +27,7 @@ import (
 type config struct {
 	model, tokens, logits               string
 	prompt, chunk, warmups, repetitions int
+	decode                              int
 	writeTokens                         bool
 }
 
@@ -38,6 +40,7 @@ func main() {
 	flag.IntVar(&cfg.chunk, "chunk", 512, "maximum prefill rows")
 	flag.IntVar(&cfg.warmups, "warmup", 2, "untimed repetitions")
 	flag.IntVar(&cfg.repetitions, "reps", 5, "timed repetitions")
+	flag.IntVar(&cfg.decode, "decode", 0, "continuation tokens decoded one at a time after prefill")
 	flag.BoolVar(&cfg.writeTokens, "write-tokens", false, "tokenize the fixed benchmark prompt into the token file")
 	flag.Parse()
 	if err := run(cfg); err != nil {
@@ -48,6 +51,7 @@ func main() {
 
 func run(cfg config) (err error) {
 	if cfg.model == "" || cfg.tokens == "" || cfg.prompt <= 0 || cfg.prompt > math.MaxInt32-64 ||
+		cfg.decode < 0 || cfg.decode > math.MaxInt32-cfg.prompt ||
 		cfg.chunk <= 0 || cfg.chunk > 4096 || cfg.warmups < 0 || cfg.repetitions <= 0 {
 		return errors.New("invalid benchmark arguments")
 	}
@@ -74,19 +78,28 @@ func run(cfg config) (err error) {
 	if err != nil {
 		return err
 	}
-	if len(data)%4 != 0 || len(data)/4 < cfg.prompt {
-		return fmt.Errorf("token file has %d bytes, need at least %d aligned bytes", len(data), 4*cfg.prompt)
+	needTokens := cfg.prompt + cfg.decode
+	if len(data)%4 != 0 || len(data)/4 < needTokens {
+		return fmt.Errorf("token file has %d bytes, need at least %d aligned bytes", len(data), 4*needTokens)
 	}
-	tokens := make([]int32, cfg.prompt)
-	if err := binary.Read(bytes.NewReader(data[:4*cfg.prompt]), binary.LittleEndian, tokens); err != nil {
+	tokens := make([]int32, needTokens)
+	if err := binary.Read(bytes.NewReader(data[:4*needTokens]), binary.LittleEndian, tokens); err != nil {
 		return err
 	}
 	model, err := qwen35.Load(reader)
 	if err != nil {
 		return err
 	}
+	for i, token := range tokens {
+		if token < 0 || int(token) >= model.Config.VocabSize {
+			return fmt.Errorf("token %d at index %d is outside model vocabulary", token, i)
+		}
+	}
 	const blockSize = 16
 	capacity := cfg.prompt + 64
+	if cfg.decode > 0 {
+		capacity = cfg.prompt + cfg.decode
+	}
 	chunk := min(cfg.chunk, cfg.prompt)
 	device, err := gpu.Open(reader, model, gpu.Options{
 		Blocks:       (capacity + blockSize - 1) / blockSize,
@@ -112,12 +125,13 @@ func run(cfg config) (err error) {
 
 	var logits []float32
 	samples := make([]int64, 0, cfg.repetitions)
+	decodeSamples := make([]int64, 0, cfg.repetitions)
 	for i := -cfg.warmups; i < cfg.repetitions; i++ {
 		if err := session.Reset(); err != nil {
 			return err
 		}
 		start := time.Now()
-		logits, err = session.Prefill(tokens, true)
+		logits, err = session.Prefill(tokens[:cfg.prompt], true)
 		elapsed := time.Since(start)
 		if err != nil {
 			return err
@@ -125,6 +139,25 @@ func run(cfg config) (err error) {
 		if i >= 0 {
 			samples = append(samples, elapsed.Nanoseconds())
 		}
+		if cfg.decode > 0 {
+			decodeStart := time.Now()
+			for j := range cfg.decode {
+				logits, err = session.Decode(tokens[cfg.prompt+j])
+				if err != nil {
+					return fmt.Errorf("decode token %d: %w", j, err)
+				}
+			}
+			decodeElapsed := time.Since(decodeStart)
+			if logits == nil {
+				return fmt.Errorf("decode token %d: missing host logits", cfg.decode-1)
+			}
+			if i >= 0 {
+				decodeSamples = append(decodeSamples, decodeElapsed.Nanoseconds())
+			}
+		}
+	}
+	if logits == nil || len(logits) != model.Config.VocabSize {
+		return fmt.Errorf("final host logits row has %d values, want %d", len(logits), model.Config.VocabSize)
 	}
 	top := 0
 	for i, value := range logits {
@@ -141,12 +174,14 @@ func run(cfg config) (err error) {
 		}
 	}
 	return json.NewEncoder(os.Stdout).Encode(struct {
-		Prompt    int     `json:"prompt"`
-		Chunk     int     `json:"chunk"`
-		Warmups   int     `json:"warmup"`
-		Top       int     `json:"top1"`
-		SamplesNS []int64 `json:"samples_ns"`
-	}{cfg.prompt, chunk, cfg.warmups, top, samples})
+		Prompt          int     `json:"prompt"`
+		Chunk           int     `json:"chunk"`
+		Warmups         int     `json:"warmup"`
+		Top             int     `json:"top1"`
+		SamplesNS       []int64 `json:"samples_ns"`
+		Decode          int     `json:"decode,omitempty"`
+		DecodeSamplesNS []int64 `json:"decode_samples_ns,omitempty"`
+	}{cfg.prompt, chunk, cfg.warmups, top, samples, cfg.decode, decodeSamples})
 }
 
 func writeBinary(path string, data any) error {

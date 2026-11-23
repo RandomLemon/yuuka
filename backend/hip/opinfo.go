@@ -60,6 +60,7 @@ const (
 	OpMoEDownQ8             uint32 = uint32(C.YUUKA_OP_MOE_DOWN_Q8)
 	OpMoEGateUpMMQ          uint32 = uint32(C.YUUKA_OP_MOE_GATE_UP_MMQ)
 	OpMoEDownMMQ            uint32 = uint32(C.YUUKA_OP_MOE_DOWN_MMQ)
+	OpMoERouteSelected      uint32 = uint32(C.YUUKA_OP_MOE_ROUTE_SELECTED)
 )
 
 // opFlagTail mirrors YUUKA_OP_FLAG_TAIL.
@@ -68,7 +69,7 @@ const opFlagTail = 0x1
 // MaxOpCode is the highest op code the bound ABI declares. The shadow covers
 // every code in 1..MaxOpCode, and opinfo_test.go fails when one of them has no
 // name or role.
-const MaxOpCode = OpMoEDownMMQ
+const MaxOpCode = OpMoERouteSelected
 
 // OpRole names what a plan operation holds in one of its buffer slots. The role
 // is a property of the ABI opcode, so it is recorded once per code in opRoles
@@ -234,6 +235,8 @@ func OpName(code uint32) string {
 		return "moe_gate_up_mmq"
 	case OpMoEDownMMQ:
 		return "moe_down_mmq"
+	case OpMoERouteSelected:
+		return "moe_route_selected"
 	default:
 		return "unknown"
 	}
@@ -308,6 +311,9 @@ func opRoles(code uint32) [3]OpRole {
 	case OpMoERoute, OpMoEGateUp:
 		// activation first, then the expert weights.
 		return [3]OpRole{RoleActivation, RoleWeight, RoleWeight}
+	case OpMoERouteSelected:
+		// logits, then the selected ids and normalized weights.
+		return [3]OpRole{RoleActivation, RoleControl, RoleOutput}
 	case OpMoEDown:
 		// activation, weights, counts, assignment, out.
 		return [3]OpRole{RoleActivation, RoleWeight, RoleControl}

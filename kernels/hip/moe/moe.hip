@@ -98,7 +98,7 @@ __device__ __forceinline__ float moe_dot_values(const float (&x)[kLaneValues],
 // max with a lowest-index tie-break that matches the ascending scan of the
 // reference selection, and the winner is masked out of the register set, so a
 // slot costs one pass over the row instead of a scan per slot.
-template <int kPerLane>
+template <int kPerLane, bool kBin>
 __global__ void moe_route_kernel(const float * logits, int rows, int experts,
                                  int used, int bucket_capacity, int32_t * ids,
                                  float * weights, int32_t * counts,
@@ -164,13 +164,21 @@ __global__ void moe_route_kernel(const float * logits, int rows, int experts,
     }
     const float normalized = total > 0.0f ? weight / total : weight;
     row_weights[lane] = normalized;
-    const int expert = row_ids[lane];
-    const int index = atomicAdd(counts + expert, 1);
-    if (index < bucket_capacity) {
-        const int64_t base = static_cast<int64_t>(expert) * bucket_capacity + index;
-        assign_rows[base] = row;
-        assign_slots[base] = lane;
-        assign_weights[base] = normalized;
+    if constexpr (kBin) {
+        const int expert = row_ids[lane];
+        const int index = atomicAdd(counts + expert, 1);
+        if (index < bucket_capacity) {
+            const int64_t base = static_cast<int64_t>(expert) * bucket_capacity + index;
+            assign_rows[base] = row;
+            assign_slots[base] = lane;
+            assign_weights[base] = normalized;
+        }
+    } else {
+        (void)bucket_capacity;
+        (void)counts;
+        (void)assign_rows;
+        (void)assign_slots;
+        (void)assign_weights;
     }
 }
 
@@ -662,6 +670,160 @@ __global__ void moe_reduce_add_kernel(float * x, const float * expert_out,
     }
 }
 
+// moe_reduce_add_one_8_kernel is the one-row, eight-slot, 2048-hidden form of
+// moe_reduce_add_kernel. Lane i of each 32-lane block owns one hidden column
+// and accumulates the eight weighted slot outputs in slot order.
+__global__ void moe_reduce_add_one_8_kernel(float * x, const float * expert_out,
+                                            const float * weights, int hidden) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * 32 + (threadIdx.x & 31);
+    if (i >= hidden) {
+        return;
+    }
+    float sum = 0.0f;
+    #pragma unroll
+    for (int slot = 0; slot < 8; ++slot) {
+        sum += weights[slot] * expert_out[static_cast<int64_t>(slot) * hidden + i];
+    }
+    x[i] += sum;
+}
+
+// The selected-expert decode specialization serves only the one-token,
+// eight-slot, hidden-2048/expert-FFN-512 shape on gfx1151. Each wave owns
+// kSelectedRows output rows and loads the activation span once per K step, so
+// the span is reused by gate and up and by both rows.
+#ifndef YUUKA_MOE_SELECTED_ROWS
+#define YUUKA_MOE_SELECTED_ROWS 1
+#endif
+#ifndef YUUKA_MOE_SELECTED_WARPS
+#define YUUKA_MOE_SELECTED_WARPS 4
+#endif
+constexpr int kSelectedRows = YUUKA_MOE_SELECTED_ROWS;
+constexpr int kSelectedWarps = YUUKA_MOE_SELECTED_WARPS;
+constexpr int kSelectedThreads = 32 * kSelectedWarps;
+constexpr int kSelectedRowsPerBlock = kSelectedWarps * kSelectedRows;
+
+__device__ __forceinline__ void load_values8(const float * x,
+                                             float (&out)[kLaneValues]) {
+    const float4 lo = *reinterpret_cast<const float4 *>(x);
+    const float4 hi = *reinterpret_cast<const float4 *>(x + 4);
+    out[0] = lo.x;
+    out[1] = lo.y;
+    out[2] = lo.z;
+    out[3] = lo.w;
+    out[4] = hi.x;
+    out[5] = hi.y;
+    out[6] = hi.z;
+    out[7] = hi.w;
+}
+
+template <MoeCodebook kCodebook>
+__global__ void moe_gate_up_selected_tuned_kernel(
+    const float * norm, const int32_t * ids, const uint8_t * gate_exps,
+    const uint8_t * up_exps, float * act, int used, int hidden, int ffn,
+    uint64_t hidden_row_bytes) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slot = blockIdx.y;
+    if (slot >= used) {
+        return;
+    }
+    const int first_row =
+        blockIdx.x * kSelectedRowsPerBlock + warp * kSelectedRows;
+    if (first_row >= ffn) {
+        return;
+    }
+    const int expert = ids[slot];
+    const float * x = norm;
+    const int64_t steps = hidden / kStepK;
+    float gate_acc[kSelectedRows];
+    float up_acc[kSelectedRows];
+    #pragma unroll
+    for (int r = 0; r < kSelectedRows; ++r) {
+        gate_acc[r] = 0.0f;
+        up_acc[r] = 0.0f;
+    }
+    for (int64_t step = 0; step < steps; ++step) {
+        const int64_t idx = step * kStepK + kLaneValues * lane;
+        float xv[kLaneValues];
+        load_values8(x + idx, xv);
+        #pragma unroll
+        for (int r = 0; r < kSelectedRows; ++r) {
+            const int row = first_row + r;
+            if (row >= ffn) {
+                continue;
+            }
+            const int64_t base =
+                static_cast<int64_t>(expert * ffn + row) * hidden_row_bytes;
+            float gate_w[kLaneValues];
+            float up_w[kLaneValues];
+            moe_span8<kCodebook>(0, gate_exps + base, idx, gate_w);
+            moe_span8<kCodebook>(0, up_exps + base, idx, up_w);
+            gate_acc[r] += moe_dot_values(xv, gate_w);
+            up_acc[r] += moe_dot_values(xv, up_w);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < kSelectedRows; ++r) {
+        const int row = first_row + r;
+        const float gate = warp_reduce_sum(gate_acc[r]);
+        const float up = warp_reduce_sum(up_acc[r]);
+        if (lane == 0 && row < ffn) {
+            act[static_cast<int64_t>(slot) * ffn + row] =
+                (gate / (1.0f + expf(-gate))) * up;
+        }
+    }
+}
+
+template <MoeCodebook kCodebook>
+__global__ void moe_down_selected_tuned_kernel(
+    const float * act, const int32_t * ids, const uint8_t * down_exps, float * out,
+    int used, int hidden, int ffn, uint64_t ffn_row_bytes) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slot = blockIdx.y;
+    if (slot >= used) {
+        return;
+    }
+    const int first_row =
+        blockIdx.x * kSelectedRowsPerBlock + warp * kSelectedRows;
+    if (first_row >= hidden) {
+        return;
+    }
+    const int expert = ids[slot];
+    const float * x = act + static_cast<int64_t>(slot) * ffn;
+    const int64_t steps = ffn / kStepK;
+    float acc[kSelectedRows];
+    #pragma unroll
+    for (int r = 0; r < kSelectedRows; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (int64_t step = 0; step < steps; ++step) {
+        const int64_t idx = step * kStepK + kLaneValues * lane;
+        float xv[kLaneValues];
+        load_values8(x + idx, xv);
+        #pragma unroll
+        for (int r = 0; r < kSelectedRows; ++r) {
+            const int row = first_row + r;
+            if (row >= hidden) {
+                continue;
+            }
+            const int64_t base =
+                static_cast<int64_t>(expert * hidden + row) * ffn_row_bytes;
+            float w[kLaneValues];
+            moe_span8<kCodebook>(0, down_exps + base, idx, w);
+            acc[r] += moe_dot_values(xv, w);
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < kSelectedRows; ++r) {
+        const int row = first_row + r;
+        const float total = warp_reduce_sum(acc[r]);
+        if (lane == 0 && row < hidden) {
+            out[static_cast<int64_t>(slot) * hidden + row] = total;
+        }
+    }
+}
+
 // moe_gate_up_selected_kernel computes one expert-FFN row for one selected
 // expert of one token. One warp owns one output row and decodes the packed rows
 // eight values per codebook fetch, so the grid no longer needs a block-wide
@@ -840,7 +1002,7 @@ int launch_moe_route(const float * logits, int rows, int experts, int used,
     }
     const dim3 grid(static_cast<unsigned>((rows + kWarps - 1) / kWarps));
     #define YUUKA_LAUNCH_MOE_ROUTE(PER_LANE)                                          \
-        moe_route_kernel<PER_LANE><<<grid, kThreads, 0, stream>>>(                     \
+        moe_route_kernel<PER_LANE, true><<<grid, kThreads, 0, stream>>>(                     \
             logits, rows, experts, used, bucket_capacity, ids, weights, counts,        \
             assign_rows, assign_slots, assign_weights)
     switch (per_lane) {
@@ -864,6 +1026,50 @@ int launch_moe_route(const float * logits, int rows, int experts, int used,
         break;
     }
     #undef YUUKA_LAUNCH_MOE_ROUTE
+    return YUUKA_OK;
+}
+
+// launch_moe_route_selected is the one-row decode form. It runs one wave, so
+// the top-k and softmax reduction order is the binned kernel's, and it skips the
+// count memset and the assignment atomics because the selected-expert kernels
+// consume only the ids and weights.
+int launch_moe_route_selected(const float * logits, int experts, int used,
+                              int32_t * ids, float * weights,
+                              hipStream_t stream) {
+    if (logits == nullptr || ids == nullptr || weights == nullptr ||
+        experts <= 0 || experts > 1024 || used <= 0 || used > experts ||
+        used > 32) {
+        return YUUKA_ERR_INVALID_ARGUMENT;
+    }
+    const int per_lane = moe_route_per_lane(experts);
+    if (per_lane == 0) {
+        return YUUKA_ERR_INVALID_ARGUMENT;
+    }
+    #define YUUKA_LAUNCH_MOE_ROUTE_SELECTED(PER_LANE)                                  \
+        moe_route_kernel<PER_LANE, false><<<1, 32, 0, stream>>>(                        \
+            logits, 1, experts, used, 1, ids, weights, nullptr, nullptr, nullptr,       \
+            nullptr)
+    switch (per_lane) {
+    case 1:
+        YUUKA_LAUNCH_MOE_ROUTE_SELECTED(1);
+        break;
+    case 2:
+        YUUKA_LAUNCH_MOE_ROUTE_SELECTED(2);
+        break;
+    case 4:
+        YUUKA_LAUNCH_MOE_ROUTE_SELECTED(4);
+        break;
+    case 8:
+        YUUKA_LAUNCH_MOE_ROUTE_SELECTED(8);
+        break;
+    case 16:
+        YUUKA_LAUNCH_MOE_ROUTE_SELECTED(16);
+        break;
+    default:
+        YUUKA_LAUNCH_MOE_ROUTE_SELECTED(32);
+        break;
+    }
+    #undef YUUKA_LAUNCH_MOE_ROUTE_SELECTED
     return YUUKA_OK;
 }
 
@@ -1011,6 +1217,15 @@ void launch_moe_reduce_add(float * x, const float * expert_out,
     if (rows <= 0 || used <= 0 || hidden <= 0) {
         return;
     }
+    if (rows == 1 && used == 8 && hidden == 2048) {
+        // One lane per hidden column: 64 Wave32 blocks cover the 2048 columns
+        // instead of one 256-thread block walking eight columns per lane. The
+        // eight slot products stay in the original slot order and the residual
+        // is added once.
+        moe_reduce_add_one_8_kernel<<<64, 32, 0, stream>>>(
+            x, expert_out, weights, hidden);
+        return;
+    }
     moe_reduce_add_kernel<<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
         x, expert_out, weights, rows, used, hidden);
 }
@@ -1023,10 +1238,21 @@ void launch_moe_gate_up_selected(const float * norm, const int32_t * ids,
     if (rows <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
         return;
     }
-    const dim3 grid(static_cast<unsigned>((ffn + kWarps - 1) / kWarps),
-                    static_cast<unsigned>(rows * used));
     const auto * gate = static_cast<const uint8_t *>(gate_exps);
     const auto * up = static_cast<const uint8_t *>(up_exps);
+    if (rows == 1 && used == 8 && hidden == 2048 && ffn == 512 &&
+        dtype == YUUKA_DTYPE_IQ2_XXS && hidden % (32 * kLaneValues) == 0) {
+        const dim3 tuned_grid(
+            static_cast<unsigned>((ffn + kSelectedRowsPerBlock - 1) /
+                                  kSelectedRowsPerBlock),
+            static_cast<unsigned>(used));
+        moe_gate_up_selected_tuned_kernel<MoeCodebook::IQ2XXS>
+            <<<tuned_grid, kSelectedThreads, 0, stream>>>(
+                norm, ids, gate, up, act, used, hidden, ffn, hidden_row_bytes);
+        return;
+    }
+    const dim3 grid(static_cast<unsigned>((ffn + kWarps - 1) / kWarps),
+                    static_cast<unsigned>(rows * used));
     #define YUUKA_LAUNCH_MOE_GATE_UP_SELECTED(CODEBOOK)                                \
         moe_gate_up_selected_kernel<CODEBOOK><<<grid, kThreads, 0, stream>>>(           \
             norm, ids, gate, up, act, rows, used, hidden, ffn, hidden_row_bytes, dtype)
@@ -1055,9 +1281,27 @@ void launch_moe_down_selected(const float * act, const int32_t * ids,
     if (rows <= 0 || used <= 0 || hidden <= 0 || ffn <= 0) {
         return;
     }
+    const auto * down = static_cast<const uint8_t *>(down_exps);
+    if (rows == 1 && used == 8 && hidden == 2048 && ffn == 512 &&
+        (dtype == YUUKA_DTYPE_IQ2_S || dtype == YUUKA_DTYPE_IQ3_S) &&
+        ffn % (32 * kLaneValues) == 0) {
+        const dim3 tuned_grid(
+            static_cast<unsigned>((hidden + kSelectedRowsPerBlock - 1) /
+                                  kSelectedRowsPerBlock),
+            static_cast<unsigned>(used));
+        if (dtype == YUUKA_DTYPE_IQ2_S) {
+            moe_down_selected_tuned_kernel<MoeCodebook::IQ2S>
+                <<<tuned_grid, kSelectedThreads, 0, stream>>>(
+                    act, ids, down, out, used, hidden, ffn, ffn_row_bytes);
+        } else {
+            moe_down_selected_tuned_kernel<MoeCodebook::IQ3S>
+                <<<tuned_grid, kSelectedThreads, 0, stream>>>(
+                    act, ids, down, out, used, hidden, ffn, ffn_row_bytes);
+        }
+        return;
+    }
     const dim3 grid(static_cast<unsigned>((hidden + kWarps - 1) / kWarps),
                     static_cast<unsigned>(rows * used));
-    const auto * down = static_cast<const uint8_t *>(down_exps);
     #define YUUKA_LAUNCH_MOE_DOWN_SELECTED(CODEBOOK)                                   \
         moe_down_selected_kernel<CODEBOOK><<<grid, kThreads, 0, stream>>>(              \
             act, ids, down, out, rows, used, hidden, ffn, ffn_row_bytes, dtype)

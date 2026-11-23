@@ -403,6 +403,17 @@ func decodeAttentionScratch(heads, headDim, scoreStride, capacity int) uint64 {
 	return uint64(serial)
 }
 
+// moeDecodeUsesSelectedRoute reports whether the one-token decode form can use
+// AddMoERouteSelected. The selected router keeps the candidates of one row in
+// one wave, so it serves at most 1024 experts and 32 selected slots; any other
+// shape keeps the binned route and its assignment buffers.
+func (m *Model) moeDecodeUsesSelectedRoute() bool {
+	cfg := m.config
+	return cfg.IsMoE() && cfg.ExpertCount > 0 && cfg.ExpertCount <= 1024 &&
+		cfg.ExpertUsedCount > 0 && cfg.ExpertUsedCount <= cfg.ExpertCount &&
+		cfg.ExpertUsedCount <= 32
+}
+
 // ffnWidth returns the widest feed-forward activation width a layer writes.
 // A dense layer writes its single FFN width; an MoE layer writes the shared
 // expert and the routed expert widths, so the shared activation buffers must
@@ -450,13 +461,19 @@ func (m *Model) allocActivations() error {
 			activationSize{&m.act.moeLogits, experts},
 			activationSize{&m.act.moeIDs, used},
 			activationSize{&m.act.moeWeights, used},
-			activationSize{&m.act.moeCounts, experts},
-			activationSize{&m.act.moeAssignRows, experts * used},
-			activationSize{&m.act.moeAssignSlots, experts * used},
-			activationSize{&m.act.moeAssignWeights, experts * used},
 			activationSize{&m.act.moeAct, used * uint64(cfg.ExpertFFNSize)},
 			activationSize{&m.act.moeOut, used * uint64(cfg.HiddenSize)},
 		)
+		// The binned route's counts and assignment buckets are only needed by
+		// a decode shape the one-wave selected form rejects.
+		if !m.moeDecodeUsesSelectedRoute() {
+			sizes = append(sizes,
+				activationSize{&m.act.moeCounts, experts},
+				activationSize{&m.act.moeAssignRows, experts * used},
+				activationSize{&m.act.moeAssignSlots, experts * used},
+				activationSize{&m.act.moeAssignWeights, experts * used},
+			)
+		}
 	}
 	for _, entry := range sizes {
 		buf, err := m.allocDevice(entry.n * 4)
@@ -643,15 +660,22 @@ func (m *Model) configurePrefill(rows int) error {
 				dst   **hip.Buffer
 				bytes uint64
 			}{&p.moeOut, rowSlots * hiddenWidth * 4},
-			struct {
-				dst   **hip.Buffer
-				bytes uint64
-			}{&p.moeQ8, rowSlots * expertWidth},
-			struct {
-				dst   **hip.Buffer
-				bytes uint64
-			}{&p.moeDS, rowSlots * (expertWidth / 32) * 8},
 		)
+		// The Q8_1 expert tile only exists when an expert row holds a whole
+		// 32-value quantization group; the tiny F32 fixture has a shorter
+		// expert width and selects the FP32 grouped route.
+		if expertWidth%32 == 0 {
+			entries = append(entries,
+				struct {
+					dst   **hip.Buffer
+					bytes uint64
+				}{&p.moeQ8, rowSlots * expertWidth},
+				struct {
+					dst   **hip.Buffer
+					bytes uint64
+				}{&p.moeDS, rowSlots * (expertWidth / 32) * 8},
+			)
+		}
 	}
 	p.attentionBlas = nil
 	p.attentionSplit = nil

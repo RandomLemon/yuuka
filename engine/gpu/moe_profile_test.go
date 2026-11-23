@@ -97,7 +97,7 @@ func TestGPUProfileMoE(t *testing.T) {
 		t.Fatal(err)
 	}
 	logMoEProfile(t, "decode", 1, time.Since(start), times)
-	logMoEExpertCounts(t, "decode", 1, rt, s.model.act.moeCounts)
+	logMoESelectedIDs(t, "decode", rt)
 }
 
 // moePrefillBenchmarkText is the fixed benchmark stream the prefill comparison
@@ -338,31 +338,32 @@ func logMoEPrefillLong(t *testing.T, n int, wall time.Duration,
 	}
 }
 
-// logMoEExpertCounts reports how many experts the last route selected and how
-// many assignments each one received. Every selected expert re-reads its whole
-// packed weight set, so the distribution is what decides whether the expert
-// stage streams the full expert weights or a fraction of them.
-func logMoEExpertCounts(t *testing.T, stage string, rows int, rt *Runtime,
-	counts *hip.Buffer) {
+// logMoESelectedIDs reports the experts the one-row selected route chose. The
+// ids drive which packed expert rows the decode kernel reads, so a duplicate or
+// an out-of-range id would measure a different expert set than the reference.
+func logMoESelectedIDs(t *testing.T, stage string, rt *Runtime) {
 	t.Helper()
 	experts := rt.model.config.ExpertCount
-	raw := make([]byte, 4*experts)
-	if err := rt.model.device.Download(raw, counts); err != nil {
+	used := rt.model.config.ExpertUsedCount
+	raw := make([]byte, 4*used)
+	if err := rt.model.device.Download(raw, rt.model.act.moeIDs); err != nil {
 		t.Fatal(err)
 	}
-	active, total, most := 0, 0, 0
-	for i := 0; i < experts; i++ {
-		count := int(int32(binary.LittleEndian.Uint32(raw[4*i:])))
-		if count > 0 {
-			active++
+	seen := make(map[int]bool, used)
+	ids := make([]int, used)
+	for i := range ids {
+		id := int(int32(binary.LittleEndian.Uint32(raw[4*i:])))
+		if id < 0 || id >= experts {
+			t.Fatalf("%s route id %d at slot %d is outside %d experts", stage, id, i,
+				experts)
 		}
-		total += count
-		if count > most {
-			most = count
+		if seen[id] {
+			t.Fatalf("%s route selected expert %d twice", stage, id)
 		}
+		seen[id] = true
+		ids[i] = id
 	}
-	t.Logf("%s route: rows=%d experts=%d active=%d assignments=%d used=%d max_per_expert=%d",
-		stage, rows, experts, active, total, rt.model.config.ExpertUsedCount, most)
+	t.Logf("%s route: used=%d ids=%v", stage, used, ids)
 }
 
 func logMoEProfile(t *testing.T, stage string, rows int, wall time.Duration,
@@ -391,5 +392,191 @@ func logMoEProfile(t *testing.T, stage string, rows int, wall time.Duration,
 	for _, item := range rowsOut {
 		t.Logf("  %-24s n=%4d %9.3f ms %5.1f%%", hip.OpName(item.code), item.count,
 			float64(item.ns)/1e6, 100*float64(item.ns)/float64(total))
+	}
+}
+
+// TestGPUProfileMoEDecodeContexts attributes the shipping one-token decode at
+// populated prompt positions. It resets the session, prefills the requested
+// prefix at the release chunk size, and then advances decode one token at a
+// time, profiling only steps 0, 63, and 127 while the intervening steps use the
+// normal execution path. Each cell sizes the KV pool to P+128 because the
+// attention grid uses the model capacity, not the populated prefix.
+//
+// The test is a diagnostic: operation events and the host clocks are not part of
+// a release measurement. It is opt-in through YUUKA_TEST_MOE_MODEL, and a
+// supplied target model on a host with the HIP runtime must execute.
+func TestGPUProfileMoEDecodeContexts(t *testing.T) {
+	reader, tok, model := openMoEModel(t)
+	const length = 8320
+	const decodeSteps = 128
+	ids, err := tok.Encode(strings.Repeat(moePrefillBenchmarkText, length))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) < length {
+		t.Fatalf("benchmark prompt produced %d tokens, need %d", len(ids), length)
+	}
+	ids = ids[:length]
+	for _, prompt := range []int{512, 2048, 8192} {
+		t.Run(fmt.Sprintf("P%d", prompt), func(t *testing.T) {
+			opts := Options{KVType: tensor.F16, KVTypeSet: true}
+			rt, err := newRuntime(reader, model, prompt+decodeSteps, opts)
+			if err != nil {
+				t.Fatalf("HIP runtime unavailable: %v", err)
+			}
+			defer rt.Close()
+			if err := rt.SetPrefillChunk(512); err != nil {
+				t.Fatal(err)
+			}
+			s := rt.session
+			if err := s.Reset(); err != nil {
+				t.Fatal(err)
+			}
+			logits, err := s.Prefill(ids[:prompt], true)
+			if err != nil {
+				t.Fatalf("prefill %d: %v", prompt, err)
+			}
+			if got := s.Position(); got != prompt {
+				t.Fatalf("position after prefill is %d, want %d", got, prompt)
+			}
+			if len(logits) != model.Config.VocabSize {
+				t.Fatalf("prefill returned %d logits, want %d", len(logits),
+					model.Config.VocabSize)
+			}
+			shadow := s.plan.Ops()
+			names := decodeBufferNames(rt.model, s)
+			samples := make([]decodeSample, 0, 3*len(shadow))
+			for j := range decodeSteps {
+				if got := s.Position(); got != prompt+j {
+					t.Fatalf("position before step %d is %d, want %d", j, got, prompt+j)
+				}
+				if j == 0 || j == 63 || j == decodeSteps-1 {
+					times, err := s.ProfileStep(ids[prompt+j])
+					if err != nil {
+						t.Fatalf("profile step %d: %v", j, err)
+					}
+					if len(times) != len(shadow) {
+						t.Fatalf("step %d executed %d operations, plan holds %d",
+							j, len(times), len(shadow))
+					}
+					for i, item := range times {
+						if shadow[i].Code != item.Code {
+							t.Fatalf("step %d operation %d is %s, plan holds %s",
+								j, i, hip.OpName(item.Code), shadow[i].Name())
+						}
+					}
+					samples = append(samples, decodeSamples(shadow, times, names)...)
+				} else if _, err := s.Decode(ids[prompt+j]); err != nil {
+					t.Fatalf("decode step %d: %v", j, err)
+				}
+			}
+			if got := s.Position(); got != prompt+decodeSteps {
+				t.Fatalf("position after decode is %d, want %d", got, prompt+decodeSteps)
+			}
+			logMoEDecodeContexts(t, prompt, len(shadow), samples)
+		})
+	}
+}
+
+// moeDecodeGroupKey keeps the op code, weight identity, dtype, and shape in the
+// aggregation so two projections that share an op code remain distinguishable.
+type moeDecodeGroupKey struct {
+	code   uint32
+	tensor string
+	dtype  tensor.DType
+	shape  string
+}
+
+// moeDecodeCategory names the stage an operation belongs to. The names follow
+// the decode attribution headings: selected experts, routing, shared expert,
+// dense projections, the vocabulary head, recurrent state, paged attention, and
+// residual accumulation.
+func moeDecodeCategory(s decodeSample) string {
+	switch s.info.Code {
+	case hip.OpMoERoute, hip.OpMoERouteSelected:
+		return "router_topk"
+	case hip.OpMoEGateUpSelected, hip.OpMoEGateUpQ8, hip.OpMoEGateUpMMQ:
+		return "selected_gate_up"
+	case hip.OpMoEDownSelected, hip.OpMoEDownQ8, hip.OpMoEDownMMQ:
+		return "selected_down"
+	case hip.OpMoEReduceAdd:
+		return "routed_reduce"
+	case hip.OpMoESharedAdd:
+		return "shared_add"
+	case hip.OpGDN, hip.OpRecurrentToken, hip.OpConv1D, hip.OpConvL2Norm:
+		return "recurrent"
+	case hip.OpAttentionPaged:
+		return "paged_attention"
+	case hip.OpAdd:
+		return "residual_add"
+	case hip.OpGemv, hip.OpGemvBatch, hip.OpGemvResidual, hip.OpGemvPair,
+		hip.OpGemvQ8_1, hip.OpLMHead:
+		switch s.tensor {
+		case "ffn_gate_inp.weight":
+			return "router_projection"
+		case "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+			"ffn_gate_inp_shexp.weight":
+			return "shared_expert"
+		case "output.weight":
+			return "vocab_head"
+		case "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight":
+			return "dense_attention"
+		case "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight":
+			return "recurrent"
+		case "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight":
+			return "dense_ffn"
+		}
+		return "other_matvec"
+	}
+	return "other"
+}
+
+// logMoEDecodeContexts reports per-operation and per-stage cost over the three
+// profiled steps at one populated prompt position.
+func logMoEDecodeContexts(t *testing.T, prompt, planOps int, samples []decodeSample) {
+	t.Helper()
+	steps := 3
+	groups := make(map[moeDecodeGroupKey]uint64)
+	categories := make(map[string]uint64)
+	var total uint64
+	for _, sample := range samples {
+		ns := uint64(sample.ms * 1e6)
+		total += ns
+		key := moeDecodeGroupKey{sample.info.Code, sample.tensor, sample.dtype,
+			sample.shapeText()}
+		groups[key] += ns
+		categories[moeDecodeCategory(sample)] += ns
+	}
+	type row struct {
+		key moeDecodeGroupKey
+		ns  uint64
+	}
+	rowsOut := make([]row, 0, len(groups))
+	for key, ns := range groups {
+		rowsOut = append(rowsOut, row{key, ns})
+	}
+	sort.Slice(rowsOut, func(i, j int) bool { return rowsOut[i].ns > rowsOut[j].ns })
+	type categoryRow struct {
+		name string
+		ns   uint64
+	}
+	categoryRows := make([]categoryRow, 0, len(categories))
+	for name, ns := range categories {
+		categoryRows = append(categoryRows, categoryRow{name, ns})
+	}
+	sort.Slice(categoryRows, func(i, j int) bool {
+		return categoryRows[i].ns > categoryRows[j].ns
+	})
+	t.Logf("P=%d plan_ops=%d profiled_steps=%d total=%.3f ms mean_step=%.3f ms",
+		prompt, planOps, steps, float64(total)/1e6, float64(total)/1e6/float64(steps))
+	for _, item := range categoryRows {
+		t.Logf("  stage %-20s %9.3f ms %5.1f%% %8.3f ms/step",
+			item.name, float64(item.ns)/1e6, 100*float64(item.ns)/float64(total),
+			float64(item.ns)/1e6/float64(steps))
+	}
+	for _, item := range rowsOut {
+		t.Logf("  op %-24s %-28s %-4v %-16s %9.3f ms %8.3f ms/step",
+			hip.OpName(item.key.code), item.key.tensor, item.key.dtype,
+			item.key.shape, float64(item.ns)/1e6, float64(item.ns)/1e6/float64(steps))
 	}
 }

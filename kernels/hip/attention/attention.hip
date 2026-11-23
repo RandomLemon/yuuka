@@ -333,14 +333,19 @@ __device__ __forceinline__ void load_value_pair(const void * pool, uint32_t dtyp
 // share the KV head accumulate their online-softmax state in registers. K and V
 // rows are read once per block, so a KV row is read once per tile rather than
 // once per query head. The partial results are merged by
-// attention_flash_combine.
-template <int kGroup, int kVecBlocks, bool kDense>
+// attention_flash_combine. kSubgroups defaults to one; the measured two-subgroup
+// variant reduced live accumulators but doubled K/V traffic and is not shipped.
+template <int kGroup, int kVecBlocks, bool kDense, int kSubgroups = 1>
 __global__ void attention_paged_flash_kernel(
     const float * q, const void * k_pool, const void * v_pool, float * partials,
     const int32_t * block_table, const int32_t * dynamic, int block_size,
     int heads, int head_dim, int kv_dim, int position, int ntiles, int tile_length,
     float scale, uint32_t dtype) {
-    const int kvh = blockIdx.x;
+    constexpr int kHeads = kGroup / kSubgroups;
+    static_assert(kGroup % kSubgroups == 0, "subgroup must divide the group");
+    const int kvh = blockIdx.x / kSubgroups;
+    const int sub = blockIdx.x % kSubgroups;
+    const int head0 = kvh * kGroup + sub * kHeads;
     const int tile = blockIdx.y;
     const int tid = threadIdx.x;
     const int lane = tid % 32;
@@ -348,23 +353,28 @@ __global__ void attention_paged_flash_kernel(
     const int nwarps = blockDim.x / 32;
     const int length = (dynamic != nullptr ? dynamic[1] : position) + 1;
     const int start = tile * tile_length;
+    // A captured graph launches its original tile extent; a tile that is dead
+    // at the replayed position returns uniformly before any barrier or K/V read.
+    if (start >= length) {
+        return;
+    }
     const int valid = min(tile_length, length - start);
 
     // Dynamic shared memory: two score-sized arrays, then the per-head tile max
     // and tile sum.
     extern __shared__ float smem[];
     float * score_tile = smem;
-    float * weight_tile = smem + tile_length * kGroup;
-    float * tile_max = smem + 2 * tile_length * kGroup;
-    float * tile_sum = tile_max + kGroup;
+    float * weight_tile = smem + tile_length * kHeads;
+    float * tile_max = smem + 2 * tile_length * kHeads;
+    float * tile_sum = tile_max + kHeads;
 
     const int stride_q = kDense ? head_dim : 2 * head_dim;
     // The query row is per query head; every lane keeps the dims it owns for all
     // heads of the group, so the score phase needs no shared-memory query.
-    float qreg[kGroup][4 * kVecBlocks];
+    float qreg[kHeads][4 * kVecBlocks];
     #pragma unroll
-    for (int h = 0; h < kGroup; ++h) {
-        const float * row = q + (kvh * kGroup + h) * stride_q;
+    for (int h = 0; h < kHeads; ++h) {
+        const float * row = q + (head0 + h) * stride_q;
         #pragma unroll
         for (int block = 0; block < kVecBlocks; ++block) {
             const int dim = block * 128 + lane * 4;
@@ -383,11 +393,11 @@ __global__ void attention_paged_flash_kernel(
         }
     }
 
-    float acc[kGroup][2];
-    float running_max[kGroup];
-    float running_sum[kGroup];
+    float acc[kHeads][2];
+    float running_max[kHeads];
+    float running_sum[kHeads];
     #pragma unroll
-    for (int h = 0; h < kGroup; ++h) {
+    for (int h = 0; h < kHeads; ++h) {
         acc[h][0] = 0.0f;
         acc[h][1] = 0.0f;
         running_max[h] = -INFINITY;
@@ -405,7 +415,7 @@ __global__ void attention_paged_flash_kernel(
         load_key_span<kVecBlocks>(k_pool, dtype, row, kvh * head_dim, head_dim,
                                   kv_dim, lane, kreg);
         #pragma unroll
-        for (int h = 0; h < kGroup; ++h) {
+        for (int h = 0; h < kHeads; ++h) {
             float sum = 0.0f;
             #pragma unroll
             for (int i = 0; i < 4 * kVecBlocks; ++i) {
@@ -413,21 +423,21 @@ __global__ void attention_paged_flash_kernel(
             }
             sum = warp_reduce_sum(sum);
             if (lane == 0) {
-                score_tile[(p - start) * kGroup + h] = sum * scale;
+                score_tile[(p - start) * kHeads + h] = sum * scale;
             }
         }
     }
     __syncthreads();
-    if (tid < kGroup) {
+    if (tid < kHeads) {
         float max = -INFINITY;
         for (int i = 0; i < valid; ++i) {
-            max = fmaxf(max, score_tile[i * kGroup + tid]);
+            max = fmaxf(max, score_tile[i * kHeads + tid]);
         }
         tile_max[tid] = max;
     }
     __syncthreads();
     #pragma unroll
-    for (int h = 0; h < kGroup; ++h) {
+    for (int h = 0; h < kHeads; ++h) {
         const float previous = running_max[h];
         const float next = fmaxf(previous, tile_max[h]);
         const float rescale = isinf(previous) ? 0.0f : expf(previous - next);
@@ -437,11 +447,11 @@ __global__ void attention_paged_flash_kernel(
         acc[h][1] *= rescale;
     }
     // One warp per head exponentiates the tile and reduces its weight sum.
-    if (warp < kGroup) {
+    if (warp < kHeads) {
         float total = 0.0f;
         for (int i = lane; i < valid; i += 32) {
-            const float value = expf(score_tile[i * kGroup + warp] - running_max[warp]);
-            weight_tile[i * kGroup + warp] = value;
+            const float value = expf(score_tile[i * kHeads + warp] - running_max[warp]);
+            weight_tile[i * kHeads + warp] = value;
             total += value;
         }
         total = warp_reduce_sum(total);
@@ -451,7 +461,7 @@ __global__ void attention_paged_flash_kernel(
     }
     __syncthreads();
     #pragma unroll
-    for (int h = 0; h < kGroup; ++h) {
+    for (int h = 0; h < kHeads; ++h) {
         running_sum[h] += tile_sum[h];
     }
     // Value phase: one thread per output dim pair, so a warp covers a 32-value
@@ -464,10 +474,10 @@ __global__ void attention_paged_flash_kernel(
             const int64_t row = paged_row(block_table, block_size, start + i);
             float value[2];
             load_value_pair(v_pool, dtype, row, col, kv_dim, value);
-            float weight[kGroup];
-            load_group<kGroup>(weight_tile + i * kGroup, weight);
+            float weight[kHeads];
+            load_group<kHeads>(weight_tile + i * kHeads, weight);
             #pragma unroll
-            for (int h = 0; h < kGroup; ++h) {
+            for (int h = 0; h < kHeads; ++h) {
                 acc[h][0] += weight[h] * value[0];
                 acc[h][1] += weight[h] * value[1];
             }
@@ -479,8 +489,8 @@ __global__ void attention_paged_flash_kernel(
     __syncthreads();
 
     #pragma unroll
-    for (int h = 0; h < kGroup; ++h) {
-        const int head = kvh * kGroup + h;
+    for (int h = 0; h < kHeads; ++h) {
+        const int head = head0 + h;
         float * partial = partials + (head * ntiles + tile) * head_dim;
         if (tid < pairs) {
             partial[tid * 2 + 0] = acc[h][0];
@@ -503,9 +513,7 @@ __global__ void attention_flash_combine_kernel(
     const int head = blockIdx.x / splits;
     const int split = blockIdx.x % splits;
     const int dim = split * 64 + static_cast<int>(threadIdx.x);
-    if (head >= heads || dim >= head_dim) {
-        return;
-    }
+    const bool active = head < heads && dim < head_dim;
     // An empty tile is still launched, so the merge stops at the last live tile.
     const int length = (dynamic != nullptr ? dynamic[1] : position) + 1;
     const int live = min(ntiles, (length + tile - 1) / tile);
@@ -515,12 +523,29 @@ __global__ void attention_flash_combine_kernel(
     for (int t = 0; t < live; ++t) {
         max = fmaxf(max, stats[2 * t]);
     }
+    // One exp and one stat read per tile per 64-dimension block, staged in
+    // bounded shared memory; the numerator and denominator keep tile order.
+    __shared__ float weights[64];
     float numerator = 0.0f;
     float denominator = 0.0f;
-    for (int t = 0; t < live; ++t) {
-        const float weight = expf(stats[2 * t] - max);
-        numerator += weight * part[t * head_dim + dim];
-        denominator += weight * stats[2 * t + 1];
+    for (int base = 0; base < live; base += 64) {
+        const int chunk = min(64, live - base);
+        if (static_cast<int>(threadIdx.x) < chunk) {
+            weights[threadIdx.x] = expf(stats[2 * (base + threadIdx.x)] - max);
+        }
+        __syncthreads();
+        if (active) {
+            #pragma unroll 4
+            for (int i = 0; i < chunk; ++i) {
+                const float weight = weights[i];
+                numerator += weight * part[(base + i) * head_dim + dim];
+                denominator += weight * stats[2 * (base + i) + 1];
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) {
+        return;
     }
     float value = (denominator != 0.0f) ? numerator / denominator : 0.0f;
     if constexpr (!kDense) {
@@ -555,7 +580,7 @@ int flash_vec_blocks(int head_dim) {
 
 // launch_flash<KGroup, kVecBlocks, kDense> launches the split-key kernel and its
 // merge pass for one shape.
-template <int kGroup, int kVecBlocks, bool kDense>
+template <int kGroup, int kVecBlocks, bool kDense, int kSubgroups = 1>
 void launch_flash(float * out, const float * q, const void * k_pool,
                   const void * v_pool, float * partials,
                   const int32_t * block_table, const int32_t * dynamic,
@@ -564,11 +589,21 @@ void launch_flash(float * out, const float * q, const void * k_pool,
                   uint32_t dtype, hipStream_t stream) {
     const int tile = flash_tile(capacity);
     const int ntiles = (capacity + tile - 1) / tile;
-    const dim3 grid(static_cast<unsigned int>(kv_heads),
-                    static_cast<unsigned int>(ntiles));
-    const size_t shared = static_cast<size_t>(2 * tile * kGroup + 2 * kGroup) *
+    // A plain submission only schedules tiles that hold a live position. A
+    // captured graph keeps its recorded extent and the kernel returns early for
+    // the dead tiles from dynamic[1].
+    int dispatched = ntiles;
+    if (dynamic == nullptr) {
+        const int live = (position + tile) / tile;
+        dispatched = live < ntiles ? live : ntiles;
+    }
+    constexpr int kHeads = kGroup / kSubgroups;
+    static_assert(kGroup % kSubgroups == 0, "subgroup must divide the group");
+    const dim3 grid(static_cast<unsigned int>(kv_heads * kSubgroups),
+                    static_cast<unsigned int>(dispatched));
+    const size_t shared = static_cast<size_t>(2 * tile * kHeads + 2 * kHeads) *
                           sizeof(float);
-    attention_paged_flash_kernel<kGroup, kVecBlocks, kDense>
+    attention_paged_flash_kernel<kGroup, kVecBlocks, kDense, kSubgroups>
         <<<grid, kThreads, shared, stream>>>(q, k_pool, v_pool, partials,
                                              block_table, dynamic, block_size, heads,
                                              head_dim, kv_dim, position, ntiles,

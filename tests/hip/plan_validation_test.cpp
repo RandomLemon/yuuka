@@ -151,6 +151,65 @@ int main() {
                     "MOE_REDUCE_ADD overflow") && ok;
     }
     {
+        // The one-row selected router takes logits, ids, and weights only. The
+        // roomy buffer holds 64 exponents, 8 ids, and 8 weights.
+        yuuka_op op = make_op(YUUKA_OP_MOE_ROUTE_SELECTED, roomy);
+        op.n[0] = 1;
+        op.n[1] = 64;
+        op.n[2] = 8;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_OK, "MOE_ROUTE_SELECTED") && ok;
+    }
+    {
+        yuuka_op op = make_op(YUUKA_OP_MOE_ROUTE_SELECTED, roomy);
+        op.n[0] = 2;
+        op.n[1] = 64;
+        op.n[2] = 8;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "MOE_ROUTE_SELECTED rows") && ok;
+    }
+    {
+        yuuka_op op = make_op(YUUKA_OP_MOE_ROUTE_SELECTED, roomy);
+        op.n[0] = 1;
+        op.n[1] = 64;
+        op.n[2] = 33;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_UNSUPPORTED,
+                    "MOE_ROUTE_SELECTED slots") && ok;
+    }
+    {
+        yuuka_op op = make_op(YUUKA_OP_MOE_ROUTE_SELECTED, roomy);
+        op.n[0] = 1;
+        op.n[1] = 1025;
+        op.n[2] = 8;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_UNSUPPORTED,
+                    "MOE_ROUTE_SELECTED experts") && ok;
+    }
+    {
+        yuuka_op op = make_op(YUUKA_OP_MOE_ROUTE_SELECTED, tiny);
+        op.n[0] = 1;
+        op.n[1] = 2;
+        op.n[2] = 1;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "MOE_ROUTE_SELECTED short") && ok;
+    }
+    {
+        yuuka_op op = make_op(YUUKA_OP_MOE_ROUTE_SELECTED, roomy);
+        op.buf[2] = nullptr;
+        op.n[0] = 1;
+        op.n[1] = 64;
+        op.n[2] = 8;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "MOE_ROUTE_SELECTED missing") && ok;
+    }
+    {
+        yuuka_op op = make_op(YUUKA_OP_MOE_ROUTE_SELECTED, roomy);
+        op.off[1] = 4;
+        op.n[0] = 1;
+        op.n[1] = 64;
+        op.n[2] = 8;
+        ok = expect(yuuka_plan_add(plan, &op), YUUKA_ERR_INVALID_ARGUMENT,
+                    "MOE_ROUTE_SELECTED offset") && ok;
+    }
+    {
         // The streaming LM head keeps one accumulator per row per channel in
         // registers, so a row block above the cap has no kernel.
         yuuka_op op = make_op(YUUKA_OP_LM_HEAD, roomy);

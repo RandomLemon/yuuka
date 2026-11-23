@@ -337,6 +337,11 @@ int launch_moe_route(const float * logits, int rows, int experts, int used,
                      int32_t * counts, int32_t * assign_rows,
                      int32_t * assign_slots, float * assign_weights,
                      hipStream_t stream);
+/* One-row decode routing: one wave computes the top-k ids and normalized
+ * weights without the count memset or the assignment-bin atomics. */
+int launch_moe_route_selected(const float * logits, int experts, int used,
+                              int32_t * ids, float * weights,
+                              hipStream_t stream);
 void launch_moe_gate_up_grouped(const float * norm, const void * gate_exps,
                                 const void * up_exps, const int32_t * counts,
                                 const int32_t * assign_rows,

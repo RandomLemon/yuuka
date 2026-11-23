@@ -503,7 +503,25 @@ The test has no pass/fail gate: every MoE stage that has a recorded constant is
 gated by the real-model tests of the same package
 (`TestGPUMoEGoldenGeneration`, `TestGPUMoEChunkedPrefill`,
 `TestTinyGPUMoEMatchesCPU`), and the profile is a ranking tool.
-`TestGPUProfileMoEPrefillLong` runs the same per-operation profile over the
+`TestGPUMoEDecodeMatchesControl` records or replays the prefill row and 128
+teacher-forced decode rows at each of the three lengths. Recording requires
+`YUUKA_TEST_MOE_DECODE_RECORD=1` and an empty
+`YUUKA_TEST_MOE_DECODE_CONTROL_DIR=...`; it checks the GGUF and token-stream
+digests and refuses to overwrite a control file. Replay streams one row at a
+time, checks the exact `129*vocab*4` size, requires finite logits and the
+control top-1 on every row, and gates the prefill row bitwise and the decode
+rows at the documented tolerance. The frozen controls produced zero maximum
+difference, so the check remains bitwise.
+`TestGPUMoEGoldenDecodePrefixes` feeds each previous top-1 back and checks the
+recorded four-token continuations after the 512, 2048, and 8192 prefixes.
+`TestGPUProfileMoEDecodeContexts` profiles the shipping one-token decode at 512,
+2048, and 8192 populated prompt tokens. Each cell allocates a session for that
+cell's `P+128` capacity, resets, prefills the fixed stream at a 512-row chunk,
+asserts `s.Position() == P`, and profiles steps 0, 63, and 127 while the
+intervening steps use normal `Decode`. It aggregates by operation code, tensor
+leaf, dtype, and shape and reports the decode stages separately; it is a
+diagnostic with no pass/fail gate.
+`TestGPUMoEPrefillLong` runs the same per-operation profile over the
 fixed 8192-token stream at the release chunk, executing every chunk at its
 populated absolute position and grouping dense GEMMs by tensor leaf, dtype,
 path, and shape. Its `continuation` subtest prints the final logits and
@@ -651,8 +669,11 @@ block dequantization has separate reference tests for `IQ2_XXS`, `IQ2_S`, and
 `IQ3_S` on both backends. Synthetic coverage includes a tiny F32 `qwen35moe`
 fixture on the CPU and HIP paths and a scripted partial-accept speculative
 rollback test. Native coverage includes the grouped MoE kernels for F32 and
-Q4_K, the selected and grouped pipelines for IQ2_XXS/IQ2_S/IQ3_S expert
-matrices, the Q8_1 int8 expert pipeline (compared against a host computation
+Q4_K, the binned and one-wave selected routers on tied, negative, and
+lane-spanning logits, the selected reduce against the generic block reduce
+across the 2048 hidden columns, the selected and grouped pipelines for
+IQ2_XXS/IQ2_S/IQ3_S expert matrices (including the 2048/512 release shape), the
+Q8_1 int8 expert pipeline (compared against a host computation
 over the dequantized Q8_1 activations), the int8 WMMA expert pipeline for Q4_K
 and Q6_K experts at assignment tiles 16, 32, 64, and 128 with partially filled
 buckets (`hip_moe_mmq_correctness`, projections compared against a host

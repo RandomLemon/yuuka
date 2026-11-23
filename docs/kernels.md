@@ -115,7 +115,7 @@ hard-coded from another GPU.
 
 | Kernel family | Main scenario | Optimization focus |
 | --- | --- | --- |
-| `gemv_row` / `gemv_row_pair` | Decode matvec (selected, one row, K % 512 == 0) | One wave per output row, sixteen K values per lane, two rows per wave, no shared staging and no barrier in K |
+| `gemv_row` / `gemv_row_pair` | Decode matvec (selected, one row, K % 512 == 0) | One wave per output row, sixteen K values per lane, no shared staging and no barrier in K |
 | `lm_head_stream` | Decode matvec fallback, both output projections | One wave per four output channels, 16-byte packed reads, LDS activation staging, wave reduction, no block barrier in K |
 | `gemv_i8` | Decode matvec, opt-in and not selected | Same mapping over int8 digits, one `v_dot4` per four weights, per-sub-block scale and minimum |
 | `lm_head_stream` epilogues | Decode matvec (selected) | Same streaming kernel with the residual add in the epilogue, or walking a second packed matrix to form the SwiGLU product (`GEMV_RESIDUAL`, `GEMV_PAIR`) |
@@ -128,14 +128,14 @@ hard-coded from another GPU.
 
 | `flash_attention` | Prefill | Online softmax, causal mask, GQA |
 | `attention_prefill_paged_blas_f16` | F16 prefill, 2048+ positions | Gathered K/V, rocBLAS QK/PV, FP32 softmax |
-| `attention_paged_flash` / `attention_flash_combine` | Decode (selected) | Block table, one block per KV head and key tile, online softmax in registers, split partials merged by log-sum-exp |
+| `attention_paged_flash` / `attention_flash_combine` | Decode (selected) | Block table, live-tile dispatch, online softmax in registers, split partials merged by log-sum-exp with bounded shared staging |
 | `attention_paged` (serial) | Decode fallback and reference | One block per query head, sequential positions, per-head score workspace |
 | `rmsnorm` / `rope` | All stages | Minimize memory traffic and launches |
 | `fused_swiglu` | FFN | SiLU, gate, and multiply |
 | `moe_route` / `moe_gate_up_grouped` / `moe_down_grouped` | Sparse MoE prefill | Top-k routing, per-expert assignment bins, packed expert reads |
 | `moe_gate_up_q8` / `moe_down_q8` | Sparse MoE prefill, IQ experts | Q8_1 activation tile, int8 `dp4a`, sixteen-assignment tile |
 | `moe_gate_up_mmq` / `moe_down_mmq` | Sparse MoE prefill, K-quant and IQ experts | Q8_1 activation tile, int8 WMMA, 16-128 assignment tile, gather/scatter through the routed bucket |
-| `moe_gate_up_selected` / `moe_down_selected` / `moe_shared_add` | Sparse MoE decode | One grid per routing slot, no binning, sigmoid-gated shared expert |
+| `moe_route_selected` / `moe_gate_up_selected` / `moe_down_selected` / `moe_shared_add` | Sparse MoE decode | One-wave router without bins, one grid per routing slot, sigmoid-gated shared expert |
 | `sampling` | Output | GPU sampling or a low-cost host path |
 
 ## 5. Decode: quantized GEMV
@@ -261,21 +261,30 @@ kernel.
 matvec. It changes the mapping rather than the arithmetic, so a regression is
 attributable to dispatch rather than to numerics:
 
-- Grid `ceil(n_out / 8)`: one block covers eight output rows (four waves, two
-  rows per wave), so a 1024-output projection launches 128 blocks instead of 32.
+- Grid `ceil(n_out / 4)`: one block covers four output rows (four waves, one
+  row per wave), so a 1024-output projection launches 256 blocks instead of 32.
+  The two-row form was measured slower on the release shapes: the second row per
+  wave did not add memory-level parallelism and left fewer blocks for the
+  latency-bound projections.
 - A lane owns sixteen consecutive K values and decodes them from one 8- to
   16-byte span of the packed row through `decode_span16`, which is the wide form
   of `decode_span4`: Q4_K and Q5_K spans are 16-byte aligned vector loads, F16
   and F32 spans are 32- and 64-byte reads, and Q6_K, Q8_0, Q4_0, and Q5_0 rows
   have strides that are not a multiple of sixteen bytes, so their spans are
   copied with four 32-bit loads.
-- A wave steps K in 512-value steps, reads its sixteen activation values once
-  per step, and reuses them for both of its rows. The activation row is small
-  enough to stay in L1, so the kernel stages nothing in shared memory and has no
-  barrier inside the K loop; the only sync is the wave shuffle tree per row.
+- A wave steps K in 512-value steps and reads its sixteen activation values once
+  per step. The activation row is small enough to stay in L1, so the kernel
+  stages nothing in shared memory and has no barrier inside the K loop; the only
+  sync is the wave shuffle tree.
 - The epilogue adds the residual row when the plan fuses it, and
   `gemv_row_pair_kernel` walks a second packed matrix over the same activation
-  values for the gate/up pair with the SwiGLU product folded in.
+  values for the gate/up and K/V pairs with the SwiGLU product folded in where
+  the pair writes one output. The F32 beta/alpha pair at 2048->32 uses a
+  per-output-row block form (`gemv_pair_f32_32_kernel`) because the wave mapping
+  launches too few blocks at that width.
+- The row remap preserves the per-row K/FMA order and the wave reduction, so its
+  outputs are bitwise equal to the two-row form; the release control test
+  checks every frozen decode row.
 
 Measured in step at a 7-token context (`TestGPUProfileDecode`, profiled, 176.6
 GB/s effective over the matvec family, against 130.3 GB/s before the remap):
@@ -854,10 +863,15 @@ chunk length; only the final chunk executes the output tail.
 decode attention kernel. It splits the key range so the cost follows the KV
 bytes instead of the position count:
 
-- Grid `(kv_heads, ntiles)`. One block owns one KV head and one contiguous tile
-  of key positions, and all `heads / kv_heads` query heads that share that KV
-  head. A KV row is therefore read once per block rather than once per query
-  head; on Qwen3.5 that is four query heads per block.
+- Grid `(kv_heads, dispatched_tiles)`. One block owns one KV head and one
+  contiguous tile of key positions, and all `heads / kv_heads` query heads that
+  share that KV head. A KV row is therefore read once per block rather than once
+  per query head. A plain submission schedules only the tiles that hold a live
+  position; a captured graph keeps its recorded extent and the kernel returns
+  uniformly for a dead tile before any barrier or K/V read. The partials stride
+  stays `ntiles = ceil(capacity / tile)`. The measured 8:1 subgroup variant
+  (two 4-query-head subgroups per KV head) was slower because it read every K/V
+  row twice and is not shipped.
 - The tile is 32 positions up to a 1024-position capacity and 64 above it, so a
   short context gets more blocks and a long context writes fewer partials. The
   tile length is a kernel argument and the shared-memory arrays are sized for
@@ -878,7 +892,9 @@ bytes instead of the position count:
 - The block writes one partial output vector per head and tile plus its running
   maximum and normalizer. `attention_flash_combine_kernel` merges them with the
   log-sum-exp rescaling, one 64-dim slice of one head per block, and applies the
-  attention gate as `sigmoid(gate)` before the output write.
+  attention gate as `sigmoid(gate)` before the output write. The merge computes
+  each tile's exponential once per 64-dimension block in a bounded 64-entry
+  shared array instead of once per dimension, keeping tile order.
 - The dynamic variant reads `position` from a device parameter buffer for both
   the split kernel and the merge, so a captured HIP Graph replays without
   changing kernel arguments.
@@ -1070,6 +1086,16 @@ winner is masked out of the lane register set. A slot therefore costs one pass
 over the row instead of a scan per slot. An expert count above 1024 fails plan
 construction instead of selecting from a truncated candidate set.
 
+The decode router is `moe_route_selected` (ABI opcode 51). It runs the same
+top-k and softmax body on one wave for one row, but it writes only the selected
+ids and normalized weights: the selected expert kernels do not read the expert
+counts or assignment bins, so the decode plan allocates neither and the kernel
+issues no count memset or assignment atomics. The binned route remains for
+prefill and for decode shapes outside one wave (more than 1024 experts or 32
+slots). The selected reduce for the one-row, eight-slot, 2048-hidden case
+launches 64 Wave32 blocks with one hidden column per lane and keeps the eight
+slot products in slot order before the single residual add.
+
 The grouped kernels are the prefill form. They index blocks by
 `(expert, 8 output rows)` and each warp owns one output row:
 
@@ -1096,6 +1122,15 @@ per-value forms produce. A warp reduces its eight lane partials with
 anywhere in the expert path, and the reduction cost no longer scales with the
 thread count. Spans that would cross the end of the row, and dtypes without a
 span decoder, fall back to `moe_packed_value` per value.
+
+The selected-expert decode kernels specialize the one-token, eight-slot,
+hidden-2048/expert-FFN-512 shape: one output row per wave, four waves per block,
+and the lane's eight-value activation span loaded once per 256-value K step and
+reused across gate/up (and by both rows when a wider wave tile is measured). The
+down form applies the same reuse to the two 256-value K steps of the 512-wide
+expert FFN. The 2048/512 selected tests compare the specialized and grouped
+paths against the host dequantized values; two rows per wave and eight warps per
+block were measured slower and are not shipped.
 
 The routing and assignment buffers are sized `experts * rows * used`, which is
 safe because one row contributes exactly `used` assignments. A malformed plan

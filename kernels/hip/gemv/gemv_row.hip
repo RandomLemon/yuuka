@@ -9,8 +9,10 @@
 // projection launched too few blocks to cover DRAM latency and every lane had
 // little data in flight. This kernel keeps the weights packed and changes the
 // shape of the mapping instead:
-//   - grid = ceil(n_out / (kRowWarps * kRows)): one block covers sixteen output
-//     rows, so a 1024-output projection launches 64 blocks instead of 32;
+//   - grid = ceil(n_out / (kRowWarps * kRows)): one block covers four output
+//     rows at the shipped kRows=1, so a 1024-output projection launches 256
+//     blocks instead of 32. Two rows per wave was measured slower because it
+//     added no memory-level parallelism and reduced the block count;
 //   - a lane owns sixteen consecutive K values and decodes them from one
 //     eight- to sixteen-byte span of the packed row, one whole 32-value
 //     sub-block of a K-quant or half of a Q8_0/Q4_0/Q5_0 block;
@@ -24,6 +26,8 @@
 // registers: the block covers kRowWarps * kRows output rows and walks K once.
 // The launcher only selects this kernel for a 512-value K step, which every
 // decode projection in the supported models satisfies, and for one row block.
+// The shipped kRows is one; the pair form keeps the same template so a
+// two-matrix launch uses the same row mapping.
 
 namespace {
 
@@ -31,7 +35,7 @@ constexpr int kRowWarps = 4;
 constexpr int kRowThreads = 32 * kRowWarps;
 constexpr int kSpanValues = 16;              // K values one lane owns per step
 constexpr int kStepValues = 32 * kSpanValues; // 512 K values per wave step
-constexpr int kRowsPerWave = 2;
+constexpr int kRowsPerWave = 1;
 constexpr int kRowsPerBlock = kRowWarps * kRowsPerWave;
 
 // load_activation_span reads the lane's sixteen activation values. The
@@ -156,6 +160,42 @@ __global__ void gemv_row_pair_kernel(float * out0, float * out1, const float * x
         if (!kSwiglu && row < n_out1) {
             out1[row] = total1;
         }
+    }
+}
+
+// gemv_pair_f32_32_kernel is the narrow FP32 beta/alpha pair: one block per
+// output row, 256 threads, two independent accumulators over the same strided
+// activation values, and the same halving reduction tree as gemv_f32_kernel.
+// A wave-per-row pair would launch four blocks at this width, so the per-row
+// form is the one that fills the device.
+__global__ void gemv_pair_f32_32_kernel(float * out0, float * out1, const float * x,
+                                        const float * w0, const float * w1,
+                                        int64_t n_in) {
+    const int64_t row = blockIdx.x;
+    const float * row0 = w0 + row * n_in;
+    const float * row1 = w1 + row * n_in;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int64_t i = threadIdx.x; i < n_in; i += blockDim.x) {
+        const float xv = x[i];
+        sum0 += row0[i] * xv;
+        sum1 += row1[i] * xv;
+    }
+    __shared__ float scratch0[256];
+    __shared__ float scratch1[256];
+    scratch0[threadIdx.x] = sum0;
+    scratch1[threadIdx.x] = sum1;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            scratch0[threadIdx.x] += scratch0[threadIdx.x + stride];
+            scratch1[threadIdx.x] += scratch1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out0[row] = scratch0[0];
+        out1[row] = scratch1[0];
     }
 }
 
@@ -347,6 +387,13 @@ void launch_gemv_row_pair_f32out(float * out0, float * out1, const float * x,
     const bool sigmoid = swiglu != 0;
     switch (dtype) {
         case YUUKA_DTYPE_F32:
+            if (!sigmoid && o0 == 32 && o1 == 32 && in % 256 == 0 &&
+                in <= INT32_MAX) {
+                gemv_pair_f32_32_kernel<<<32, 256, 0, stream>>>(
+                    out0, out1, x, reinterpret_cast<const float *>(w0b),
+                    reinterpret_cast<const float *>(w1b), in);
+                break;
+            }
             sigmoid ? launch_gemv_row_pair_dtype<YUUKA_DTYPE_F32, true>(
                           out0, out1, x, w0b, w1b, in, o0, o1, rb, stream)
                     : launch_gemv_row_pair_dtype<YUUKA_DTYPE_F32, false>(

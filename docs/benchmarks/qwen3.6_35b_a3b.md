@@ -4,16 +4,20 @@
 2048, and 8192 prompt tokens against llama.cpp on the same model, device, KV
 format, chunk size, and single-request protocol, with the per-operation
 attribution of what changed and the correctness gates the run was taken with.
-Decode is recorded only as a regression check; it is not a speed target.
+The same document records the single-token decode release comparison: 128
+teacher-forced one-token steps after 512, 2048, and 8192 populated prompt
+tokens, against the same local llama.cpp build.
 
 **Status.** Measured on 2026-11-22 at `d0253fde` against the frozen
 `1bc54d18` baseline and upstream `b1b770d90`. The matched fixed-512 ABBA
 comparison now leads at every requested length: 1718.6 against 1613.8 tokens/s
 at 512 (1.065x), 1682.4 against 1564.0 at 2048 (1.076x), and 1493.4 against
 1477.1 at 8192 (1.011x), using 20 samples per engine per length. The three
-speed gates and the behavior gates pass; the MoE attention route's numerical
-envelope is recorded in the matched comparison and in
-[moe_real_test.go](../../engine/gpu/moe_real_test.go). The earlier
+prefill speed gates and the behavior gates pass; the MoE attention route's
+numerical envelope is recorded in the matched comparison and in
+[moe_real_test.go](../../engine/gpu/moe_real_test.go). The 2026-11-23 decode
+comparison below passes all four ordered ratios and the pooled ratio at 512,
+2048, and 8192 tokens (1.0736x, 1.0662x, 1.0430x against llama.cpp). The earlier
 `ac7c697` dense-stage record and 128-row attribution below are historical and
 are kept for the stage comparison.
 
@@ -54,6 +58,18 @@ A first confirm block started at 56 °C and its 512-token first process was
 discarded as thermally contaminated; the accepted confirmation block started at
 47 °C. The GPU ran with DPM `auto`, so the clock snapshots in the raw log span
 2.17-2.40 GHz. Numbers are observations on one machine, not guarantees.
+
+The decode gate uses the same saved stream and also resets for every repetition.
+`ycompare -decode 128` prefills `[0,P)` and fetches the final prompt host row
+before starting the timer, then times 128 sequential `Session.Decode` calls over
+`[P,P+128)`. The llama driver takes the optional trailing `DECODE` argument and
+times 128 one-token `llama_decode` calls at absolute positions `P..P+127`,
+calling `llama_get_logits_ith(-1)` after each step; that call synchronizes the
+host row inside the interval. Both drivers append `decode` and
+`decode_samples_ns` to the JSON and leave `samples_ns` as the prefill series.
+The Yuuka driver rejects a short or misaligned token file, an out-of-vocabulary
+id, or a missing final host row instead of shortening the sample. Neither driver
+samples, checks intermediate rows, or fetches logits outside the timed loop.
 
 ## Matched release comparison
 
@@ -182,6 +198,91 @@ set to that GGUF, `YUUKA_TEST_KV=f16`, and
 `YUUKA_TEST_ATTENTION_LONG=1` for `TestGPUAttentionPathsAgree`. The native
 gates are the selected CTest suite and the `--moe-dense` sweep in base,
 candidate, candidate, base order.
+
+## Decode release comparison (2026-11-23)
+
+The decode target is the shipping single-request HIP path at 512, 2048, and
+8192 populated prompt tokens, followed by 128 one-token decode steps. All four
+ordered `(y1,l1)` and `(y2,l2)` ratios and the pooled 20-sample ratio exceed
+1.00 at every length, and the same final build improves on the frozen Yuuka
+baseline in both reversed pairings at every length.
+
+| Prompt | Frozen Yuuka | Final Yuuka | llama.cpp | Final / llama | Frozen / final |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 15.572 ms, 64.2 tok/s | 13.968 ms, 71.6 tok/s | 14.996 ms, 66.7 tok/s | **1.0736x** | 1.1148x |
+| 2048 | 15.913 ms, 62.8 tok/s | 14.297 ms, 69.9 tok/s | 15.243 ms, 65.6 tok/s | **1.0662x** | 1.1130x |
+| 8192 | 16.897 ms, 59.2 tok/s | 15.214 ms, 65.7 tok/s | 15.868 ms, 63.0 tok/s | **1.0430x** | 1.1106x |
+
+`ms/token` is `median(decode_samples_ns) / (128e6)`; the final and llama
+medians pool the 20 samples of the two independent blocks, and the frozen
+median pools the 20 samples of the `b1/f1/f2/b2` recheck. The four ordered
+ratios are:
+
+| Prompt | Release y1/l1 | Release y2/l2 | Confirm y1/l1 | Confirm y2/l2 | Pooled |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 1.0783x | 1.0684x | 1.0697x | 1.0774x | 1.0736x |
+| 2048 | 1.0572x | 1.0588x | 1.0638x | 1.0703x | 1.0662x |
+| 8192 | 1.0427x | 1.0432x | 1.0483x | 1.0417x | 1.0430x |
+
+The frozen comparison uses `base,final,final,base` with the same flags, tokens,
+2 warmups, and 5 repetitions per process:
+
+| Prompt | Recheck b1/f1 | Recheck b2/f2 | Pooled base/final |
+| ---: | ---: | ---: | ---: |
+| 512 | 1.1224x | 1.1079x | 1.1162x |
+| 2048 | 1.1147x | 1.1015x | 1.1106x |
+| 8192 | 1.1086x | 1.1133x | 1.1112x |
+
+### Decode attribution
+
+`TestGPUProfileMoEDecodeContexts` profiles steps 0, 63, and 127 after the
+populated prefix; the average of those three steps at 8192 is 16.813 ms with
+events enabled, against the 15.214 ms release median without them. The plan went
+from 713 to 673 operations. The stages that changed:
+
+| Stage (per decode step, 8192) | Frozen | Final |
+| --- | ---: | ---: |
+| Router top-k | 0.521 ms | 0.377 ms |
+| Routed reduce | 0.676 ms | 0.202 ms |
+| Selected gate/up (IQ2_XXS) | 2.048 ms | 1.929 ms |
+| Selected down (IQ2_S/IQ3_S) | 1.620 ms | 1.494 ms |
+| Shared expert | 1.336 ms | 1.045 ms |
+| Paged decode attention | 1.603 ms | 1.466 ms |
+| Dense matvecs, recurrence, norms, and head | 11.20 ms | 10.30 ms |
+| **Profiled step** | **19.00 ms** | **16.81 ms** |
+
+The router runs one wave without the count memset or assignment atomics, and the
+one-row/eight-slot/2048 reduce covers the device with 64 Wave32 blocks instead
+of one block. The selected IQ kernels load the eight-value activation span once
+per 256-value K step and use four waves per block, one output row per wave. The
+one-row matvec remap uses one row per wave instead of two, which doubled the
+block count on the latency-bound projections; the K/V and F32 beta/alpha pairs
+remove two launches without changing the per-row reduction. Decode attention
+merges its tile weights once per 64-dimension block in bounded shared memory and
+launches only live tiles on plain submission. The measured stage reductions
+cover the baseline gap at each length; no single microbenchmark is used as the
+gate.
+
+Correctness for the gate: the recorded frozen controls compare bitwise over the
+prefill row and all 128 teacher-forced decode rows at every length, the
+`The capital of France is` golden continuation is `[11751, 11, 264, 3177]`, and
+the fixed-prefix greedy continuations are `[13477, 37550, 33075, 888]`,
+`[5388, 13, 561, 3841]`, and `[13477, 37550, 33075, 888]`. The native tests pin
+both router forms on tied and negative logits, the reduce against the generic
+block reduce, the 2048/512 selected kernels against the host dequantization, and
+the attention merge and live-tile replay against the reference.
+
+Environment: same model and SHA-256 as above; token stream SHA-256
+`2367fa295341e579a00189d5a5f52df5b742c5e732f16c6b8f5b15f6709acf81`, first 8192
+ids `e613216db780a72fdbe796b31c63b4afabf273199dbc67f799b5c082d18e3e30`;
+Yuuka source at `3575b28cf35261848a73b0518c8110f6f076be9f` with this decode
+change; llama.cpp `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`; ROCm/HIP and
+device as above. F16 KV, chunk 512, full GPU offload, one request, 2 warmups and
+5 repetitions per process, one process at a time. The final library sha256 was
+`03957aa2a338bad3a71aee73f953b99682426ff8b70b71a85850c7d18ba7fff2`. The three
+gate blocks started at 56-58 °C and stayed at 57-65 °C with 16-100 W board
+power; no thermal throttle was logged. The earlier prefill blocks and the
+decode blocks agree across repeated orders, which is why no block was discarded.
 
 ## Earlier dense-stage record (ac7c697)
 

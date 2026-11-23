@@ -81,6 +81,46 @@ func TestTinyGPUMoEMatchesCPU(t *testing.T) {
 			t.Fatalf("pass %d: max logit diff %.6g exceeds 2e-3", pass, diff)
 		}
 	}
+
+	// The selected-expert fallback must also match the CPU reference when the
+	// comparison advances through the session Step path after a reset and a
+	// fresh prefill, not only through the batched Forward entry point.
+	rt.Reset()
+	cpuState, err = qwen35.NewState(model.Config, capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpuLogits, err = model.Forward(ids, cpuState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := rt.Forward(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for step := range 4 {
+		if top1(cpuLogits) != top1(got) {
+			t.Fatalf("step %d: top-1 token differs: cpu %d gpu %d", step,
+				top1(cpuLogits), top1(got))
+		}
+		token := int32(top1(got))
+		got, err = rt.Step(token)
+		if err != nil {
+			t.Fatalf("step %d: %v", step, err)
+		}
+		cpuLogits, err = model.Step(token, cpuState)
+		if err != nil {
+			t.Fatalf("step %d cpu: %v", step, err)
+		}
+		diff := maxDiff(cpuLogits, got)
+		if top1(cpuLogits) != top1(got) {
+			t.Fatalf("step %d: top-1 token differs: cpu %d gpu %d (max diff %.6g)",
+				step, top1(cpuLogits), top1(got), diff)
+		}
+		if diff > 2e-3 {
+			t.Fatalf("step %d: max logit diff %.6g exceeds 2e-3", step, diff)
+		}
+	}
 }
 
 // TestTinyGPUChunkedPrefillMoEMatchesCPU checks the grouped expert prefill path,

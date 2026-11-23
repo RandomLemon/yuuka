@@ -624,6 +624,99 @@ int main() {
         }
     }
 
+    // The release qwen35moe shapes: hidden 2048 and expert FFN 512, eight
+    // selected slots. These are the dimensions of the selected-expert
+    // specialization, so the grouped and selected paths are both checked
+    // against the host over eight distinct expert ids.
+    {
+        const int big_hidden = 2048, big_ffn = 512, big_experts = 8, big_used = 8;
+        const int big_rows = 1;
+        std::vector<float> big_norm(big_hidden), big_logits(big_experts);
+        for (float & value : big_norm) value = dist(rng);
+        for (int e = 0; e < big_experts; ++e) {
+            big_logits[e] = -0.5f + 0.125f * float(e);
+        }
+        std::vector<uint8_t> big_gate, big_up;
+        for (int row = 0; row < big_experts * big_ffn; ++row) {
+            for (int block = 0; block < big_hidden / 256; ++block) {
+                append_block(big_gate, ref_blocks[0], row * 8 + block);
+                append_block(big_up, ref_blocks[0], row * 8 + block + 3);
+            }
+        }
+        const std::vector<float> big_gate_host = dequant(
+            ctx, big_gate, big_hidden, uint64_t(big_experts) * big_ffn,
+            YUUKA_DTYPE_IQ2_XXS);
+        const std::vector<float> big_up_host = dequant(
+            ctx, big_up, big_hidden, uint64_t(big_experts) * big_ffn,
+            YUUKA_DTYPE_IQ2_XXS);
+        CHECK(!big_gate_host.empty() && !big_up_host.empty());
+
+        for (int variant = 0; variant < 2; ++variant) {
+            const uint32_t down_dtype = down_dtypes[variant];
+            const std::vector<uint8_t> & down_block =
+                down_dtype == YUUKA_DTYPE_IQ3_S ? down_block_iq3s : down_block_iq2s;
+            std::vector<uint8_t> big_down;
+            for (int row = 0; row < big_experts * big_hidden; ++row) {
+                for (int block = 0; block < big_ffn / 256; ++block) {
+                    append_block(big_down, down_block, row * 2 + block);
+                }
+            }
+            const std::vector<float> big_down_host = dequant(
+                ctx, big_down, big_ffn, uint64_t(big_experts) * big_hidden,
+                down_dtype);
+            CHECK(!big_down_host.empty());
+
+            for (int selected = 0; selected < 2; ++selected) {
+                moe_buffers b;
+                CHECK(alloc_buffers(ctx, b, big_rows, big_experts, big_used,
+                                    big_hidden, big_ffn, big_gate, big_up, big_down,
+                                    big_norm, big_logits));
+                std::vector<float> got, weights;
+                std::vector<int32_t> ids;
+                if (run_pipeline(ctx, b, selected, big_hidden, big_ffn, big_rows,
+                                 big_experts, big_used, YUUKA_DTYPE_IQ2_XXS,
+                                 down_dtype, got, ids, weights) != 0) {
+                    free_buffers(b);
+                    teardown(ctx);
+                    return 1;
+                }
+                free_buffers(b);
+                CHECK(ids.size() == size_t(big_used));
+                for (int slot = 0; slot < big_used; ++slot) {
+                    CHECK(ids[slot] >= 0 && ids[slot] < big_experts);
+                    for (int prior = 0; prior < slot; ++prior) {
+                        CHECK(ids[prior] != ids[slot]);
+                    }
+                }
+                std::vector<float> want(big_hidden, 0.0f);
+                for (int slot = 0; slot < big_used; ++slot) {
+                    const int expert = ids[slot];
+                    std::vector<float> act(big_ffn);
+                    for (int j = 0; j < big_ffn; ++j) {
+                        const float * gate_row =
+                            &big_gate_host[(uint64_t(expert) * big_ffn + j) * big_hidden];
+                        const float * up_row =
+                            &big_up_host[(uint64_t(expert) * big_ffn + j) * big_hidden];
+                        act[j] = silu(dot(gate_row, big_norm.data(), big_hidden)) *
+                                 dot(up_row, big_norm.data(), big_hidden);
+                    }
+                    for (int i = 0; i < big_hidden; ++i) {
+                        const float * down_row =
+                            &big_down_host[(uint64_t(expert) * big_hidden + i) * big_ffn];
+                        want[i] += weights[slot] * dot(down_row, act.data(), big_ffn);
+                    }
+                }
+                float worst = 0.0f;
+                for (int i = 0; i < big_hidden; ++i) {
+                    worst = std::fmax(worst, std::fabs(got[i] - want[i]));
+                }
+                std::printf("moe 2048/512 %s path, down dtype %u: max abs diff %.3g\n",
+                            selected != 0 ? "selected" : "grouped", down_dtype, worst);
+                CHECK(worst <= 1e-2f);
+            }
+        }
+    }
+
     // Q8_1 expert route. The assignment tile is sixteen, so a 32-row chunk with
     // one slot per row and logits that alternate the winner fills the tile for
     // both experts. The reference reprocesses the same device routing over the
