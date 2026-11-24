@@ -142,7 +142,7 @@ hard-coded from another GPU.
 | `moe_gate_up_q8` / `moe_down_q8` | Sparse MoE prefill, IQ experts | Q8_1 activation tile, int8 `dp4a`, sixteen-assignment tile |
 | `moe_gate_up_mmq` / `moe_down_mmq` | Sparse MoE prefill, K-quant and IQ experts | Q8_1 activation tile, int8 WMMA, 16-128 assignment tile, gather/scatter through the routed bucket |
 | `moe_route_selected` / `moe_gate_up_selected` / `moe_down_selected` / `moe_shared_add` | Sparse MoE decode | One-wave router without bins, one grid per routing slot, sigmoid-gated shared expert |
-| `sampling` | Output | GPU sampling or a low-cost host path |
+| `sampling` | Output, host-side only | No device kernel exists: the decode step downloads the FP32 logits row and the Go generation loop samples it |
 
 ## 5. Decode: quantized GEMV
 

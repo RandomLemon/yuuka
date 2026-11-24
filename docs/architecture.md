@@ -56,7 +56,7 @@ Request Scheduler / Admission / Iteration-level Continuous Scheduling (Go)
                    |
 Model Executor / Prefill / Decode / Paged KV (Go)
                    |
-Execution Planner / Operator Dispatch / Memory Planner (Go)
+Execution Planner / Operator Dispatch / Allocation (Go)
                    |
              Backend Interface
            /         |          \
@@ -65,8 +65,13 @@ Execution Planner / Operator Dispatch / Memory Planner (Go)
    HIP Streams / Events / Graph / Allocators
            |
    Quant GEMV | Quant GEMM | Flash/Paged Attention
-   Norm | RoPE | Activation | Sampling | Fusion
+   Norm | RoPE | Activation | Fusion
 ```
+
+The `Backend Interface` box is the target seam and not the current call path:
+execution today runs through `serving.Backend`, `engine.Runtime`,
+`engine/gpu.Model`/`Session`, and `backend/hip.Plan` (see section 4). Sampling
+is host-side; there is no device sampling kernel.
 
 ### 3.1 Layer responsibilities
 
@@ -76,7 +81,7 @@ Execution Planner / Operator Dispatch / Memory Planner (Go)
 | Model and tokenizer | GGUF metadata interpretation, tokenizer, chat template, sampling policy | HIP calls, request scheduling |
 | Scheduler | Admission, batching, token/KV budgets, cancellation | Kernel selection, weight layout |
 | Executor | Prefill/decode orchestration, KV block tables, sampling loop | Format parsing, transport concerns |
-| Planner | `ExecutionPlan`, operator selection, scratch sizing, kernel signatures | Device-specific kernel internals |
+| Planner | Planned operator sequence (`hip.Plan`), operator selection, scratch sizing, kernel signatures | Device-specific kernel internals |
 | Backend | Device allocation, streams, events, kernel launch, graph capture | GGUF parsing, model architecture decisions |
 | Kernels | Device-side computation | Model metadata, request lifecycle |
 
@@ -86,30 +91,28 @@ model definitions.
 
 ## 4. Core interfaces
 
-The following interfaces define the intended seams. They are a design shape,
-not a frozen API.
+`backend/backend.go` is the declared seam. Its current contents are reproduced
+below; it is the target negotiation interface, not a frozen API.
 
 ```go
-type Model interface {
-    Config() ModelConfig
-    Tokenizer() Tokenizer
-    Weights() WeightStore
-    BuildPlan(Backend) (Executable, error)
+type Capabilities struct {
+    Name             string
+    Device           string
+    SupportsF32      bool
+    SupportsF16      bool
+    SupportedQuant   []string
+    SupportsGraph    bool
+    MaxBatch         int
+    TotalMemoryBytes uint64
 }
 
-type TensorDesc struct {
-    Name   string
-    Shape  []int64
-    DType  DType
-    Offset uint64
-    Bytes  uint64
+type Buffer interface {
+    Bytes() uint64
+    Close() error
 }
 
-type Backend interface {
-    Name() string
-    Alloc(size uint64) (Buffer, error)
-    Compile(plan *ExecutionPlan) (Executable, error)
-    Synchronize() error
+type Event interface {
+    Wait() error
 }
 
 type Executable interface {
@@ -117,14 +120,53 @@ type Executable interface {
     Close() error
 }
 
-type Event interface {
-    Wait() error
+type Backend interface {
+    Name() string
+    Capabilities() Capabilities
+    Alloc(size uint64) (Buffer, error)
+    Compile(plan *ExecutionPlan) (Executable, error)
+    Synchronize() error
+    Close() error
+}
+
+type OpCode uint32 // OpMatVec, OpMatMul, OpRMSNorm, OpRoPE, OpAttention,
+                  // OpSwiGLU, OpGDN, OpSample
+
+type Op struct {
+    Code   OpCode
+    Inputs []int
+    Out    int
+    Attrs  map[string]any
+}
+
+type ExecutionPlan struct {
+    ModelName string
+    Pipeline  []Op
+    Bindings  int
+    Scratch   uint64
+}
+
+type Batch struct {
+    Tokens     []int32
+    Positions  []int32
+    BatchSize  int
+    SequenceID uint64
 }
 ```
 
-Implementation status: `backend/backend.go` remains the intended device seam
-and defines `Backend`, `ExecutionPlan`, `Batch`, and related types, but the
-implemented execution path uses narrower concrete interfaces:
+`ErrUnsupported` and `UnsupportedError` mark capability failures that planning
+must surface instead of substituting another numerical path.
+
+Two types from an earlier revision of this section do not exist and must not be
+assumed: a `Model` interface (`Config`/`Tokenizer`/`Weights`/`BuildPlan`) and a
+`TensorDesc`. Model access is through the concrete `qwen35.Model`, tensor
+metadata is `gguf.Tensor`, and dtypes are `tensor.DType`; there is no
+`BuildPlan` method anywhere (section 4.2 describes the planning that does
+happen).
+
+Implementation status: no package imports
+`github.com/yuuka-ai/yuuka/backend`, so the interface above is unexercised code.
+The executed path uses narrower concrete interfaces:
 
 - `serving.Backend` and `serving.Sequence` for request construction and
   prefill/decode steps;
@@ -160,8 +202,8 @@ These contracts must be explicit in the implementation:
 
 ### 4.2 Planning model
 
-`BuildPlan` inspects the model, backend capabilities, quantization types, and
-expected batch shapes. It produces an `ExecutionPlan` containing:
+Planning inspects the model configuration, quantization types, and expected
+batch shapes before any device allocation. It produces a plan containing:
 
 - weight buffer bindings and device residency;
 - kernel choices and their shape signatures;
@@ -185,11 +227,11 @@ Build tokenizer, model config, weight descriptors
         |
 Build ExecutionPlan (kernel selection, scratch, residency)
         |
-Allocate weights, activation pool, KV pool, graph workspace
+Allocate per-tensor weights, prefill scratch, KV pool, recurrent state
         |
 Prefill: prompt chunks -> attention + GEMM -> KV writes
         |
-Decode loop: quantized GEMV + paged attention + sampling
+Decode loop: quantized GEMV + paged attention -> logits -> host sampling
         |
 Stream tokens / finish / release request resources
 ```
@@ -219,15 +261,17 @@ session state on a partial rejection.
 Key rules:
 
 1. GGUF data is validated before any device allocation.
-2. Weights are loaded into a device-resident pool for the model lifetime.
+2. Weights are uploaded once into per-tensor device allocations that stay
+   resident for the model lifetime.
 3. HIP prefill and decode share the KV cache but use different operator paths.
    HIP prefill uses chunked batched plans; decode uses the single-token GEMV
    and per-head attention graph. The CPU reference processes tokens one at a
    time for both phases. The MoE FFN is the one place where the two HIP phases
    differ in kernel family: decode routes one token through selected-expert
    kernels, prefill bins the chunk's assignments and runs grouped kernels.
-4. Sampling may run on the GPU or on the host through a low-overhead path; the
-   choice is a plan decision, not a per-token branch in model code.
+4. Sampling runs on the host over the FP32 logits row the decode step
+   downloads. There is no device sampling kernel and no plan-level sampling
+   decision; moving it onto the GPU would add a new kernel family.
 5. Request cancellation releases KV blocks and scratch through the scheduler
    and memory manager, not through ad hoc frees in the API layer. The
    single-request runtime retains its own table for reset; the serving path
@@ -263,7 +307,10 @@ Event -> Go completion -> sampling/streaming
   the memory is pinned and its lifetime is guaranteed for the entire operation.
 - Prefer persistent data in HIP-managed buffers, with events coordinating reuse
   and release.
-- Host/device transfers use explicit staging buffers where required.
+- Host/device transfers are synchronous `hipMemcpy` calls from pageable host
+  memory into the destination buffer, so the host buffer may be reused as soon
+  as the call returns. There is no general staging pool; the only pinned
+  allocation is the per-stream 8-byte graph dynamic-parameter buffer.
 - Every path that can fail after partial allocation must have a cleanup path
   that releases all acquired buffers and streams.
 
@@ -275,9 +322,9 @@ Event -> Go completion -> sampling/streaming
 | `DeviceBuffer` | Device allocation with explicit lifetime | Implemented as `hip.Buffer` |
 | `HostPinnedBuffer`, `MappedBuffer` | Allocation classes with different performance and lifetime rules | Not implemented as general types; pinned staging is used only for graph dynamic parameters |
 | `GraphExecutable`, `GraphReplay` | Cached launch graphs for stable shapes | Implemented as `hip.Graph` |
-| `ScratchAllocator`, `WeightAllocator`, `KVAllocator` | Pool-specific allocation policies | KV allocator implemented in `memory`; dedicated scratch and weight allocators are not |
+| `ScratchAllocator`, `WeightAllocator`, `KVAllocator` | Pool-specific allocation policies | KV block allocator implemented in `memory`; prefill scratch is reallocated as one group by `configurePrefill`; there is no scratch or weight allocator, and weights are one `hipMalloc` per tensor |
 | Shape signature and dispatch selectors | Dispatch and tuning lookup | Implemented by `SelectPrefillPath`; decode GEMV is fixed at one row; no generic kernel registry |
-| Backend capabilities | Capability negotiation and unsupported-operation fallback | Implemented per operator in plan validation; the generic `backend` seam is not wired |
+| Backend capabilities | Capability negotiation and unsupported-operation fallback | Implemented per operator in plan validation (`engine/gpu/validate.go`, `backend/hip.Plan` argument checks); the generic `backend` package is imported by no package |
 
 ## 7. Memory model
 
@@ -292,17 +339,19 @@ equivalent. The implementation must measure, for the target system:
 - any available unified-memory mechanisms;
 - bandwidth, prefetch behavior, page migration, and synchronization cost.
 
-The memory planner chooses a policy per buffer class based on measurements, not
-on the assumption that zero-copy access is optimal.
+The allocation path chooses a policy per buffer class based on measurements, not
+on the assumption that zero-copy access is optimal. Today weights, activations,
+KV rows, and recurrent state are all `hipMalloc` device buffers, and uploads are
+synchronous host-to-device copies from pageable memory.
 
 ### 7.2 Pools
 
 | Pool | Contents | Lifetime | Allocation policy |
 | --- | --- | --- | --- |
-| **Weights** | Quantized weights, embedding tables, output head | Model lifetime | Device-resident; stable addresses preferred |
+| **Weights** | Quantized weights, embedding tables, output head | Model lifetime | One device allocation per GGUF tensor; no pooling, addresses stable for the model lifetime |
 | **Activation** | Layer scratch, attention workspace, logits | Per step or per batch | Reused across layers; sized from the plan |
-| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Paged block allocator with F32, F16, or Q8_0 rows; immutable per-request block table; see [serving.md](serving.md) |
-| **Staging** | Host/device transfer buffers | Transient | Reused; explicit synchronization |
+| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Paged block allocator with F32, F16, or Q8_0 rows; append-only per-request block table covered for the full budget at admission; see [serving.md](serving.md) |
+| **Staging** | Host/device transfer buffers | Transient | No staging pool: each upload is one synchronous `hipMemcpy` straight into the destination buffer from pageable host memory; the only pinned allocation is the 8-byte graph dynamic-parameter staging buffer |
 | **Graph workspace** | Stable-address buffers for replay | Session lifetime | Address stability is required while a captured graph is installed |
 
 Prefill scratch is part of the activation pool and is sized from the model
@@ -320,15 +369,16 @@ the buffer it references.
 ### 7.3 KV cache summary
 
 Current implementation: CPU and HIP use paged KV pools addressed by allocator
-block ID. A request owns a block table covering its prompt plus output budget;
-positions are resolved through that table by the CPU attention loop and by the
-paged HIP KV-write and attention kernels. Recurrent convolution and matrix
-state stay contiguous per session and are snapshotted for prefix reuse. The
-default block size is 16 tokens. F16 is the default KV storage; opt-in F32 and
-Q8_0 formats use the same block table and are selected through `--kv-type` for
-the `qwen35` and `qwen35moe` CPU and HIP runtimes.
-The logical KV view exposed to model code does not expose physical block layout. Block allocation, reference counting, prefix sharing, cancellation, and
-eviction are specified in [serving.md](serving.md).
+block ID. A request owns an append-only block table that admission covers for
+the full prompt plus output budget before the first step; positions are resolved
+through that table by the CPU attention loop and by the paged HIP KV-write and
+attention kernels. Recurrent convolution and matrix state stay contiguous per
+session and are snapshotted for prefix reuse. The default block size is 16
+tokens. F16 is the default KV storage; opt-in F32 and Q8_0 formats use the same
+block table and are selected through `--kv-type` for the `qwen35` and
+`qwen35moe` CPU and HIP runtimes. The logical KV view exposed to model code does
+not expose physical block layout. Block allocation, reference counting, prefix
+sharing, cancellation, and eviction are specified in [serving.md](serving.md).
 
 ## 8. Backends and fallback
 
@@ -378,15 +428,21 @@ yuuka/
 │   └── qwen35/                # qwen35 and qwen35moe reference decoders
 ├── engine/
 │   ├── engine.go              # Single-request generation loop
-│   ├── sampling.go            # Greedy, top-k, nucleus sampling
-│   └── gpu/                   # Shared HIP model plus paged sessions
+│   ├── sampling.go            # Host-side greedy, top-k, nucleus sampling
+│   ├── speculative.go         # Greedy prompt-lookup speculation
+│   ├── text.go                # Incremental UTF-8 streaming helper
+│   └── gpu/                   # Shared HIP model, plans, paged sessions
 ├── memory/                    # Block allocator, block tables, prefix cache
 ├── scheduler/                 # Admission, continuous batching, timeouts
-├── serving/                   # Request tasks, backends, prefix integration
+├── serving/                   # manager.go, task.go, types.go, text.go,
+│                              #   backend_qwen35.go, backend_hip.go
 ├── backend/
-│   ├── backend.go             # Planned backend interfaces; not wired yet
+│   ├── backend.go             # Planned backend interfaces; imported by nothing
+│   ├── npu/                   # Diagnostic capability probe only
 │   └── hip/
 │       ├── hip.go             # cgo binding for the C ABI
+│       ├── dispatch.go        # Measured prefill and MoE path selectors
+│       ├── opinfo.go          # Operator codes shared with the profiler
 │       └── bridge/            # HIP C ABI implementation
 ├── kernels/hip/
 │   ├── attention/
@@ -398,30 +454,37 @@ yuuka/
 │   ├── prefill/
 │   ├── ssm/
 │   ├── common.cuh
+│   ├── iq_decode.cuh
 │   ├── kv.cuh
 │   ├── quant.cuh
 │   └── yuuka_kernels.h
 ├── tests/
 │   ├── fixture/               # Deterministic tiny GGUF generators
-│   └── hip/                   # C ABI, GEMV, GEMM, operators, paged KV, graph
+│   └── hip/                   # 13 CTest binaries: ABI, GEMV, GEMM, prefill,
+│                              #   ops, embedding, paged KV/graph, delta-net,
+│                              #   MoE (plain, IQ, MMQ), plan validation
 ├── bench/
-│   ├── hip/                   # Hardware probe and kernel sweeps
+│   ├── hip/                   # Hardware and dot probes; GEMV, decode-GEMV,
+│                              #   prefill, MoE, and delta-net sweeps
 │   ├── prefill-compare/       # Matched-input prefill driver and llama.cpp runner
 │   └── serving/               # Latency and throughput harness
-├── scripts/
+├── scripts/                   # Toolchain, hardware, profile, compare helpers
 ├── docs/
+│   └── benchmarks/            # Per-model measured reports
 ├── CMakeLists.txt
 └── go.mod
 ```
 
 Planned but not present yet: a separate `backend/cpu/` package and
-`kernels/hip/sampling/`. `backend/npu/` currently contains the diagnostic
-capability probe, not an execution backend. The CPU reference model code is
-implemented in `model/qwen35`; `engine` owns the single-request generation
-loop, while `serving` and `scheduler` own concurrent requests. The generic
-`backend` interfaces remain the target shape; the current executor uses
-`serving.Backend`, `engine/gpu.Model`, `engine/gpu.Session`, and
-`backend/hip.Plan`.
+`kernels/hip/sampling/`. Sampling is host-side today
+(`engine/sampling.go`) and no device sampling kernel exists, so the `OpSample`
+plan code and the `Sampling` kernel family are targets, not implementation.
+`backend/npu/` contains the diagnostic capability probe, not an execution
+backend. The CPU reference model code is implemented in `model/qwen35`; `engine`
+owns the single-request generation loop, while `serving` and `scheduler` own
+concurrent requests. The generic `backend` interfaces remain the target shape
+and are imported by no package; the current executor uses `serving.Backend`,
+`engine/gpu.Model`, `engine/gpu.Session`, and `backend/hip.Plan`.
 
 Use CMake for the HIP shared library and Go Modules for Go components. The two
 build systems meet at the C ABI. Do not embed the HIP/C++ build inside a Go
@@ -453,9 +516,10 @@ decision and the phase that may reopen it are recorded below.
    bound buffers. Model-lifetime allocations and request session allocations
    are tracked separately; Phase 4 did not need an arena allocator.
 2. **UMA allocation policy.** Weights, activations, KV, and recurrent state use
-   device allocations. General uploads currently use synchronous `hipMemcpy`
-   from pageable host memory; graph dynamic-parameter updates use a per-stream
-   pinned staging buffer. Full pinned staging for model uploads is not
+   device allocations, one `hipMalloc` per buffer. Uploads are synchronous
+   `hipMemcpy` from pageable host memory straight into the destination;
+   there is no staging pool. Graph dynamic-parameter updates use the per-stream
+   8-byte pinned buffer. Full pinned staging for model uploads is not
    implemented. Mapped host memory is measured but is not a default path.
    Revisit only with a measured prefetch or migration win.
 3. **Graph replay mutation.** Implemented in Phase 4 and opt-in. Capture is per
