@@ -42,11 +42,11 @@ func (m *Model) prefillMatmulPath(plan *hip.Plan, w weight, x *hip.Buffer, xOff 
 	}
 }
 
-// decodeMatmul appends one decode matvec. The channel-parallel kernel serves
-// every shape the decode graph dispatches except the 32-output recurrent
-// projections, where the per-row GEMV stays; within that set the K-quants and
-// Q8_0 dot the Q8_1 activation with int8 v_dot4 and the other dtypes keep FP32
-// (docs/kernels.md section 5.3).
+// decodeMatmul appends one decode matvec. The streaming family serves every
+// shape the decode graph dispatches except the shapes below its output-width
+// crossover (the 32-output recurrent projections and the MoE router), which keep
+// the per-row GEMV. The FP32 streaming kernel is the selected route; the int8
+// variant runs only when Options.Int8Matvec is set (docs/kernels.md section 5.1).
 //
 // The int8 route reads digits that decodeActGroup quantized for this group of
 // matvecs, so a matvec on a row that was not prepared is a planning error and

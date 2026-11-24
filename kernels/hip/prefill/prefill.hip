@@ -677,7 +677,7 @@ __global__ void kv_write_paged_dynamic_kv_kernel(void * k_pool, void * v_pool,
 // The FP16 MMA path in attention_wmma.hip replaces the earlier per-group tiled
 // kernel that covered four query heads per workgroup: it serves the same group,
 // runs both products on the WMMA pipe, and is measured faster at every chunk
-// length and position it accepts (kernels.md section 7.5).
+// length and position it accepts (kernels.md section 5.3).
 
 template <bool Dense>
 __global__ void attention_prefill_paged_f32_kernel(

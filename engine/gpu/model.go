@@ -124,7 +124,7 @@ type Options struct {
 	// LegacyBlasAttention selects the rocBLAS prefill attention path for F16 KV
 	// pools. It is off by default: the FP16 MMA kernel covers the shapes this
 	// path can stage and is measured faster at every chunk length it accepts
-	// (kernels.md section 7.5). The path stays available for A/B measurement.
+	// (kernels.md section 5.3). The path stays available for A/B measurement.
 	LegacyBlasAttention bool
 	// ForceTiledAttention keeps the tiled paged prefill attention kernel where
 	// the FP16 MMA kernel would be selected. It exists so a differential test

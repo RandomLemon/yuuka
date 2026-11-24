@@ -21,7 +21,7 @@
 // int8 WMMA, an assignment tile per weight tile, and a device-side per-expert
 // loop over the bucket. The staging, tile shape, scale layout, and scatter are
 // this repository's; the codebooks and their scale granularity are documented
-// in docs/kernels.md section 8.1. The IQ codebooks decode through the dot8
+// in docs/kernels.md section 5.5. The IQ codebooks decode through the dot8
 // forms of kernels/hip/iq_decode.cuh, so the digits are the ones the dp4a route
 // and the FP32 reference path see.
 //

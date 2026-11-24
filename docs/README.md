@@ -87,7 +87,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | --- | --- | --- |
 | [architecture.md](architecture.md) | Layered design, core interfaces, Go/HIP boundary, memory model, key decisions | All contributors |
 | [gguf.md](gguf.md) | GGUF reader, metadata mapping, tokenizer, quantization handling, model support matrix | Runtime and model contributors |
-| [kernels.md](kernels.md) | Prefill/decode kernel design, quantized GEMV/GEMM, attention, fusion, dispatch and tuning | Kernel contributors |
+| [kernels.md](kernels.md) | Operator families, supported dtypes, selection rules, fusion, numerics | Kernel contributors |
 | [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |
 | [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, regression gates | All contributors |
 | [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
@@ -199,7 +199,7 @@ Implemented and tested:
   across a tile of assignments. The K-quant and the IQ expert dtypes take the
   int8 WMMA grouped route, which replaces the per-assignment `dp4a` with the
   dense MMQ GEMM's int8 tiles at a measured assignment-tile table (see
-  [kernels.md](kernels.md#81-moe-expert-pipeline)); `Options.ForceMoEQ8` keeps
+  [kernels.md](kernels.md#55-moe)); `Options.ForceMoEQ8` keeps
   the `dp4a` route for A/B measurement. On Qwen3.6-35B-A3B the int8 WMMA route
   moved the expert stage from 99.4 to 58.4 ms at a 128-row chunk and from 363.2
   to 142.1 ms at 512 rows. The 2026-11-22 prefill pass then reached 1718.6,

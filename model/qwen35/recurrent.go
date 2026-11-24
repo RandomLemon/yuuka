@@ -118,7 +118,7 @@ func gdnPerTokenScan(state, sk, d, conv, alpha, beta, out []float32, rows, group
 //
 // where g is the cumulative log decay from the chunk start and g_c its last
 // entry. The decay of a row is a scalar for the whole state matrix, which is
-// why it factors out of the solve. See docs/kernels.md section 6.5.
+// why it factors out of the solve. See docs/kernels.md section 5.6.
 func gdnChunkedScan(state []float32, conv, alpha, beta, out []float32, rows,
 	groups, rank, stateSize, convDim int, sc *gdnScratch) {
 	for c0 := 0; c0 < rows; c0 += gdnChunkSize {

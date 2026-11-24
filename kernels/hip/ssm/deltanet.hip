@@ -9,7 +9,7 @@
 // conv_l2norm fuses the short convolution with the L2 norms of the q and k
 // channels it produces, so the delta-net unit of one layer is two launches
 // instead of five. The convolution ring state and the recurrent state keep the
-// layout the chunked prefill path consumes (docs/kernels.md section 9).
+// layout the chunked prefill path consumes (docs/kernels.md section 5.6).
 #include "../common.cuh"
 #include "../yuuka_kernels.h"
 
