@@ -85,7 +85,7 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 
 | Document | Contents | Primary audience |
 | --- | --- | --- |
-| [architecture.md](architecture.md) | Layered design, core interfaces, Go/HIP boundary, memory model, repository layout, key decisions | All contributors |
+| [architecture.md](architecture.md) | Layered design, core interfaces, Go/HIP boundary, memory model, key decisions | All contributors |
 | [gguf.md](gguf.md) | GGUF reader, metadata mapping, tokenizer, quantization handling, model support matrix | Runtime and model contributors |
 | [kernels.md](kernels.md) | Prefill/decode kernel design, quantized GEMV/GEMM, attention, fusion, dispatch and tuning | Kernel contributors |
 | [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |

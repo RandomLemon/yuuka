@@ -5,11 +5,15 @@
 This document describes the intended structure of `yuuka`: a GGUF inference
 framework with a Go runtime and HIP device kernels, targeting a single AMD
 gfx1151 APU. It covers the layer boundaries, the core interfaces, the Go/HIP
-seam, memory ownership, backend selection, and the repository layout.
+seam, memory ownership, backend selection, and the rules that keep the layers
+independent.
 
-Kernel algorithms are specified in [kernels.md](kernels.md); request scheduling
-and serving are specified in [serving.md](serving.md); format handling is
-specified in [gguf.md](gguf.md).
+It specifies design intent and the contracts each layer must satisfy, not
+current implementation state. Implementation status is tracked in
+[README.md](README.md); kernel algorithms are specified in
+[kernels.md](kernels.md); request scheduling and serving are specified in
+[serving.md](serving.md); format handling is specified in
+[gguf.md](gguf.md).
 
 ## 2. Target hardware and constraints
 
@@ -68,11 +72,6 @@ Execution Planner / Operator Dispatch / Allocation (Go)
    Norm | RoPE | Activation | Fusion
 ```
 
-The `Backend Interface` box is the target seam and not the current call path:
-execution today runs through `serving.Backend`, `engine.Runtime`,
-`engine/gpu.Model`/`Session`, and `backend/hip.Plan` (see section 4). Sampling
-is host-side; there is no device sampling kernel.
-
 ### 3.1 Layer responsibilities
 
 | Layer | Owns | Must not own |
@@ -81,7 +80,7 @@ is host-side; there is no device sampling kernel.
 | Model and tokenizer | GGUF metadata interpretation, tokenizer, chat template, sampling policy | HIP calls, request scheduling |
 | Scheduler | Admission, batching, token/KV budgets, cancellation | Kernel selection, weight layout |
 | Executor | Prefill/decode orchestration, KV block tables, sampling loop | Format parsing, transport concerns |
-| Planner | Planned operator sequence (`hip.Plan`), operator selection, scratch sizing, kernel signatures | Device-specific kernel internals |
+| Planner | Planned operator sequence, operator selection, scratch sizing, kernel signatures | Device-specific kernel internals |
 | Backend | Device allocation, streams, events, kernel launch, graph capture | GGUF parsing, model architecture decisions |
 | Kernels | Device-side computation | Model metadata, request lifecycle |
 
@@ -91,33 +90,24 @@ model definitions.
 
 ## 4. Core interfaces
 
-`backend/backend.go` is the declared seam. Its current contents are reproduced
-below; it is the target negotiation interface, not a frozen API.
+The following types define the intended seams. They are a design shape, not a
+frozen API: names, packaging, and concrete implementations may change as long as
+the contracts in section 4.1 hold.
 
 ```go
-type Capabilities struct {
-    Name             string
-    Device           string
-    SupportsF32      bool
-    SupportsF16      bool
-    SupportedQuant   []string
-    SupportsGraph    bool
-    MaxBatch         int
-    TotalMemoryBytes uint64
+type Model interface {
+    Config() ModelConfig
+    Tokenizer() Tokenizer
+    Weights() WeightStore
+    BuildPlan(Backend) (Executable, error)
 }
 
-type Buffer interface {
-    Bytes() uint64
-    Close() error
-}
-
-type Event interface {
-    Wait() error
-}
-
-type Executable interface {
-    Run(batch *Batch) (Event, error)
-    Close() error
+type TensorDesc struct {
+    Name   string
+    Shape  []int64
+    DType  DType
+    Offset uint64
+    Bytes  uint64
 }
 
 type Backend interface {
@@ -129,60 +119,24 @@ type Backend interface {
     Close() error
 }
 
-type OpCode uint32 // OpMatVec, OpMatMul, OpRMSNorm, OpRoPE, OpAttention,
-                  // OpSwiGLU, OpGDN, OpSample
-
-type Op struct {
-    Code   OpCode
-    Inputs []int
-    Out    int
-    Attrs  map[string]any
+type Executable interface {
+    Run(batch *Batch) (Event, error)
+    Close() error
 }
 
-type ExecutionPlan struct {
-    ModelName string
-    Pipeline  []Op
-    Bindings  int
-    Scratch   uint64
-}
-
-type Batch struct {
-    Tokens     []int32
-    Positions  []int32
-    BatchSize  int
-    SequenceID uint64
+type Event interface {
+    Wait() error
 }
 ```
 
-`ErrUnsupported` and `UnsupportedError` mark capability failures that planning
-must surface instead of substituting another numerical path.
-
-Two types from an earlier revision of this section do not exist and must not be
-assumed: a `Model` interface (`Config`/`Tokenizer`/`Weights`/`BuildPlan`) and a
-`TensorDesc`. Model access is through the concrete `qwen35.Model`, tensor
-metadata is `gguf.Tensor`, and dtypes are `tensor.DType`; there is no
-`BuildPlan` method anywhere (section 4.2 describes the planning that does
-happen).
-
-Implementation status: no package imports
-`github.com/yuuka-ai/yuuka/backend`, so the interface above is unexercised code.
-The executed path uses narrower concrete interfaces:
-
-- `serving.Backend` and `serving.Sequence` for request construction and
-  prefill/decode steps;
-- `scheduler.Task` for admission-driven request state;
-- `engine.Runtime` for the single-request CLI;
-- `engine/gpu.Model` and `engine/gpu.Session` for the shared HIP model and
-  per-request paged KV state;
-- `backend/hip.Plan`, `Graph`, `Stream`, `Event`, and `Buffer` at the C ABI.
-
-The generic `backend.Backend` interface can be adopted later, but it must not
-introduce a cgo call per tensor and must preserve the current block-table and
-session ownership rules.
+`TensorDesc` is the only tensor metadata shape the planner and kernels may
+consume: a name, logical shape, dtype, and byte range inside the weight store.
+The model layer must not expose raw packed bytes upward, and device code must not
+inspect model metadata.
 
 ### 4.1 Interface contracts
 
-These contracts must be explicit in the implementation:
+These contracts must be explicit in every implementation:
 
 - **Buffer ownership.** Every `Buffer` has one owner. Transfer of ownership and
   the point of release are part of the API, not an implementation detail.
@@ -202,8 +156,9 @@ These contracts must be explicit in the implementation:
 
 ### 4.2 Planning model
 
-Planning inspects the model configuration, quantization types, and expected
-batch shapes before any device allocation. It produces a plan containing:
+Planning inspects the model configuration, backend capabilities, quantization
+types, and expected batch shapes before any device allocation. It produces a
+plan containing:
 
 - weight buffer bindings and device residency;
 - kernel choices and their shape signatures;
@@ -213,10 +168,10 @@ batch shapes before any device allocation. It produces a plan containing:
 - fallback choices for unsupported operations.
 
 Planning happens at load time and whenever a new shape class requires a new
-kernel configuration. It must not perform a cgo call per tensor per token. Each
-HIP session caches one prefill plan per distinct chunk length; the final partial
-chunk has its own plan. A model-level prefill-generation counter invalidates a
-session's cached chunk plans when the chunk geometry changes.
+kernel configuration. It must not perform a cgo call per tensor per token. Chunk
+geometry is part of the plan identity: a session caches one prefill plan per
+distinct chunk length, the final partial chunk has its own plan, and a change in
+chunk geometry invalidates the cached plans.
 
 ## 5. Execution model
 
@@ -225,9 +180,9 @@ Open and validate GGUF
         |
 Build tokenizer, model config, weight descriptors
         |
-Build ExecutionPlan (kernel selection, scratch, residency)
+Build plan (kernel selection, scratch, residency)
         |
-Allocate per-tensor weights, prefill scratch, KV pool, recurrent state
+Allocate weights, activation scratch, KV pool, recurrent state
         |
 Prefill: prompt chunks -> attention + GEMM -> KV writes
         |
@@ -236,46 +191,24 @@ Decode loop: quantized GEMV + paged attention -> logits -> host sampling
 Stream tokens / finish / release request resources
 ```
 
-Current status: the HIP `qwen35` path processes prompts through cached chunked
-prefill plans (int8 MMQ with `gfx1151` Direct specialization, Direct/rocWMMA
-FP16 GEMM, FP32 streaming for `1–16` K-quant rows, rocBLAS F16 baseline, paged
-MMA/split-key and tiled attention, prepared/split-register gated delta-net, and
-paged KV writes) and then decodes through the single-token paged plan. The CPU reference
-path processes the prompt one token at a time through the reference operators
-and uses the same paged KV and recurrent-state interfaces, but it does not build
-WMMA, rocBLAS, or Flash Attention plans. The serving scheduler interleaves
-requests on one model stream. HIP Graph capture and replay are implemented per
-session but opt-in; the plain stream path is the default because the measured
-decode gain was within noise.
-
-The CPU reference also covers `qwen35moe`, and the HIP backend executes both
-`qwen35` and `qwen35moe` for the same hybrid attention and recurrent layers.
-Other architectures, including Llama, dense Qwen3, and Qwen3 MoE, have no
-adapter and are rejected at load time. `qwen35moe` uses top-k routing and a
-sigmoid-gated shared expert in both paths; the HIP decode plan runs the
-selected-expert MoE kernels and the chunked prefill plan runs the grouped
-expert kernels. Speculative decoding is an opt-in greedy generation mode that
-verifies prompt-lookup drafts through an all-position prefill plan and restores
-session state on a partial rejection.
-
 Key rules:
 
 1. GGUF data is validated before any device allocation.
-2. Weights are uploaded once into per-tensor device allocations that stay
-   resident for the model lifetime.
-3. HIP prefill and decode share the KV cache but use different operator paths.
-   HIP prefill uses chunked batched plans; decode uses the single-token GEMV
-   and per-head attention graph. The CPU reference processes tokens one at a
-   time for both phases. The MoE FFN is the one place where the two HIP phases
-   differ in kernel family: decode routes one token through selected-expert
-   kernels, prefill bins the chunk's assignments and runs grouped kernels.
-4. Sampling runs on the host over the FP32 logits row the decode step
-   downloads. There is no device sampling kernel and no plan-level sampling
-   decision; moving it onto the GPU would add a new kernel family.
-5. Request cancellation releases KV blocks and scratch through the scheduler
-   and memory manager, not through ad hoc frees in the API layer. The
-   single-request runtime retains its own table for reset; the serving path
-   releases each request table exactly once.
+2. Weights are uploaded once and stay resident for the model lifetime.
+3. Prefill and decode share the KV cache but use different operator families:
+   prefill runs chunked batched plans, decode runs single-token quantized GEMV
+   with per-head attention. Sampling runs on the host over the logits each step
+   returns.
+4. Sampling policy is a property of the request, not of the device path. A
+   future device sampling kernel must fit behind the same interface.
+5. Request cancellation releases KV blocks and scratch through the scheduler and
+   memory manager, not through ad hoc frees in the API layer. Each request table
+   is released exactly once, whether the request completed, was cancelled, or
+   failed.
+6. The CPU reference path is deliberately simple: it walks the prompt one token
+   at a time through the same operators, KV cache, and recurrent-state
+   interfaces, so it stays an independent correctness oracle rather than a
+   second optimized implementation.
 
 ## 6. Go and HIP boundary
 
@@ -283,7 +216,7 @@ Go must not make a fine-grained cgo call for every tensor operation. The
 boundary is designed around planned, batched submission:
 
 ```text
-Go builds/caches ExecutionPlan
+Go builds/caches the plan
         |
 Go submits a batch or decode step
         |
@@ -305,26 +238,24 @@ Event -> Go completion -> sampling/streaming
 
 - GPU asynchronous work must not hold raw pointers into Go-managed memory unless
   the memory is pinned and its lifetime is guaranteed for the entire operation.
-- Prefer persistent data in HIP-managed buffers, with events coordinating reuse
-  and release.
-- Host/device transfers are synchronous `hipMemcpy` calls from pageable host
-  memory into the destination buffer, so the host buffer may be reused as soon
-  as the call returns. There is no general staging pool; the only pinned
-  allocation is the per-stream 8-byte graph dynamic-parameter buffer.
+- Prefer persistent data in backend-managed buffers, with events coordinating
+  reuse and release.
+- Host/device transfers must have a defined completion point. A host buffer may
+  only be reused once the transfer that reads it has completed.
 - Every path that can fail after partial allocation must have a cleanup path
   that releases all acquired buffers and streams.
 
 ### 6.3 Target abstractions
 
-| Abstraction | Purpose | Status |
+| Abstraction | Purpose | Design constraint |
 | --- | --- | --- |
-| `Device`, `Stream`, `Event` | Execution and synchronization | Implemented in `backend/hip` |
-| `DeviceBuffer` | Device allocation with explicit lifetime | Implemented as `hip.Buffer` |
-| `HostPinnedBuffer`, `MappedBuffer` | Allocation classes with different performance and lifetime rules | Not implemented as general types; pinned staging is used only for graph dynamic parameters |
-| `GraphExecutable`, `GraphReplay` | Cached launch graphs for stable shapes | Implemented as `hip.Graph` |
-| `ScratchAllocator`, `WeightAllocator`, `KVAllocator` | Pool-specific allocation policies | KV block allocator implemented in `memory`; prefill scratch is reallocated as one group by `configurePrefill`; there is no scratch or weight allocator, and weights are one `hipMalloc` per tensor |
-| Shape signature and dispatch selectors | Dispatch and tuning lookup | Implemented by `SelectPrefillPath`; decode GEMV is fixed at one row; no generic kernel registry |
-| Backend capabilities | Capability negotiation and unsupported-operation fallback | Implemented per operator in plan validation (`engine/gpu/validate.go`, `backend/hip.Plan` argument checks); the generic `backend` package is imported by no package |
+| `Device`, `Stream`, `Event` | Execution and synchronization | Explicit streams only; no reliance on a default stream; one event per submission |
+| `DeviceBuffer` | Device allocation with explicit lifetime | Single owner, explicit release, no reuse before completion |
+| `HostPinnedBuffer`, `MappedBuffer` | Allocation classes with different performance and lifetime rules | Used only where a measurement justifies the class, with lifetime guaranteed for the operation |
+| `GraphExecutable`, `GraphReplay` | Cached launch graphs for stable shapes | Validate addresses, shapes, and block tables before replay; fall back on mismatch |
+| Weight, activation, and KV allocators | Per-class allocation policies | Sized during planning, not per launch; KV policy is paged |
+| Shape signature and dispatch selectors | Dispatch and tuning lookup | Keyed by dtype, shape class, and row class; values come from measured tables for the target device |
+| Backend capabilities | Capability negotiation and unsupported-operation fallback | Consulted during planning; unsupported combinations fail explicitly |
 
 ## 7. Memory model
 
@@ -333,75 +264,53 @@ Event -> Go completion -> sampling/streaming
 The APU shares physical memory between CPU and GPU, but allocation paths are not
 equivalent. The implementation must measure, for the target system:
 
-- `hipMalloc` device allocations;
+- device allocations;
 - host pinned allocations;
 - mapped/host-visible allocations;
 - any available unified-memory mechanisms;
 - bandwidth, prefetch behavior, page migration, and synchronization cost.
 
-The allocation path chooses a policy per buffer class based on measurements, not
-on the assumption that zero-copy access is optimal. Today weights, activations,
-KV rows, and recurrent state are all `hipMalloc` device buffers, and uploads are
-synchronous host-to-device copies from pageable memory.
+The allocation policy per buffer class is chosen from those measurements, not
+from the assumption that zero-copy access is optimal.
 
 ### 7.2 Pools
 
-| Pool | Contents | Lifetime | Allocation policy |
+| Pool | Contents | Lifetime | Policy requirement |
 | --- | --- | --- | --- |
-| **Weights** | Quantized weights, embedding tables, output head | Model lifetime | One device allocation per GGUF tensor; no pooling, addresses stable for the model lifetime |
-| **Activation** | Layer scratch, attention workspace, logits | Per step or per batch | Reused across layers; sized from the plan |
-| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Paged block allocator with F32, F16, or Q8_0 rows; append-only per-request block table covered for the full budget at admission; see [serving.md](serving.md) |
-| **Staging** | Host/device transfer buffers | Transient | No staging pool: each upload is one synchronous `hipMemcpy` straight into the destination buffer from pageable host memory; the only pinned allocation is the 8-byte graph dynamic-parameter staging buffer |
+| **Weights** | Quantized weights, embedding tables, output head | Model lifetime | Device-resident and uploaded once; addresses stay stable while the model is loaded |
+| **Activation** | Layer scratch, attention workspace, logits | Per step or per batch | Reused across layers and sized from the plan; no per-kernel allocation in the hot path |
+| **KV cache** | Key/value blocks | Request lifetime, with prefix-cache sharing | Paged block allocator with F32, F16, or Q8_0 rows, addressed through a block table; see [serving.md](serving.md) |
+| **Staging** | Host/device transfer buffers | Transient | Reused with explicit synchronization; the class of each staging buffer follows section 7.1 |
 | **Graph workspace** | Stable-address buffers for replay | Session lifetime | Address stability is required while a captured graph is installed |
-
-Prefill scratch is part of the activation pool and is sized from the model
-configuration when the chunk size changes. `xF16` holds the chunk activations
-cast to FP16 and `yF16` the widest FP16 matmul result, both for the rocBLAS F16
-route. `xQ8` and `xDS` hold the Q8_1 activations and their float2 block scales
-for the int8 K-quant route; `xQ8` is one byte per activation and `xDS` one
-`float2` per 32 values, so the pair is smaller than the FP16 weight scratch the
-removed dequantize route required. `token_embd` and `output` are excluded from
-the sizing because the embedding op gathers the first and only the single-row LM
-head reads the second. Ownership stays with the model's prefill scratch, and
-`configurePrefill` reallocates every buffer together so a plan never outlives
-the buffer it references.
 
 ### 7.3 KV cache summary
 
-Current implementation: CPU and HIP use paged KV pools addressed by allocator
-block ID. A request owns an append-only block table that admission covers for
-the full prompt plus output budget before the first step; positions are resolved
-through that table by the CPU attention loop and by the paged HIP KV-write and
-attention kernels. Recurrent convolution and matrix state stay contiguous per
-session and are snapshotted for prefix reuse. The default block size is 16
-tokens. F16 is the default KV storage; opt-in F32 and Q8_0 formats use the same
-block table and are selected through `--kv-type` for the `qwen35` and
-`qwen35moe` CPU and HIP runtimes. The logical KV view exposed to model code does
-not expose physical block layout. Block allocation, reference counting, prefix
-sharing, cancellation, and eviction are specified in [serving.md](serving.md).
+The KV cache is a paged pool addressed by allocator block ID. A request owns a
+block table covering its prompt plus output budget; the model code sees only the
+logical position, never the physical block layout. Positions are resolved
+through the block table by attention and by KV writes. Recurrent convolution and
+matrix state are the exception: they stay contiguous per session and are
+snapshotted when a prefix is shared.
+
+The storage format is a per-run choice among F32, F16, and Q8_0, using the same
+block table and the same kernel entry points. The block size is configurable.
+Block allocation, reference counting, prefix sharing, cancellation, and eviction
+are specified in [serving.md](serving.md).
 
 ## 8. Backends and fallback
 
-| Backend | Role | Status |
+| Backend | Role | Requirement |
 | --- | --- | --- |
-| HIP GPU | Primary execution path | Implemented for `qwen35` and `qwen35moe` single and concurrent requests over a shared paged KV pool; other architectures are rejected; opt-in graph replay |
-| CPU reference | Correctness baseline, required fallback for unsupported operations | Implemented for `qwen35` and `qwen35moe`; default backend; concurrent paged serving for both |
-| XDNA NPU | Optional heterogeneous acceleration | Diagnostic capability probe and explicit GPU fallback only; execution is a future task; see [npu.md](npu.md) |
+| HIP GPU | Primary execution path | Implements the full prefill and decode graph for every supported architecture; device errors are reported, never suppressed |
+| CPU reference | Correctness oracle and required fallback | Implements the same operators and the same KV and recurrent-state interfaces, and is the default when no device path is selected |
+| XDNA NPU | Optional heterogeneous acceleration | May report capabilities and fall back to the GPU; must never be a dependency of the GPU-only path; see [npu.md](npu.md) |
 
-The concrete planners validate supported dtypes, quantization types, batch
-limits, graph eligibility, and buffer shapes per operation. The generic
-`backend.Backend.Capabilities` seam remains the target negotiation interface
-and is not wired yet (see section 6.3). If a kernel or dtype is unsupported, the
-planner either selects a measured dispatch path or fails during planning with a
-precise diagnostic. Silent numerical substitution is not allowed.
-
-Plan construction applies the same rule to every GEMV, batched GEMV, and GEMM
-operation, and to the streaming kernel that both output tails and the decode
-matvec family use. An
-unsupported dtype or a width that violates the quantization
-block layout is a capability error, and invalid dimensions, batch sizes, or
-buffer ranges are argument errors. A rejected operation is not appended to the
-plan, so execution cannot silently skip it.
+Planning validates supported dtypes, quantization types, batch limits, graph
+eligibility, and buffer shapes per operation, consulting the backend capability
+description. If a kernel or dtype is unsupported, the planner either selects a
+measured dispatch path or fails during planning with a precise diagnostic.
+Silent numerical substitution is not allowed, and a rejected operation is never
+appended to a plan.
 
 Reserved for future extension:
 
@@ -409,88 +318,10 @@ Reserved for future extension:
 - `Transfer` and `Event` for cross-device dependencies;
 - NPU-specific weight formats and model copies.
 
-These interfaces must remain optional so the first GPU-only release does not
-depend on NPU toolchain availability.
+These interfaces must remain optional so the GPU-only release does not depend on
+NPU toolchain availability.
 
-## 9. Repository layout
-
-Current implemented layout:
-
-```text
-yuuka/
-├── cmd/
-│   ├── yuuka/                 # CLI
-│   └── yuuka-server/          # OpenAI-compatible server
-├── gguf/                      # Pure Go GGUF reader and validation
-├── tokenizer/                 # Qwen BPE, SentencePiece, and chat rendering
-├── tensor/                    # Dtypes, block layouts, CPU reference math
-├── model/
-│   └── qwen35/                # qwen35 and qwen35moe reference decoders
-├── engine/
-│   ├── engine.go              # Single-request generation loop
-│   ├── sampling.go            # Host-side greedy, top-k, nucleus sampling
-│   ├── speculative.go         # Greedy prompt-lookup speculation
-│   ├── text.go                # Incremental UTF-8 streaming helper
-│   └── gpu/                   # Shared HIP model, plans, paged sessions
-├── memory/                    # Block allocator, block tables, prefix cache
-├── scheduler/                 # Admission, continuous batching, timeouts
-├── serving/                   # manager.go, task.go, types.go, text.go,
-│                              #   backend_qwen35.go, backend_hip.go
-├── backend/
-│   ├── backend.go             # Planned backend interfaces; imported by nothing
-│   ├── npu/                   # Diagnostic capability probe only
-│   └── hip/
-│       ├── hip.go             # cgo binding for the C ABI
-│       ├── dispatch.go        # Measured prefill and MoE path selectors
-│       ├── opinfo.go          # Operator codes shared with the profiler
-│       └── bridge/            # HIP C ABI implementation
-├── kernels/hip/
-│   ├── attention/
-│   ├── embedding/
-│   ├── gemm/
-│   ├── gemv/
-│   ├── moe/
-│   ├── ops/
-│   ├── prefill/
-│   ├── ssm/
-│   ├── common.cuh
-│   ├── iq_decode.cuh
-│   ├── kv.cuh
-│   ├── quant.cuh
-│   └── yuuka_kernels.h
-├── tests/
-│   ├── fixture/               # Deterministic tiny GGUF generators
-│   └── hip/                   # 13 CTest binaries: ABI, GEMV, GEMM, prefill,
-│                              #   ops, embedding, paged KV/graph, delta-net,
-│                              #   MoE (plain, IQ, MMQ), plan validation
-├── bench/
-│   ├── hip/                   # Hardware and dot probes; GEMV, decode-GEMV,
-│                              #   prefill, MoE, and delta-net sweeps
-│   ├── prefill-compare/       # Matched-input prefill driver and llama.cpp runner
-│   └── serving/               # Latency and throughput harness
-├── scripts/                   # Toolchain, hardware, profile, compare helpers
-├── docs/
-│   └── benchmarks/            # Per-model measured reports
-├── CMakeLists.txt
-└── go.mod
-```
-
-Planned but not present yet: a separate `backend/cpu/` package and
-`kernels/hip/sampling/`. Sampling is host-side today
-(`engine/sampling.go`) and no device sampling kernel exists, so the `OpSample`
-plan code and the `Sampling` kernel family are targets, not implementation.
-`backend/npu/` contains the diagnostic capability probe, not an execution
-backend. The CPU reference model code is implemented in `model/qwen35`; `engine`
-owns the single-request generation loop, while `serving` and `scheduler` own
-concurrent requests. The generic `backend` interfaces remain the target shape
-and are imported by no package; the current executor uses `serving.Backend`,
-`engine/gpu.Model`, `engine/gpu.Session`, and `backend/hip.Plan`.
-
-Use CMake for the HIP shared library and Go Modules for Go components. The two
-build systems meet at the C ABI. Do not embed the HIP/C++ build inside a Go
-package.
-
-## 10. Key decisions
+## 9. Key decisions
 
 | Question | Decision |
 | --- | --- |
@@ -504,66 +335,61 @@ package.
 | NPU scheduling in the first release? | No. Reserve backend and event abstractions only. |
 | When to add HIP Graph? | After the plain stream path is stable and profiling shows launch overhead is significant. |
 
-## 11. Open design questions
+## 10. Open design questions
 
 These require implementation experiments or explicit decisions. The current
-decision and the phase that may reopen it are recorded below.
+decision is recorded with each question; reopening one requires new
+measurements or a scope change recorded in the same change.
 
 1. **Buffer and event ownership syntax.** Buffers are caller-owned opaque C
-   handles with explicit release; the Go wrapper makes `Close` idempotent.
-   An event represents one submission, and `Wait` may be called more than once;
+   handles with explicit release; the Go wrapper makes `Close` idempotent. An
+   event represents one submission, and `Wait` may be called more than once;
    implementations must make it idempotent after completion. Plans do not own
-   bound buffers. Model-lifetime allocations and request session allocations
-   are tracked separately; Phase 4 did not need an arena allocator.
-2. **UMA allocation policy.** Weights, activations, KV, and recurrent state use
-   device allocations, one `hipMalloc` per buffer. Uploads are synchronous
-   `hipMemcpy` from pageable host memory straight into the destination;
-   there is no staging pool. Graph dynamic-parameter updates use the per-stream
-   8-byte pinned buffer. Full pinned staging for model uploads is not
-   implemented. Mapped host memory is measured but is not a default path.
-   Revisit only with a measured prefetch or migration win.
-3. **Graph replay mutation.** Implemented in Phase 4 and opt-in. Capture is per
-   session for the decode shape. Token and position are read from a
-   device-resident dynamic buffer uploaded before `hipGraphLaunch`; replay
-   validates the session, position, block-table coverage, and dynamic buffer
-   and falls back to stream submission on any failure. The measured decode gain
-   on the validated model was within noise, so the plain stream path is the
-   default.
-4. **Dispatch decisions.** Measured thresholds are encoded in the explicit Go
-   selector `SelectPrefillPath`, keyed by dtype, shape class, and row class. They
-   are derived from the checked-in sweep harness and recorded in
-   [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md), and they are gated by dispatch tests. There is
-   no runtime autotuner or device table registry; adding a device requires
-   re-running the sweeps and updating the selectors and tests. Values from other
-   RDNA parts are not accepted.
+   bound buffers, and the design does not require an arena allocator.
+2. **Allocation policy per class.** Weights, activations, KV, and recurrent
+   state are device allocations; mapped host memory is measured but is not a
+   default path. Upload strategy follows the measurements required by section
+   7.1. Revisit only with a measured prefetch or migration win.
+3. **Graph replay mutation.** Capture is per session for the decode shape.
+   Token and position reach the device through a device-resident dynamic
+   buffer; replay validates the session, position, and block-table coverage and
+   falls back to stream submission on any failure. Replay is opt-in: it is
+   enabled only when profiling shows launch overhead is material.
+4. **Dispatch decisions.** Measured thresholds are encoded in explicit Go
+   selectors keyed by dtype, shape class, and row class, derived from the
+   checked-in sweep harness and recorded in the benchmark reports. There is no
+   runtime autotuner and no device table registry; adding a device means
+   re-running the sweeps and updating the selectors and their tests. Values
+   measured on another RDNA part are not accepted.
 5. **Fallback semantics.** Unsupported dtype/shape combinations fail during
-   planning with a capability error; silent numerical substitution is forbidden.
-   rocBLAS may be selected for prefill only through a measured dispatch table.
-   Decode stays on fused quantized GEMV.
-6. **Prefix-cache eviction.** LRU is selected for Phase 4. Entries release
-   their own references while request-held references keep shared blocks alive.
-   Entry and block caps are configurable; allocator pressure invokes the cache
-   before allocation fails.
+   planning with a capability error; silent numerical substitution is
+   forbidden. A library GEMM may be selected for prefill only through a measured
+   decision. Decode stays on fused quantized GEMV.
+6. **Prefix-cache eviction.** LRU, with reference-counted blocks: an entry
+   releases only its own reference while request-held references keep shared
+   blocks alive. Entry and block caps are configurable, and allocator pressure
+   invokes the cache before allocation fails.
 7. **Mixed-shape batching.** The scheduler interleaves per-request plans on one
-   stream. Fusing multiple decode requests or prefill plus decode into one
-   kernel batch is not implemented; it would require per-lane block tables and
-   sequence lengths and is left to a later phase.
-8. **NPU integration boundary.** Future task; not scheduled. `backend/npu`
-   provides only a diagnostic capability probe and fallback decision. NPU
-   execution, graph compilation, and subgraph splitting are not shipped, and
-   activation criteria in [npu.md](npu.md) are unmet on the reference host.
+   stream. Fusing several decode requests, or prefill plus decode, into one
+   kernel batch is not part of the first release: it needs per-lane block tables
+   and sequence lengths.
+8. **NPU integration boundary.** Future task; not scheduled. The NPU backend
+   reports capabilities and a fallback decision only. Execution, graph
+   compilation, and subgraph splitting are out of scope until the activation
+   criteria in [npu.md](npu.md) are met on the reference host.
 
-## 12. Extensibility rules
+## 11. Extensibility rules
 
 - **New architecture:** add a metadata adapter and a model builder. Do not add
-  architecture-specific branches to the GGUF reader or HIP runtime.
-- **New quantization type:** add reader support, a dtype descriptor, dequant/GEMV
-  and GEMM kernels, and planner entries. The model layer must not inspect raw
-  packed bytes.
-- **New backend:** implement `Backend`, `Executable`, and `Event`, declare
-  capabilities, and provide fallback behavior. Do not modify the scheduler.
+  architecture-specific branches to the GGUF reader or to the HIP runtime.
+- **New quantization type:** add reader support, a dtype descriptor, dequant,
+  GEMV and GEMM kernels, and planner entries. The model layer must not inspect
+  raw packed bytes.
+- **New backend:** implement the backend, executable, and event contracts,
+  declare capabilities, and provide fallback behavior. Do not modify the
+  scheduler.
 - **New kernel:** add its shape validation to plan construction, its dispatch
-  rule to the Go selectors, correctness tests, and a performance baseline. The
+  rule to the selectors, correctness tests, and a performance baseline. The
   planner selects it only when its preconditions hold.
 - **New API surface:** add it in the transport layer and map it to scheduler
   requests. Do not bypass admission or KV budgeting.
