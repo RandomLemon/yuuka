@@ -69,7 +69,8 @@ Not yet implemented: model architectures other than `qwen35` and `qwen35moe`,
 NPU execution (the probe is diagnostic), quantization presets outside the
 documented set, speculative decoding for non-greedy sampling, and fused
 mixed-shape multi-request batching.
-See `docs/README.md` for the full status.
+See `docs/README.md` for release scope and `docs/benchmarks.md` for measured
+status.
 
 Therefore:
 

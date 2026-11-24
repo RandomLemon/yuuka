@@ -23,7 +23,8 @@ reference and a HIP path, and a concurrent serving path:
 Only `qwen35` and `qwen35moe` are supported, on both the CPU reference and the
 HIP backend. Other architectures, unsupported tensor types, and non-Qwen chat
 templates are rejected explicitly rather than approximated. See
-[`docs/README.md`](docs/README.md) for full status and limitations.
+[`docs/README.md`](docs/README.md) for release scope and the model reports for
+measured status and limits.
 
 ## Quick start
 

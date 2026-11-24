@@ -9,7 +9,7 @@ ROCm change before trusting the numbers.
 | Item | Value |
 | --- | --- |
 | Date | 2026-11-11 |
-| Commit | implementation commit containing this report |
+| Commit | commit containing this report |
 | Host kernel | Linux 6.17.13-21-pve |
 | OS | Debian GNU/Linux 13 (trixie) |
 | CPU | AMD Ryzen AI MAX+ 395, 16 cores / 32 threads |
@@ -86,9 +86,6 @@ state, fan behavior, or long-running throttling. The hwmon power reading is
 socket power, not a GPU-only counter. Re-run the script with a longer duration
 before using the values for a sustained-performance claim.
 
-The C ABI test and the quantized GEMV test run through CTest. The hardware probe
-is a benchmark and is run explicitly.
-
 ## Memory measurements
 
 Size is 256 MiB per operation. Values are measured with HIP events and include
@@ -114,9 +111,8 @@ The measured host/device copy path is much slower than the device-local write
 rate. The memory policy is:
 
 - keep weights in device allocations for the model lifetime;
-- the probe measures pinned uploads, but the runtime currently uploads model
-  data with synchronous `hipMemcpy` from pageable host memory; full pinned
-  staging remains a planned optimization;
+- use pinned host staging only where a measurement justifies it; generalized
+  pinned upload remains a planned optimization;
 - keep activation, KV, and recurrent state in device memory;
 - do not assume mapped host memory is a zero-cost replacement for device
   allocations;
@@ -143,27 +139,15 @@ A `16x16x16` FP16 WMMA tile with FP32 accumulation compiles for `gfx1151` and
 matches a CPU reference within `1e-3`. This confirms that the RDNA WMMA path is
 available to the toolchain and that a wave32 launch works on this device.
 
-## C ABI and kernels
-
-- `ctest` passes the allocation, upload, stream, event, and error-propagation
-  round trip.
-- Quantized GEMV kernels for `F16`, `Q8_0`, `Q4_K`, `Q5_K`, and `Q6_K` match a
-  CPU dequantization reference on random packed rows and alignment boundaries.
-- The HIP kernels are integrated into the model executor through a planned
-  operation stream. The CPU reference path remains the default and the
-  correctness oracle.
-
 ## Decisions recorded
 
 1. Device execution uses explicit non-blocking streams; each event represents
    one submission and `Wait` is idempotent after completion.
 2. Weights remain packed; kernels dequantize inside the multiply.
-3. Model uploads currently use synchronous `hipMemcpy` from pageable host
-   memory; pinned staging is measured and used for graph dynamic parameters, and
-   general pinned staging remains a planned optimization.
-4. Mapped host memory is measured but not selected by default.
-5. WMMA is available; the prefill GEMM path can target it in a later phase.
-6. The CPU reference path remains the correctness oracle after HIP integration.
+3. Pinned host staging is used only where a measurement justifies it; mapped
+   host memory is measured but not selected by default.
+4. WMMA is available; the prefill GEMM path can target it.
+5. The CPU reference path remains the correctness oracle after HIP integration.
 
 ## Post-gate follow-up measurements
 
@@ -174,20 +158,5 @@ follow-ups would strengthen the evidence but are not Phase 0 gates:
 - A larger rocBLAS shape sweep and a WMMA tiled GEMM benchmark.
 - A final decision on which buffer classes, if any, should use mapped memory.
 
-## NPU capability probe (diagnostic)
-
-`go run ./cmd/yuuka npu-probe` on the reference host reports:
-
-```text
-state: device_only
-device: /dev/accel/accel0
-driver: true
-userspace: false
-reason: device and amdxdna driver are present, but no XRT userspace runtime was found
-fallback: selected (NPU unavailable: device and amdxdna driver are present, but no XRT userspace runtime was found; using the selected backend)
-```
-
-The XDNA device node and the `amdxdna` kernel module are present. No
-`xrt-smi`, `libxrt_core*`, or XRT installation directory was found, so the NPU
-userspace prerequisite is unmet. The project does not claim NPU inference
-support; see [npu.md](npu.md).
+The NPU capability probe is diagnostic only and is documented in
+[npu.md](npu.md); the project does not claim NPU inference support.

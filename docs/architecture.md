@@ -9,7 +9,7 @@ seam, memory ownership, backend selection, and the rules that keep the layers
 independent.
 
 It specifies design intent and the contracts each layer must satisfy, not
-current implementation state. Implementation status is tracked in
+current implementation state. Release scope and status are summarized in
 [README.md](README.md); kernel algorithms are specified in
 [kernels.md](kernels.md); request scheduling and serving are specified in
 [serving.md](serving.md); format handling is specified in

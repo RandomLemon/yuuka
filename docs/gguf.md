@@ -34,12 +34,12 @@ builders bind named tensors; kernels interpret the quantization layout.
 | 4. Tensor directory | Read each tensor name, rank, dimensions, `ggml_type`, and data offset | Reject duplicate names, invalid ranks, zero dimensions, or overflow |
 | 5. Layout | Resolve alignment, tensor byte ranges, shard assignment, and data-section bounds | Reject overlaps, out-of-range offsets, or incomplete shards |
 | 6. Model config | Map architecture metadata through an architecture adapter | Reject missing required fields or inconsistent head dimensions |
-| 7. Weight store | Build tensor descriptors and map weight bytes on demand | Reject missing required weights; unexpected extras are currently not rejected or warned about |
+| 7. Weight store | Build tensor descriptors and map weight bytes on demand | Reject missing required weights; extra tensors are permitted |
 | 8. Tokenizer | Build vocabulary, merges/scores, special tokens, and read the chat-template metadata | Reject invalid token IDs or malformed metadata types; non-Qwen templates are rejected when chat rendering is requested |
 | 9. Handoff | Expose `ModelConfig`, `Tokenizer`, and `WeightStore` to the planner | No device allocation before validation completes |
 
-The reader should use `mmap` or on-demand loading to avoid copying the entire
-file into Go heap memory. Tensor data is read-only for the model lifetime.
+The reader must use `mmap` or equivalent on-demand loading so the file is not
+copied into Go heap memory. Tensor data is read-only for the model lifetime.
 
 ## 3. On-disk details the reader must handle
 
@@ -57,9 +57,8 @@ file into Go heap memory. Tensor data is read-only for the model lifetime.
   count declared by shard 0 and carry the expected shard index. A model is
   usable only when every required tensor is present exactly once.
 - **Duplicate and missing entries.** Duplicate metadata keys or tensor names are
-  errors. Missing required tensors are errors. Extra tensors are currently not
-  rejected or warned about; the HIP loader uploads every tensor in the
-  directory, while the CPU reference loader reads only named tensors.
+  errors. Missing required tensors are errors. Extra tensors are permitted and
+  do not change the model view.
 - **Read-only mapping.** The mapping must not be mutated. Device upload reads
   from the mapping; it does not modify the source file.
 
@@ -73,25 +72,30 @@ model. They do not mean that every tensor uses `Q4_K`. Embeddings, output heads,
 normalization weights, and some layer tensors may use different types. The
 planner and kernels must consult each `TensorDesc.DType`.
 
-Initial native kernel coverage targets:
+The format must be readable for the following types. Layout notes belong
+here; execution support per backend is owned by
+[kernels.md](kernels.md#3-supported-dtypes).
 
-| Type | Layout notes | Initial use |
-| --- | --- | --- |
-| `F16` / `F32` | Unquantized baseline | Reference and fallback |
-| `Q8_0` | Simple block quantization, high bandwidth | Decode baseline |
-| `Q4_0` | 32-value block, one scale, nibble pairs | Decode, embedding, prefill |
-| `Q5_0` | Q4_0 plus a high-bit plane | Decode, embedding, prefill |
-| `Q6_K` | K-quant superblock layout | Decode and prefill |
-| `Q4_K` | 256-weight superblock with scale/min encoding | Primary decode target |
-| `Q5_K` | K-quant layout related to Q4_K/Q6_K | Decode and prefill |
-| `IQ2_XXS` | 256-weight codebook block, 66 bytes | CPU reference and HIP MoE expert / dequantization |
-| `IQ2_S` | 256-weight codebook block with 8-bit scales, 82 bytes | CPU reference and HIP MoE expert / dequantization |
-| `IQ3_S` | 256-weight codebook block, 110 bytes | CPU reference and HIP MoE expert / dequantization |
+| Type | Layout notes |
+| --- | --- |
+| `F16` / `F32` | Unquantized baseline |
+| `Q8_0` | 32-value block, one FP16 scale plus int8 values |
+| `Q4_0` | 32-value block, one scale, nibble pairs |
+| `Q5_0` | `Q4_0` plus a high-bit plane |
+| `Q6_K` | 256-value K-quant superblock |
+| `Q4_K` | 256-value superblock with scale/min encoding |
+| `Q5_K` | 256-value K-quant superblock |
+| `IQ2_XXS` | 256-value codebook block, 66 bytes |
+| `IQ2_S` | 256-value codebook block with 8-bit scales, 82 bytes |
+| `IQ3_S` | 256-value codebook block, 110 bytes |
 
 The reader validates block-size divisibility where the format requires it, but
 must not reject a tensor merely because a particular kernel does not support its
-shape. Unsupported combinations are reported by the planner as capability
-errors.
+shape. Unsupported execution combinations are reported by the planner as
+capability errors.
+
+`Q4_1`, `Q5_1`, `Q2_K`, `Q3_K`, `Q8_K`, `IQ1_S`, `IQ2_XS`, `IQ3_XXS`,
+`IQ4_NL`, and `IQ4_XS` have no execution path and are capability failures.
 
 > Do not pre-expand all quantized weights into a full FP16 matrix for decode.
 > Dequantization, multiplication, and reduction are fused in the kernel. See
@@ -130,12 +134,12 @@ family, so each architecture adapter maps its metadata into a common
 
 Validation must cover consistency between fields: explicit key and value head
 dimensions must agree with each other and with the tensor shapes; a missing key
-dimension is derived from hidden size and head count. KV head
-count must divide query head count for GQA, and special token IDs must be within
-the vocabulary. RoPE scaling metadata is
-not executed in this release. The validated models use the base RoPE table, and
-a file that declares linear or YaRN scaling is rejected during configuration
-loading rather than executed with the wrong frequency table.
+dimension is derived from hidden size and head count. KV head count must divide
+query head count for GQA, and special token IDs must be within the vocabulary.
+RoPE scaling metadata is not executed in this release: validated models use the
+base RoPE table, and a file that declares linear or YaRN scaling is rejected
+during configuration loading rather than executed with the wrong frequency
+table.
 
 ## 6. Weight store and mapping
 
@@ -146,13 +150,10 @@ pointers. It is responsible for:
 - resolving tensor names to shapes, dtypes, offsets, and byte sizes;
 - grouping tensors for device upload without changing their quantization;
 - tracking which tensors are required by the selected architecture;
-- reporting missing, duplicated, or unexpectedly shaped tensors before
-  execution.
+- reporting missing or duplicated tensors before execution.
 
-Current limitation: unexpected extra tensors are not reported. The HIP loader
-uploads every tensor in the directory, including tensors the selected
-architecture does not use; the CPU reference loader reads only the named
-tensors it needs.
+Unexpected extra tensors are permitted. A backend may upload them or ignore
+them; they never become part of the model view.
 
 The device upload policy belongs to the memory planner. On a UMA APU, mapped
 host pages may be directly visible to the GPU, but that does not guarantee the
@@ -171,16 +172,17 @@ support the tokenizer families used by the target models:
   templates are validated for the Qwen marker, not executed;
 - BOS/EOS insertion rules and stop conditions.
 
-Current implementation: Qwen2/Qwen3.5 GPT-2 byte-level BPE and SentencePiece
-vocabularies are implemented, including special-token matching,
-byte fallback, SentencePiece scores, dummy-prefix handling, and Qwen chat
-rendering gated on the metadata template. Generation prompts use
-`Tokenizer.EncodePrompt`, which inserts BOS when `tokenizer.ggml.add_bos_token`
-is true and appends EOS when `tokenizer.ggml.add_eos_token` is true; an already
-present token is not duplicated. Raw `Encode` remains free of implicit
-insertion for tokenizer and cross-framework comparisons. Non-Qwen chat
-templates are rejected explicitly when chat rendering is requested, and
-arbitrary templates are not executed.
+The tokenizer contract is:
+
+- tokenization is language-agnostic and includes byte fallback where the
+  vocabulary requires it;
+- BOS and EOS insertion is explicit and configurable, and an already present
+  token is not duplicated;
+- raw encoding without implicit insertion stays available for tokenizer and
+  cross-framework comparison;
+- non-Qwen chat templates are rejected explicitly when chat rendering is
+  requested;
+- arbitrary chat templates are never executed.
 
 Correctness checks must compare **token IDs**, not only decoded text, against a
 trusted reference implementation. The comparison set must include:
@@ -195,54 +197,36 @@ trusted reference implementation. The comparison set must include:
 A text-level match is insufficient: different tokenizations can decode to the
 same string while producing different model behavior.
 
-## 8. Architecture support status
+## 8. Architecture support
 
-| Architecture | Key features | Execution paths | Status |
-| --- | --- | --- | --- |
-| Qwen3.5 Dense hybrid (`qwen35`) | RMSNorm, RoPE over validated MRoPE sections (text-only path), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU | CPU reference, HIP | Adapted and validated on a real Qwen3.5-4B Q4_K_M GGUF |
-| Qwen3.6 MoE hybrid (`qwen35moe`) | The `qwen35` hybrid attention and recurrent state with top-k routed experts and a sigmoid-gated shared expert | CPU reference, HIP | Adapted and validated on a real Qwen3.6-35B-A3B IQ2_XXS GGUF on both paths |
+| Architecture | Key features | Execution paths |
+| --- | --- | --- |
+| Qwen3.5 dense hybrid (`qwen35`) | RMSNorm, RoPE over validated MRoPE sections (text-only path), GQA with output gate, gated delta-net linear attention, convolution state, SwiGLU | CPU reference, HIP |
+| Qwen3.6 MoE hybrid (`qwen35moe`) | The `qwen35` hybrid attention and recurrent state with top-k routed experts and a sigmoid-gated shared expert | CPU reference, HIP |
 
-`qwen35` and `qwen35moe` have been adapted and validated on real models. An
-architecture must not be treated as supported merely because an adapter exists
-or a synthetic fixture passes. Adding an architecture requires adapting its
-metadata, tensor layouts, forward pass, and backend execution, then validating
-it on a real GGUF model. Architectures not listed above have no adapter and
-fail with an explicit unsupported-architecture error.
+`qwen35` and `qwen35moe` are the supported architectures. An architecture must
+not be treated as supported merely because an adapter exists or a synthetic
+fixture passes. Adding an architecture requires adapting its metadata, tensor
+layouts, forward pass, and backend execution, then validating it on a real GGUF
+model.
 
-The current implementation target is **Qwen3.5-4B with a Q4_K_M GGUF**
-(`general.architecture = qwen35`). It uses full attention every fourth layer and
-gated delta-net linear attention in the remaining layers. The CPU reference path
-and the native HIP execution path are both implemented and tested for this
-architecture. The HIP path keeps GGUF weights packed and executes the full
-decoder. `qwen35.rope.dimension_sections` is validated for the text-only
-configuration; because every position component is equal, the forward pass
-applies standard RoPE over the full RoPE dimension.
+All other architectures—including Llama, dense Qwen3, Qwen3 MoE, Gemma, and
+DeepSeek-style models—have no adapter. They fail at load time with an explicit
+unsupported-architecture error and have no CPU or HIP execution path.
+
+`qwen35` uses full attention every fourth layer and gated delta-net linear
+attention in the remaining layers. `qwen35.rope.dimension_sections` is validated
+for the text-only configuration; because every position component is equal, the
+forward pass applies standard RoPE over the full RoPE dimension.
 
 `qwen35moe` reuses that hybrid attention and recurrent state and replaces the
-dense FFN with 256 routed experts, top-8 routing, and one shared expert. The
-adapter requires scalar or equal-width `expert_feed_forward_length` metadata and
-loads the rank-3 `ffn_{gate,up,down}_exps` tensors as packed expert slices.
-Greedy output on Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf matches the llama.cpp reference
-for the tested prompts on the CPU reference, and the HIP decoder reproduces the
-CPU greedy tokens and logits for the same GGUF. The HIP planner accepts an
-expert tensor only when the MoE kernels decode its dtype; every other dtype is
-rejected during planning instead of falling back silently.
-
-Architectures other than `qwen35` and `qwen35moe` have no adapter. Llama, dense
-Qwen3, Qwen3 MoE, Gemma, and DeepSeek-style models fail at load time with an
-explicit unsupported-architecture error. No CPU or HIP execution path exists for
-them in this repository.
-
-`qwen35moe` expert tensors are rank-3 `ffn_{gate,up,down}_exps` tensors with the
-GGUF layout `[columns, rows_per_expert, experts]` and a `ffn_gate_inp` router.
-The adapter requires a scalar `expert_feed_forward_length` or a layer array
-whose entries are all equal; per-layer expert widths are rejected explicitly.
-The routed experts use top-k routing and the shared expert is sigmoid-gated. The
-HIP planner accepts expert dtypes in F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K,
-Q6_K, IQ2_XXS, IQ2_S, and IQ3_S, and rejects every other dtype during planning.
-The router and the shared expert use the dense matrix dtypes, so a model whose
-router is F32 and whose shared expert is a K-quant runs unmodified; the selected
-gate and up expert matrices must share one dtype.
+dense FFN with routed experts, top-k routing, and one shared expert. Expert
+tensors are rank-3 `ffn_{gate,up,down}_exps` tensors with the GGUF layout
+`[columns, rows_per_expert, experts]`, plus a `ffn_gate_inp` router. The adapter
+requires a scalar `expert_feed_forward_length` or a layer array whose entries
+are all equal; per-layer expert widths are rejected. The planner accepts an
+expert tensor only when the selected backend decodes its dtype; every other
+dtype is rejected during planning instead of falling back silently.
 
 ## 9. Quantization support by phase
 
@@ -254,25 +238,15 @@ gate and up expert matrices must share one dtype.
 | Phase 5 | Additional K-quants and architecture-specific types as required | Case-by-case, driven by model coverage |
 
 Support for a quantization type is not complete until it has reader validation,
-a correct reference path, a GPU kernel, and a benchmark entry.
-
-Current status: fused GEMV decode for `F16`, `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`,
-`Q5_K`, and `Q6_K` and quantized WMMA prefill GEMM for `F16`, `F32`, `Q4_0`,
-`Q5_0`, `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_0` are implemented. The CPU reference
-additionally dequantizes and multiplies `IQ2_XXS`, `IQ2_S`, and `IQ3_S` blocks,
-and the HIP MoE expert kernels plus `yuuka_dequant_f16` decode the same three
-codebooks on the device. No HIP GEMV, GEMM, or LM-head kernel accepts them, so
-using an IQ tensor outside those two paths is a planning error. The prefill dispatch table and
-benchmark evidence are in [kernels.md](kernels.md) and
-[the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md). Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, IQ1, IQ2_XS,
-IQ3_XXS, IQ4_NL, and IQ4_XS remain capability failures.
+a correct reference path, a GPU kernel, and a benchmark entry. The supported
+set and its execution routes are defined in
+[kernels.md](kernels.md#3-supported-dtypes); the evidence is recorded in the
+model reports.
 
 ## 10. Validation checklist
 
 A model load must fail early, with a specific diagnostic, if any of the
-following checks fail. This is a requirements checklist, not a test-status
-report; [testing.md](testing.md) records which checks currently have dedicated
-rejection tests and which are enforced only in the reader or model loader.
+following checks fail:
 
 - [ ] Magic and version are supported.
 - [ ] Metadata counts and tensor counts are bounded and parse within the file size.

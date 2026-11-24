@@ -6,26 +6,26 @@ written in **HIP/C++**. It loads GGUF models directly and does not use
 llama.cpp, GGML, or Ollama as an inference execution kernel. Those projects are
 treated as format and correctness references only.
 
-> **Status: CPU and HIP single-request vertical slice with chunked prefill and
-> concurrent paged serving implemented.** The repository contains a validated
-> GGUF reader, a Qwen3.5 tokenizer, a CPU reference forward pass, a HIP device
-> executor for the same decoder, rocWMMA/rocBLAS prefill GEMM, paged Flash
-> Attention, chunked prefill, a continuous scheduler, a reference-counted
-> paged KV and prefix cache, opt-in HIP Graph replay with fallback, a CLI, and
-> an OpenAI-compatible SSE server with health, metrics, and pprof endpoints.
-> Phase 5 adds F16/Q8_0 KV formats, greedy prompt-lookup speculative decoding,
-> Q4_0/Q5_0 tensors, and the `qwen35moe` hybrid MoE architecture on both the CPU
-> reference and the HIP decoder, including on-device IQ2_XXS/IQ2_S/IQ3_S expert
-> decoding and a measured int8 WMMA expert prefill route for K-quant and IQ
-> experts.
-> NPU support is a
-> future task: the existing opt-in `npu-probe`/`--npu` path is diagnostic only
-> and does not execute model operations. All first-release success criteria are
-> met, including the 128/256-token decode matrix in
-> [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#decode-output-length). See
-> the implementation status below,
-> [npu.md](npu.md), [hardware.md](hardware.md), and
-> [benchmarks.md](benchmarks.md).
+## Scope and status
+
+The runtime provides CPU reference execution and HIP execution for the
+`qwen35` dense hybrid and `qwen35moe` hybrid MoE architectures, chunked
+prefill, paged KV with iteration-level continuous scheduling, prefix caching,
+optional HIP Graph replay, a CLI, and an OpenAI-compatible server. The CPU
+reference path is the default; the HIP path requires the native shared library
+and a `-tags hip` Go build.
+
+Model architectures, quantization types, and KV formats outside the sets
+defined in [gguf.md](gguf.md) and [kernels.md](kernels.md) are rejected
+explicitly. NPU support is a future task; the existing `npu-probe`/`--npu` path
+is diagnostic only and does not execute model operations ([npu.md](npu.md)).
+
+Measured results, the evidence for each measurement session, and the current
+limits are recorded only in the model reports indexed by
+[benchmarks.md](benchmarks.md). Measured hardware and toolchain facts are in
+[hardware.md](hardware.md). Verification is layered; tests that need a real
+model or a GPU are opt-in and skip explicitly rather than passing silently
+([testing.md](testing.md)).
 
 ## Target configuration
 
@@ -86,156 +86,18 @@ and NPU Linux runtime support are not assumed from marketing specifications.
 | Document | Contents | Primary audience |
 | --- | --- | --- |
 | [architecture.md](architecture.md) | Layered design, core interfaces, Go/HIP boundary, memory model, key decisions | All contributors |
-| [gguf.md](gguf.md) | GGUF reader, metadata mapping, tokenizer, quantization handling, model support matrix | Runtime and model contributors |
+| [gguf.md](gguf.md) | GGUF reader contract, metadata mapping, tokenizer, quantization and architecture scope | Runtime and model contributors |
 | [kernels.md](kernels.md) | Operator families, supported dtypes, selection rules, fusion, numerics | Kernel contributors |
 | [serving.md](serving.md) | Scheduler, continuous batching, paged KV cache, HIP Graph, API and observability | Runtime and service contributors |
 | [testing.md](testing.md) | Correctness strategy, test matrix, benchmark protocol, regression gates | All contributors |
-| [npu.md](npu.md) | Future XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
+| [npu.md](npu.md) | Deferred XDNA 2 NPU strategy, interface reservations, open questions | Architecture and research contributors |
 | [hardware.md](hardware.md) | Measured gfx1151 toolchain, memory, rocBLAS, and rocWMMA facts | All contributors |
 | [benchmarks.md](benchmarks.md) | Benchmark report conventions, required metadata and coverage, and the per-model report index | All contributors |
 
 ### Module indexes
 
 - [Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md) — The single-request `qwen35` HIP record: prefill and decode curves, KV formats, isolated kernel sweeps, serving, the llama.cpp comparison, and the measured dispatch decisions.
-- [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — The matched 512/2048/8192-token `qwen35moe` HIP prefill comparison next to llama.cpp, the per-operation attribution of what changed, the assignment-tile table, and the correctness gates.
-
-## Implementation status
-
-Implemented and tested:
-
-- Pure Go GGUF reader with header, metadata, tensor directory, split shards,
-  alignment, overlap, and byte-range validation.
-- Qwen3.5 byte-level BPE and SentencePiece tokenizers, with golden token ID
-  tests against llama.cpp for English, Chinese, whitespace, punctuation, emoji,
-  special tokens, and chat-template fragments; multi-turn chat rendering is
-  checked at the text level.
-- CPU reference decoder for the `qwen35` hybrid architecture: full GQA
-  attention, gated delta-net linear attention, convolution state, RMSNorm,
-  RoPE, SwiGLU, tied LM head, and KV/recurrent caches.
-- CPU reference decoder for `qwen35moe`: the same hybrid attention and
-  recurrent state with top-k routed experts plus a sigmoid-gated shared expert.
-  The adapter validates routed and shared expert widths and loads the packed
-  rank-3 expert tensors without expanding them.
-- Deterministic greedy, top-k, and nucleus sampling.
-- `yuuka inspect`, `yuuka run`, and `yuuka bench`.
-- `yuuka-server` with `/v1/chat/completions`, SSE streaming, stop sequences,
-  health, metrics, cancellation, and explicit busy rejection.
-- HIP C ABI for devices, buffers, streams, events, transfers, planned
-  operations, quantized GEMV, a batched F32/F16 GEMM baseline, and the chunked
-  prefill operator family. GEMV and WMMA GEMM are validated for `F32`, `F16`,
-  `Q8_0`, `Q4_0`, `Q5_0`, `Q4_K`, `Q5_K`, and `Q6_K`; direct embedding tests
-  cover `F32`, `Q4_0`, `Q5_0`, and `Q6_K`.
-- rocWMMA and `gfx1151` quantized prefill GEMM: `int8` MMQ for K-quants from 128
-  rows (`Q4_K`/`Q5_K`/`Q6_K` Direct specialization with masked partial tiles and
-  8-tile workgroup swizzle on wide `Q4_K`/`Q5_K` shapes), fused gate/up SwiGLU
-  with `Q8_1` activation quantization, `gfx1151` Direct FP16 WMMA (and fused
-  SwiGLU) for `17–127` K-quant rows, FP32 `lm_head_stream` for `1–16` K-quant
-  rows, paired `Q8_0` WMMA for `ssm_beta`/`ssm_alpha`, a streaming
-  channel-parallel matvec for decode and tails (with an opt-in int8 variant that
-  stays off), a rocBLAS FP16 baseline, causal paged prefill attention using
-  FP16 MMA (and measured split-key attention for long prefixes) across `F32`,
-  `F16`, and packed `Q8_0` pools with tiled fallback for unsupported shapes,
-  and the measured `SelectPrefillPath` dispatch table.
-- A split-register gated delta-net chunk kernel that keeps the recurrent state
-  resident for the whole chunk, paired with a separate pre-normalization/decay
-  pass from 2 rows upward on `gfx1151` (`gdn_prepare_splitreg`). With the
-  Phase 1 and Phase 2 prefill optimizations (`9aaf432`), F16 KV prefill on
-  `Qwen3.5-4B-Q4_K_M` reaches `195.1–196.3 ms` at 512 tokens (`~2610–2624 tok/s`)
-  and leads official `llama.cpp v1.0.0` by `+12.4%` to `+17.6%` across
-  `128–8192` tokens; `yuuka run` and `yuuka bench` default to 1024-token chunks
-  for `1024–8192` tokens on the verified `gfx1151` F16 KV configuration when
-  `--chunk-size` is omitted. See
-  [the Qwen3.5-4B benchmark](benchmarks/qwen3.5_4b.md#prefill-prompt-length).
-- HIP execution of the full Qwen3.5 decoder: embedding, normalization, RoPE,
-  full attention, gated delta-net, convolution state, SwiGLU, and the LM head.
-  Decode runs the delta-net layer as a fused pair (one convolution plus L2 norm
-  kernel and one per-token state kernel that keeps a head's 128x128 state in
-  registers and folds in the gated RMSNorm), which took the 24 recurrent layers
-  from 8.18 ms to 0.79 ms of the decode step; the unfused operators stay
-  reachable through `Options.LegacyDeltaNet`. The CLI and server select HIP with
-  `--backend hip` when built with `-tags hip`.
-- Batched quantized GEMV with measured dispatch thresholds, a per-operation HIP
-  event profile path, and per-quantization/per-batch decode baselines. The decode
-  matvec carries two plan-selected fusions: the residual add in its epilogue and
-  a two-matrix form that forms the gate/up pair and its SwiGLU product in one
-  launch, which removed 128 operations from a decode step.
-- CPU reference dequantization and matrix-vector products for `IQ2_XXS`,
-  `IQ2_S`, and `IQ3_S`, validated against ggml's dequantizers on blocks from
-  Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf. On the device the same three codebooks are
-  decoded by the MoE expert kernels and by `yuuka_dequant_f16`; no general
-  GEMV, GEMM, or LM-head kernel accepts them, and those families keep failing
-  explicitly. MoE prefill decodes the expert digits to int8 and dots them
-  against a Q8_1 activation tile with `dp4a` for chunks of at least sixteen
-  rows, keeps the FP32 form for every other shape and dtype, and takes the int8
-  WMMA form for the K-quant and IQ expert dtypes whose row, K width, and output
-  width fit its tile.
-- An opt-in prefill attribution profile (`TestGPUProfilePrefill`) that records
-  per-operation time for a 512-token chunk at positions 0, 2048, and 7680.
-- End-to-end GPU/CPU comparison on the validated model: greedy token sequences
-  match. The decode path's recorded first-step maximum absolute logit
-  difference is `4.58e-5` (`TestGPUDecodePathMatchesCPU`); the chunked prefill
-  path reports `4.67e-5` (`TestGPUMatchesCPU`) with the same top-1 token. The
-  checked-in tests enforce the token sequence, a loose logit bound, and a
-  layer-by-layer hidden-state comparison;
-  the worst recorded first-prompt layer difference is `5.53e-5`. Chunked
-  prefill at 1024 tokens produced bitwise identical logits in the recorded run
-  across chunk sizes 128, 512, and 1024; the checked-in test enforces the same
-  top-1 token and a `0.05` maximum logit bound.
-- Phase 0 hardware probe covering allocation, copy, memset, mapped memory,
-  rocBLAS SGEMM, and a rocWMMA FP16 tile.
-- Prefill performance curves at 128-32768 prompt tokens, resource usage, and a
-  same-GGUF comparison with llama.cpp HIP and Vulkan.
-- Paged KV with a block allocator, iteration-level continuous scheduling, a
-  collision-safe prefix cache, opt-in HIP Graph replay, and an
-  OpenAI-compatible server.
-- Default F16 and opt-in F32/Q8_0 KV formats with CPU and HIP write/attention
-  kernels for `qwen35` and `qwen35moe`.
-- HIP execution of `qwen35moe` decode and chunked prefill for expert tensors in
-  F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, or IQ3_S. The
-  decode path runs the selected-expert kernels over the routed experts of one
-  token; the prefill path runs the grouped kernels over the binned expert
-  assignments. Both decode the IQ codebooks eight values per codebook fetch and
-  reduce within a warp, and the grouped path reuses one decoded weight span
-  across a tile of assignments. The K-quant and the IQ expert dtypes take the
-  int8 WMMA grouped route, which replaces the per-assignment `dp4a` with the
-  dense MMQ GEMM's int8 tiles at a measured assignment-tile table (see
-  [kernels.md](kernels.md#55-moe)); `Options.ForceMoEQ8` keeps
-  the `dp4a` route for A/B measurement. On Qwen3.6-35B-A3B the int8 WMMA route
-  moved the expert stage from 99.4 to 58.4 ms at a 128-row chunk and from 363.2
-  to 142.1 ms at 512 rows. The 2026-11-22 prefill pass then reached 1718.6,
-  1682.4, and 1493.4 tokens/s at 512, 2048, and 8192 tokens against llama.cpp's
-  1613.8, 1564.0, and 1477.1: 1.065x, 1.076x, and 1.011x. It adds the 8:1 F16
-  grouped-head WMMA attention route, the F32 router tile, the measured Q5_K
-  direct cells, the direct IQ2_XXS gate/up layout, and the shared-expert
-  quantizer reuse
-  ([benchmarks/qwen3.6_35b_a3b.md](benchmarks/qwen3.6_35b_a3b.md#matched-release-comparison)).
-- Exact greedy prompt-lookup speculative decoding, verified against the plain
-  greedy path and enabled with `--speculative`.
-- A diagnostic NPU capability probe (`yuuka npu-probe`, `--npu`) that reports
-  `device_only` on the reference host and falls back to the selected backend.
-  It does not execute model operations; NPU support is a future task.
-
-Not yet implemented:
-
-- Model architectures other than `qwen35` and `qwen35moe`, including Llama,
-  dense Qwen3, and Qwen3 MoE.
-- NPU execution kernels, graph compilation, and subgraph partitioning. NPU
-  support is a future task; the reference host also lacks an XRT userspace
-  runtime.
-- Quantization presets and architectures outside the tested set, including
-  Q4_1/Q5_1, Q2_K/Q3_K, Q8_K, and the remaining IQ families.
-- Speculative decoding for non-greedy sampling.
-
-Verification gaps: real-model tests are opt-in through `YUUKA_TEST_MODEL` and
-`YUUKA_TEST_MOE_MODEL`; GPU
-tests require the reference device. Unit tests that do not need the real model
-use the deterministic tiny GGUF generated by `tests/fixture`, so no model
-weights are committed.
-
-The CPU reference path is the default. The HIP path requires the native shared
-library and a `-tags hip` Go build. `general.architecture = qwen35` and
-`qwen35moe` are the architectures with a HIP path. Other architectures are
-rejected at load time.
+- [Qwen3.6-35B-A3B benchmark](benchmarks/qwen3.6_35b_a3b.md) — The matched 128/512/2048/8192-token `qwen35moe` HIP prefill comparison next to llama.cpp, the per-operation attribution, the assignment-tile table, and the correctness gates.
 
 ## Reading paths
 
@@ -274,6 +136,8 @@ rejected at load time.
   targets. Only results recorded under the protocol in [testing.md](testing.md)
   and published in a model report listed in [benchmarks.md](benchmarks.md) count
   as benchmarks.
+- Design documents state contracts and link to the owning report instead of
+  restating measured values, kernel names, or file layout.
 - Diagrams are intentionally textual so they remain readable in terminals,
   code review, and generated documentation.
 - All measurements must record the model file, quantization, ROCm/driver

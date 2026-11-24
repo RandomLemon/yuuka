@@ -11,18 +11,13 @@ buffer ownership, and plan submission; [gguf.md](gguf.md) owns the packed row
 layouts; [serving.md](serving.md) owns scheduling, KV index construction, and the
 API.
 
-Measured evidence — per-shape timings, resource figures, and rejected
-alternatives — is recorded in [Qwen3.5-4B](benchmarks/qwen3.5_4b.md) and
-[Qwen3.6-35B-A3B](benchmarks/qwen3.6_35b_a3b.md). This document states what the
-runtime does, not how a kernel is written.
+Measured evidence—per-shape timings, resource figures, and rejected
+alternatives—is recorded in the [Qwen3.5-4B](benchmarks/qwen3.5_4b.md) and
+[Qwen3.6-35B-A3B](benchmarks/qwen3.6_35b_a3b.md) reports. This document states
+what the runtime does, not how a kernel is written.
 
-Plan operations are the versioned C ABI declared in
-`backend/hip/bridge/yuuka_hip.h`. That header owns the opcode numbers;
-renumbering or removing an opcode requires an ABI version bump.
-
-Implementation status: every family in section 4 is implemented on gfx1151 and
-covered by the native tests in `tests/hip`, with the Go-side gates in
-[testing.md](testing.md).
+Plan operations are a versioned C ABI. Renumbering or removing an opcode
+requires an ABI version bump.
 
 ## 2. Design rules
 
@@ -32,9 +27,8 @@ covered by the native tests in `tests/hip`, with the Go-side gates in
    output row.
 2. **Quantized weights stay packed.** Dequantization is fused into the consuming
    operator, and no stage materializes a dequantized copy of a model matrix. The
-   rocBLAS route is the one exception by construction: it reads weights that are
-   already stored as `F16`, which is why it serves only `F16` weights and never
-   substitutes for a quantized matrix.
+   rocBLAS route is the one exception by construction: it reads weights already
+   stored as `F16`, so it never substitutes for a quantized matrix.
 3. **Accumulate in FP32.** FP16 and int8 operand products accumulate in FP32,
    and quantized scales and minimums are applied before the final rounding, so no
    output is double-rounded by the unpack step.
@@ -45,8 +39,7 @@ covered by the native tests in `tests/hip`, with the Go-side gates in
    plan-construction error. Silent numerical substitution, silent truncation,
    and silent fallback are forbidden.
 6. **Operators are deterministic.** A repeated submission of the same plan
-   produces bitwise identical outputs; the native tests assert this for the GEMV,
-   LM-head, MoE, attention, and gated delta-net families.
+   produces bitwise identical outputs.
 7. **Thresholds are gfx1151 measurements.** Occupancy, bandwidth, and tuning
    facts from other RDNA parts or from CDNA are not accepted as evidence. A new
    device requires re-running the sweeps and updating the selectors and tests.
@@ -56,22 +49,22 @@ covered by the native tests in `tests/hip`, with the Go-side gates in
 
 ## 3. Supported dtypes
 
-Weight dtypes are declared in `tensor.DType` and match the GGUF `ggml_type`
-values. "Streaming" is the decode matvec family of section 4.
+Weight dtypes match the GGUF `ggml_type` values. "Streaming" is the decode
+matvec family of section 4.
 
 | DType | Decode matvec | Prefill matmul | MoE experts | KV pool | Embedding |
 | --- | --- | --- | --- | --- | --- |
 | `F32` | per-row, streaming | rocWMMA, batched matvec | grouped | yes | yes |
-| `F16` | per-row, streaming | rocWMMA, Direct FP16, rocBLAS, batched matvec | grouped | yes (default) | yes |
+| `F16` | per-row, streaming | rocWMMA, rocBLAS, batched matvec | grouped | yes (default) | yes |
 | `Q4_0`, `Q5_0` | per-row, streaming | rocWMMA, batched matvec | grouped | no | yes |
 | `Q8_0` | per-row, streaming, int8 (opt-in) | rocWMMA, batched matvec | grouped | yes | yes |
-| `Q4_K`, `Q5_K`, `Q6_K` | per-row, streaming, int8 (opt-in) | rocWMMA, Direct FP16, int8 MMQ, Direct MMQ, batched matvec, streaming | grouped, Q8_1 `dp4a`, int8 WMMA | no | yes |
+| `Q4_K`, `Q5_K`, `Q6_K` | per-row, streaming, int8 (opt-in) | rocWMMA, int8 MMQ, batched matvec | grouped, Q8_1 `dp4a`, int8 WMMA | no | yes |
 | `IQ2_XXS`, `IQ2_S`, `IQ3_S` | no | no | grouped, Q8_1 `dp4a`, int8 WMMA | no | no |
 
-The IQ codebooks are also read by `YUUKA_OP_DEQUANT_F16`
-(`yuuka_dequant_f16`), which expands one packed matrix to FP16 for tests and
-tooling. Every other family rejects them, so an IQ tensor outside the MoE family
-is a planning error rather than a silent zero.
+The IQ codebooks are also decoded by the block dequantization operation, which
+expands one packed matrix to FP16 for tests and tooling. Every other family
+rejects them, so an IQ tensor outside the MoE family is a planning error rather
+than a silent zero.
 
 `Q4_1`, `Q5_1`, `Q2_K`, `Q3_K`, `Q8_K`, `IQ1_S`, `IQ2_XS`, `IQ3_XXS`, `IQ4_NL`,
 and `IQ4_XS` have no device kernel and are capability failures.
@@ -92,128 +85,98 @@ include the format so blocks are never reused across formats.
 
 | Family | Stage | Contract |
 | --- | --- | --- |
-| Quantized matvec | Decode | `out[n] = W[n,k] · x[k]` over packed weights |
-| Streaming matvec | Decode, both output tails | Same product over 1–16 rows; remapped one-row form and channel-parallel form |
-| Int8 matvec | Decode, opt-in | The same product over Q8_1 activations and int8 digits; `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0` |
-| Batched matvec | Prefill, ≤ 16 rows | Reuses each decoded weight element across the row block |
+| Quantized matvec | Decode | `out[n] = W[n,k] · x[k]` over packed weights; per-row and streaming forms, with an opt-in int8 arithmetic |
+| Batched matvec | Prefill, small row blocks | Reuses each decoded weight element across the row block |
 | rocWMMA GEMM | Prefill | FP16 operands, FP32 accumulate, every matvec weight dtype |
-| rocBLAS FP16 GEMM | Prefill | `F16` weights, FP16 activation and destination scratch, FP32 compute, one cast to FP32 |
-| Int8 MMQ GEMM | Prefill | Q8_1 activations, int8 WMMA with exact int32 accumulation, FP32 weight scales; K-quants |
-| Direct MMQ GEMM | Prefill, measured cells | The MMQ arithmetic over a wider channel tile |
-| Direct FP16 WMMA GEMM | Prefill, 17–127 rows | Short-chunk form of the rocWMMA route, with a fused SwiGLU pair |
-| Narrow `Q8_0` pair | Prefill | Two `Q8_0` projections over one normalized tile |
+| rocBLAS GEMM | Prefill, `F16` weights | FP16 activation and destination scratch, FP32 compute, one cast to FP32 |
+| Int8 MMQ GEMM | Prefill | Q8_1 activations, int8 matrix instructions with exact int32 accumulation, FP32 weight scales; K-quants |
 | Embedding | Both | Row gather of packed weights into FP32 |
-| Norm, RoPE, elementwise | Both | RMSNorm, head RMSNorm, L2 norm, gated RMSNorm, RoPE (static and dynamic), SiLU·mul, add, copy, scale |
-| Prefill attention, tiled | Prefill | Causal GQA over a chunk with online softmax |
-| Prefill attention, FP16 MMA | Prefill | Grouped query heads sharing a KV head |
-| Prefill attention, split-key | Prefill | Long prefixes; partial online-softmax records merged with log-sum-exp |
-| Prefill attention, rocBLAS F16 | Prefill, opt-in | Gathered K/V, rocBLAS QK and PV, FP32 softmax |
-| Decode attention, split-key | Decode | Paged block table, one block per KV head and key range, partials merged per head |
-| Decode attention, serial | Decode | One block per query head, sequential positions; fallback and reference |
+| Norm, RoPE, elementwise | Both | RMSNorm, head RMSNorm, L2 norm, gated RMSNorm, RoPE, SiLU·mul, add, copy, scale |
+| Prefill attention | Prefill | Causal GQA with online softmax; tiled, FP16 MMA, and long-prefix split-key forms |
+| Decode attention | Decode | Paged block table; split-key and serial per-head forms |
 | KV write | Both | Single row, chunk, paged, and device-position variants |
 | Recurrent decode | Decode | Fused convolution + L2 norm, then the per-token state update with gated RMSNorm |
 | Recurrent prefill | Prefill | Chunk convolution, the chunk recurrence, and gated RMSNorm |
-| MoE routing | Both | Top-k selection with normalized weights; binned form and one-row selected form |
-| MoE experts | Prefill | Grouped kernels over the binned assignments |
-| MoE experts | Decode | One grid per routing slot of the selected experts |
+| MoE routing | Both | Top-k selection with normalized weights; binned and one-row selected forms |
+| MoE experts | Both | Grouped kernels over binned assignments; selected kernels for one token |
 | MoE combine | Both | Weighted reduce-add into the residual stream, and the sigmoid-gated shared expert |
-| Dequantize, cast | Both | `dequant_f16` for K-quants and IQ codebooks; F32↔F16 casts for the rocBLAS route |
+| Dequantize, cast | Both | Block dequantization for K-quants and IQ codebooks; F32↔F16 casts for the rocBLAS route |
 
 ## 5. Selection rules
 
 ### 5.1 Decode matvec
 
-The single predicate `backend/hip.SelectDecodeGemvPath` (sharing
-`SelectLMHeadPath`) decides the family:
+The decode selector decides the family from dtype, row count, and output width:
 
-1. dtype in the matvec set (section 3), `n_in % 256 == 0`, 1–16 rows, and `n_out`
-   at or above the measured crossover — 512 outputs for `Q4_K`/`Q5_K`/`Q6_K`,
-   1024 for `F32`/`F16`/`Q4_0`/`Q5_0`/`Q8_0` — takes the **streaming** family.
-2. Inside that family a block of exactly one row whose `n_in % 512 == 0` takes the
-   **remapped one-row** form; every other row count and K width takes the
+1. A shape in the matvec dtype set, with a K width aligned to the block layout
+   and a row block of at most 16 rows, uses the **streaming** family at or above
+   the measured output-width crossover.
+2. Inside that family a one-row block with a suitable K width uses the
+   **remapped one-row** form; every other row count and K width uses the
    **channel-parallel** form.
-3. Anything else takes the **per-row** matvec. The 32-output recurrent `beta` and
-   `alpha` projections are the shapes that land here on the dense model; the MoE
-   router projection lands here too, which is intended.
-4. The **int8** matvec replaces the FP32 route only when `Options.Int8Matvec` is
-   set. It is measured slower end to end, so production sessions leave it off.
+3. Anything else uses the **per-row** matvec. The narrow recurrent projections
+   (the 32-output `beta` and `alpha` shapes) and the MoE router fall here on
+   purpose.
+4. The **int8** matvec replaces the FP32 route only when the corresponding
+   planner option is set. It stays off by default because the measured route is
+   slower end to end; the model report records the comparison.
 
 The output projection uses the same rule, which is what makes the prefill tail
-and the decode tail one contract.
+and the decode tail one contract. The measured crossovers are recorded in the
+model reports.
 
 ### 5.2 Prefill matmul
 
-`backend/hip.SelectPrefillPath` returns the route for a dtype and shape; the
-native launcher may then upgrade a rocWMMA or MMQ decision to its Direct form.
+The prefill selector returns the route for a dtype and shape; the native
+launcher may then upgrade a generic decision to a device-specific tile.
 
-| # | Condition (evaluated in this order) | Route |
+| # | Condition | Route |
 | --- | --- | --- |
-| 1 | K-quant, `K % 256 == 0`, `N ≥ 512`, `1 ≤ M ≤ 16` | streaming matvec |
-| 2 | `F16`, `K > N`, `4 ≤ M ≤ 64` | rocBLAS |
-| 3 | `F16`, `K > N`, `M ≥ 65` | rocWMMA |
-| 4 | `F16`, `K ≤ N`, `M < 8` | batched matvec |
-| 5 | `F16`, `K ≤ N`, `8 ≤ M ≤ 127` | rocWMMA |
-| 6 | `F16`, `K ≤ N`, `M ≥ 128` | rocBLAS |
-| 7 | K-quant, `K % 256 == 0`, `N ≥ 64`, `M ≥ 128` | int8 MMQ |
-| 8 | `M < 4`, or `K > N` with `M < 8` | batched matvec |
+| 1 | K-quant, aligned K, small row block, wide output | streaming matvec |
+| 2 | `F16`, tall-skinny (`K > N`), small row block | rocBLAS |
+| 3 | `F16`, tall-skinny (`K > N`), larger row block | rocWMMA |
+| 4 | `F16`, wide (`K ≤ N`), very small row block | batched matvec |
+| 5 | `F16`, wide (`K ≤ N`), medium row block | rocWMMA |
+| 6 | `F16`, wide (`K ≤ N`), large row block | rocBLAS |
+| 7 | K-quant, aligned K and output, large row block | int8 MMQ |
+| 8 | `M < 4`, or `K > N` with a very small row block | batched matvec |
 | 9 | otherwise | rocWMMA |
 
-Native upgrades on gfx1151 only:
+The native launcher may select a wider device-specific tile for aligned K-quant
+shapes on gfx1151, including a Direct FP16 form for short chunks and a Direct
+MMQ form for measured cells. Every other cell keeps the generic tile. The
+measured cell set is recorded in the model reports.
 
-- **Direct FP16 WMMA** replaces rocWMMA for `17 ≤ M ≤ 127` when `K % 256 == 0`,
-  `N % 128 == 0`, the activation is 16-byte aligned, and the weights are 16-byte
-  (`Q4_K`/`Q5_K`) or 2-byte (`Q6_K`) aligned. The fused SwiGLU pair uses the same
-  rule.
-- **Direct MMQ** replaces the generic MMQ tile at `M ≥ 128` only for the measured
-  `(dtype, K, N)` cells enumerated in `measured_direct_shape`, with 16-byte
-  aligned packed weights and Q8_1 digits. Every other cell keeps the generic
-  tile.
-
-The prefill output tail is an `N >> M` shape with `M ≤ 16`. It uses the streaming
-matvec whenever the row count, dtype, `n_in % 256 == 0`, and the output width
-predicate hold, and one per-row matvec per row otherwise.
+The prefill output tail is an `N >> M` shape with a small row block. It uses the
+streaming matvec whenever the row count, dtype, K alignment, and the output
+width predicate hold, and one per-row matvec per row otherwise.
 
 ### 5.3 Prefill attention
 
-`launch_attention_prefill_paged_f32` selects the kernel; the Go side mirrors the
-choice in `hip.PrefillAttentionMMA`:
+The selector mirrors the native kernel choice:
 
-1. **Split-key MMA** when the plan binds the split scratch, the KV pool is `F16`,
-   `F32`, or `Q8_0`, `head_dim` is 256 with four query heads per KV head (or the
-   8:1 `F16` geometry at the same width), and the position falls in a measured
-   range:
-
-   | KV format | Query rows | Start positions |
-   | --- | --- | --- |
-   | `F16` | 512, 1024, 2048 | 6144–14336 |
-   | `F16` | 64, 513 | 7680–14336 |
-   | `F32` | 512 | 6144–14336 |
-   | `Q8_0` | 512 | 8192–14336 |
-
-2. **Unsplit FP16 MMA** when `heads == 4 * kv_heads` for any of the three pool
-   formats, or `heads == 8 * kv_heads` for an `F16` pool at width 256;
-   `head_dim` is 64, 128, or 256; and either `rows ≥ 64` or
-   `position + rows ≥ 256`. A `Q8_0` pool additionally needs position ≥ 512, or
-   ≥ 2048 for a 1024-row parent chunk.
-3. **Tiled scalar attention** otherwise, including head dimensions 1–256 outside
-   the MMA widths. Head dimensions above 256 are rejected as an unsupported
-   capability.
+1. **Split-key MMA** for long prefixes on covered KV formats, head width, and
+   query-head geometry, when the plan binds the split scratch and the position
+   falls in a measured range.
+2. **Unsplit FP16 MMA** when the query heads are a multiple of the KV heads for
+   any supported pool format, or the 8:1 grouped-head geometry on an `F16` pool
+   at the supported width; head width is 64, 128, or 256, and either the chunk is
+   large enough or the absolute position has reached the measured threshold.
+3. **Tiled scalar attention** otherwise, including head widths outside the MMA
+   set. Head widths above 256 are rejected as an unsupported capability.
 
 The query layout is the gated Qwen3.5 layout: the second head-sized half of each
 query vector gates the output through a sigmoid. The ABI also carries a dense
 variant without the gate; no supported model selects it. The rocBLAS `F16` route
-is opt-in (`Options.LegacyBlasAttention`) and serves only as a comparison point.
+is opt-in and serves only as a comparison point.
 
 ### 5.4 Decode attention and KV index
 
-The split-key kernel serves a KV head group of 1, 2, 4, or 8 query heads with
-`head_dim ≤ 256` and `head_dim % 4 == 0`; every other shape keeps the serial
-per-head kernel. The split tile is 32 positions up to a 1024-position capacity
-and 64 above it, and the partials workspace is
-`heads * ceil(capacity/tile) * (head_dim + 2)` floats. That size is owned by
-`decodeAttentionScratch` in `engine/gpu/model.go` and must agree with the kernel.
-A captured graph keeps its recorded tile extent, and positions past the live
-length are skipped before any K/V read.
+The split-key decode kernel serves a KV head group of 1, 2, 4, or 8 query heads
+with a head width that is a multiple of four; every other shape keeps the serial
+per-head kernel. The split tile and the partials workspace are sized at plan
+construction, and a captured graph keeps its recorded tile extent. Positions
+past the live length are skipped before any K/V read.
 
 Every position maps through the int32 block table
 (`block_table[p / block_size] * block_size + p % block_size`), and the table and
@@ -221,25 +184,24 @@ pools are device buffers.
 
 ### 5.5 MoE
 
-The plan builds `ROUTE`, `GATE_UP`, `DOWN`, and `REDUCE_ADD` per MoE sub-layer,
-plus `SHARED_ADD` for the shared expert. One token with at most
-1024 experts and at most 32 routing slots uses the selected-expert form, which
-reads only the selected ids and weights; other shapes use the binned form whose
-assignment arrays are sized `experts * rows * used`, and a plan that would
-overflow a bucket is rejected at construction. A wider-wave variant of the
-selected kernels covers the one-token, eight-slot, hidden-2048, FFN-512 IQ cells.
+The plan builds routing, gate/up, down, and reduce-add steps per MoE sub-layer,
+plus a shared-expert add. One token with a bounded expert count and routing-slot
+count uses the selected-expert form, which reads only the selected ids and
+weights; other shapes use the binned form whose assignment arrays are sized from
+the expert, row, and routing-slot counts. A plan that would overflow a bucket is
+rejected at construction.
 
-Routed-expert prefill route (`backend/hip.SelectMoEPrefillPath`), for chunks of at
-least 16 rows:
+Routed-expert prefill route for chunks of at least sixteen rows:
 
-| Condition | Route | Assignment tile |
-| --- | --- | --- |
-| dtype in `Q4_K`, `Q5_K`, `Q6_K`, `IQ2_XXS`, `IQ2_S`, `IQ3_S`, `K % 256 == 0`, `N % 128 == 0` | int8 WMMA | 16 up to 384 rows, 32 at 512–2048, 64 at 4096 |
-| `IQ2_XXS`, `IQ2_S`, `IQ3_S`, `K % 256 == 0`, `N % 256 == 0` | Q8_1 `dp4a` | n/a |
-| every other dtype and shape | FP32 grouped | n/a |
+| Condition | Route |
+| --- | --- |
+| K-quant or IQ expert dtype, aligned K and output width | int8 WMMA grouped |
+| IQ expert dtype, aligned K and a wider output alignment | Q8_1 `dp4a` grouped |
+| every other dtype and shape | FP32 grouped |
 
-`Options.ForceMoEQ8` keeps the `dp4a` route for the shapes the WMMA route would
-take, so the two can be compared on identical plan inputs.
+The assignment tile is selected per row class from the measured table recorded
+in the Qwen3.6 report; the `dp4a` route stays reachable through a planner option
+for A/B measurement.
 
 The router projection is deliberately not on the prefill dispatch table: an `F32`
 router runs the FP32 batched GEMM because an FP16-staged activation tile is
@@ -261,17 +223,16 @@ the decode and prefill paths.
 
 - **Decode** fuses the short convolution and the q/k L2 normalizations into one
   operator and the state update plus gated RMSNorm into a second, when the
-  geometry is inside the compiled set (state 128, 256-aligned channel counts).
-  Other geometries keep the five separate operators (`CONV1D`, two `L2NORM`,
-  `GDN`, `GATED_RMSNORM`). `Options.LegacyDeltaNet` forces the unfused plan.
-- **Prefill** runs the preparation pass plus the chunk recurrence when the model
-  runs on gfx1151 with state 128, at least two rows, and a preparation span that
-  binds in an existing scratch buffer; gated RMSNorm then runs as a separate row
-  kernel. Without that span the fallback chunk kernel computes the same
-  recurrence, and state sizes other than 128 use the fused per-column kernel.
-- The chunkwise WY (triangular-inverse) form of the same recurrence is implemented
-  and validated, but it is not the selected path: the op runs it only when the
-  caller supplies the chunk scratch slot of the plan operation.
+  geometry is inside the compiled set. Other geometries keep the five separate
+  operators.
+- **Prefill** runs a preparation pass plus the chunk recurrence when the model
+  runs on gfx1151 with the supported state width, at least two rows, and a
+  preparation span that binds in an existing scratch buffer; gated RMSNorm then
+  runs as a separate row kernel. Without that span the fallback chunk kernel
+  computes the same recurrence, and other state sizes use the fused per-column
+  kernel.
+- The chunkwise WY (triangular-inverse) form of the same recurrence is
+  implemented and validated, but it is not the selected path.
 
 ## 6. Fusion
 
@@ -280,37 +241,35 @@ lowering occupancy:
 
 | Stage | Fused form |
 | --- | --- |
-| Decode projection | Matvec + residual add (`GEMV_RESIDUAL`) |
-| Decode pair | Two matvecs over one activation row, either two outputs or the SwiGLU product (`GEMV_PAIR`); the narrow `beta`/`alpha` pair uses the same form |
-| Prefill FFN | gate + up + SwiGLU in one kernel (`GEMM_SWIGLU`), including the Direct FP16 variant |
-| Prefill FFN, MMQ | SwiGLU plus Q8_1 quantization of the product (`SILU_MUL_QUANT_Q8_1`) |
+| Decode projection | Matvec plus residual add |
+| Decode pair | Two matvecs over one activation row, either two outputs or the SwiGLU product; the narrow recurrent pair uses the same form |
+| Prefill FFN | gate + up + SwiGLU in one kernel, including the short-chunk form |
+| Prefill FFN, MMQ | SwiGLU plus Q8_1 quantization of the product |
 | Prefill Q8_1 reuse | One activation quantization per projection group; the shared-expert pair reuses the routed experts' tile |
-| Prefill norms and RoPE | Row/hand batching of RMSNorm, head RMSNorm, and RoPE over a chunk |
+| Prefill norms and RoPE | Row/head batching of RMSNorm, head RMSNorm, and RoPE over a chunk |
 | Prefill KV | Batched KV writes for a chunk |
 | Prefill attention | Online softmax, value reduction, and the attention gate |
-| Gated delta-net | Convolution state, q/k L2 norm, chunk recurrence, and gated RMSNorm, as described in 5.6 |
+| Gated delta-net | Convolution state, q/k L2 norm, chunk recurrence, and gated RMSNorm |
 | MoE | Expert routing, expert FFN, and the weighted reduce-add; sigmoid-gated shared expert add |
 
-Each fusion must be evaluated on launch count, register and occupancy cost, shared
-memory, traffic, and end-to-end latency, never on isolated kernel time alone. The
-unfused path stays behind an option so the comparison is reproducible:
-`Options.NoResidualFusion`, `NoPairFusion`, `LegacyDeltaNet`, `ForceTiledAttention`,
-`LegacyBlasAttention`, `ForceDecodeGemv`, `Int8Matvec`, `PrequantizedInt8`, and
-`ForceMoEQ8`.
+Each fusion must be evaluated on launch count, register and occupancy cost,
+shared memory, traffic, and end-to-end latency, never on isolated kernel time
+alone. The unfused and alternative routes stay reachable through opt-in planner
+options so the comparison is reproducible.
 
 ## 7. Numerical requirements
 
-| Stage | Gate |
+| Stage | Comparison |
 | --- | --- |
-| Matvec (per-row, streaming, batched) | `2e-3 * (1 + \|expected\|)` against a host dot product over dequantized weights |
-| Prefill GEMM (rocWMMA, MMQ) | `2e-2 * (1 + \|expected\|)` against a float reference built from the exact packed weights; `1e-3` when the reference itself is FP16 |
-| Prefill attention | `2e-4 * (1 + \|expected\|)` against the FP32 reference, `1e-3` for an `F16` pool |
-| Chunked prefill | logits within `2e-3` of the unchunked CPU reference and an identical top-1 token, for chunk sizes 1, 3, 7, 16, 17, 33, and 64 |
-| FP16 MMA prefill attention | logits within `0.05` against the forced tiled control on the dense model (`0.3` for the long-prompt variant), and within `2.0` on the 8:1 MoE geometry with an identical top-1 token and continuation |
-| Int8 MMQ prefill | inside the recorded `0.0031–0.264` logit band with identical tokens |
-| Int8 MoE (`dp4a`, WMMA) | `1e-6` relative against the same Q8_1 inputs; the full Q8_1 pipeline `2e-2` against a host computation over the dequantized weights |
-| Int8 decode matvec | kernel digits within `5.7e-4` of a host reference; logits may move up to `0.2656` over eight steps with identical tokens |
-| Gated delta-net | `1e-5` against an independent host implementation of the documented order of operations |
+| Matvec | Host dot product over dequantized weights |
+| Prefill GEMM | Float reference built from the exact packed weights; a tighter bound when the reference itself is FP16 |
+| Prefill attention | FP32 reference; a looser bound for an `F16` pool |
+| Chunked prefill | Identical top-1 token and logits inside a documented bound against the unchunked CPU reference |
+| MoE experts | Exact-arithmetic comparison on identical Q8_1 inputs; the int8 pipeline against a host computation over the dequantized weights |
+| Dequantization and gated delta-net | Independent host implementation of the documented order of operations |
+
+The exact tolerance of each stage is documented and enforced by the test that
+covers it; recorded end-to-end deltas are in the model reports.
 
 Rules that apply to every stage:
 
@@ -334,30 +293,30 @@ Rules that apply to every stage:
   admission, so replay and kernels never observe a changing table.
 - No device sampler: the decode step downloads the FP32 logits row and the Go
   generation loop samples it.
-- `Q8_0` KV is supported and reduces cache memory, but it is not faster than
-  `F32` at short context.
+- `Q8_0` KV reduces cache memory at a measured cost recorded in the Qwen3.5
+  report.
 - Speculative decoding is exact for greedy sampling only, and reuses the chunked
   prefill graph with a multi-row output tail.
 - Prefill does not fuse query/key/value projections or RMSNorm into a projection
   kernel.
-- The Direct MMQ and Direct FP16 WMMA routes exist only on gfx1151 builds; other
-  targets keep the generic tiles.
+- Device-specific tiles exist only on gfx1151 builds; other targets keep the
+  generic tiles.
 - `Q8_0`, `Q4_0`, and `Q5_0` weights never take the int8 MMQ prefill route, and
-  the IQ codebooks stay on the MoE and dequant paths.
-- Attention head dimensions above 256, and the ungated query layout, are outside
-  the supported set.
+  the IQ codebooks stay on the MoE and dequantization paths.
+- Attention head widths above 256, and the ungated query layout, are outside the
+  supported set.
 
 ## 9. Acceptance criteria
 
 A kernel is not complete until:
 
-- [x] It matches the CPU reference on representative shapes and buffer-boundary
+- [ ] It matches the CPU reference on representative shapes and buffer-boundary
       cases, including randomized and non-aligned shapes.
-- [x] Its numerical tolerance is documented in section 7 and enforced by a test.
-- [x] Its shape classes are covered by a benchmark or profile in the benchmark
+- [ ] Its numerical tolerance is documented in section 7 and enforced by a test.
+- [ ] Its shape classes are covered by a benchmark or profile in the benchmark
       records.
-- [x] Its resource figures (VGPR, LDS, scratch, occupancy) are recorded for the
+- [ ] Its resource figures (VGPR, LDS, scratch, occupancy) are recorded for the
       selected device.
-- [x] The planner selects it, and each quantized family has a measured fallback.
-- [x] It is integrated into an end-to-end model run.
-- [x] It does not regress a previously accepted shape class.
+- [ ] The planner selects it, and each quantized family has a measured fallback.
+- [ ] It is integrated into an end-to-end model run.
+- [ ] It does not regress a previously accepted shape class.

@@ -64,9 +64,9 @@ criteria in section 6 are met.
 
 ## 4. Interface reservations
 
-`backend/npu` currently exposes only a capability probe and fallback decision.
-The architecture reserves the following concepts without implementing them in
-the first release:
+The NPU backend exposes only a capability probe and fallback decision. The
+architecture reserves the following concepts without implementing them in the
+first release:
 
 | Concept | Purpose |
 | --- | --- |
